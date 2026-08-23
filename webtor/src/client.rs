@@ -57,15 +57,10 @@ impl TorClient {
         let relay_manager = RelayManager::new(Vec::new());
         let relay_manager_arc = Arc::new(RwLock::new(relay_manager));
 
-        let directory_manager = Arc::new(DirectoryManager::new(relay_manager_arc.clone()));
-
-        // Load cached consensus to populate relay manager
-        // This is essential for WASM where we need relays before we can fetch fresh consensus
-        info!("Loading cached consensus...");
-        if let Err(e) = directory_manager.load_cached_consensus().await {
-            error!("Failed to load cached consensus: {}", e);
-            return Err(e);
-        }
+        let directory_manager = Arc::new(DirectoryManager::new(
+            relay_manager_arc.clone(),
+            options.on_log.clone(),
+        ));
 
         let circuit_manager = Arc::new(RwLock::new(CircuitManager::new(
             relay_manager_arc.clone(),
@@ -101,35 +96,10 @@ impl TorClient {
         Ok(client)
     }
 
-    /// Bootstrap the client by fetching consensus
+    /// Bootstrap the client with current directory data and a ready circuit.
     pub async fn bootstrap(&self) -> Result<()> {
         self.log("Bootstrapping Tor client...", LogType::Info);
-
-        // Ensure channel is established
-        let channel_guard = self.channel.read().await;
-        if channel_guard.is_none() {
-            drop(channel_guard);
-            self.establish_channel().await?;
-        } else {
-            drop(channel_guard);
-        }
-
-        // Get channel
-        let channel_guard = self.channel.read().await;
-        let channel = channel_guard
-            .as_ref()
-            .ok_or_else(|| TorError::Internal("Channel not established".to_string()))?
-            .clone();
-        drop(channel_guard);
-
-        // Fetch consensus
-        self.log("Fetching consensus...", LogType::Info);
-        self.directory_manager
-            .fetch_and_process_consensus(channel)
-            .await?;
-        self.log("Consensus fetched successfully", LogType::Success);
-
-        Ok(())
+        self.ensure_ready().await
     }
 
     /// Make a one-time fetch request through Tor with a temporary circuit
@@ -433,6 +403,7 @@ impl TorClient {
     async fn establish_channel_impl(&self) -> Result<()> {
         self.log("Establishing channel", LogType::Info);
 
+        #[cfg(not(target_arch = "wasm32"))]
         let timeout = self.options.connection_timeout_duration();
 
         // Get fingerprint - use default for Snowflake if not provided
@@ -553,9 +524,29 @@ impl TorClient {
         };
 
         // Store the channel to keep it alive
-        *self.channel.write().await = Some(chan);
+        *self.channel.write().await = Some(chan.clone());
 
         self.log("Channel established", LogType::Success);
+
+        // A bridge channel can open a one-hop directory stream without a relay
+        // snapshot. Require current directory data before choosing the middle and
+        // exit so rotating ntor keys can never come from a stale bundled cache.
+        self.log(
+            "Fetching current Tor directory data through Snowflake...",
+            LogType::Info,
+        );
+        if let Err(e) = self
+            .directory_manager
+            .fetch_and_process_consensus(chan)
+            .await
+        {
+            self.log(
+                &format!("Failed to fetch current Tor directory data: {}", e),
+                LogType::Error,
+            );
+            return Err(e);
+        }
+        self.log("Current Tor directory data loaded", LogType::Success);
 
         // Now create the actual circuit through the Tor network
         self.log("Creating circuit through Tor network...", LogType::Info);

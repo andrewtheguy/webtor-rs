@@ -1,21 +1,70 @@
 use async_tungstenite::tungstenite::{protocol::Message, Error as WebSocketError};
 use futures::lock::Mutex;
 use futures::StreamExt;
+use serde::Deserialize;
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 use subtle_tls::{TlsConfig, TlsConnector, TlsStream, TlsVersion};
 use url::Url;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
+use webtor::config::LogType;
 use webtor::{DataStream, TorClient, TorClientOptions};
 
 const MAX_NOSTR_MESSAGE_BYTES: usize = 1024 * 1024;
-const CONNECTION_TIMEOUT_MS: u64 = 60_000;
+const CONNECTION_TIMEOUT_MS: u64 = 240_000;
 const CIRCUIT_TIMEOUT_MS: u64 = 120_000;
+const TOR_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+const TOR_CHECK_URL: &str = "https://check.torproject.org/api/ip";
+
+#[derive(Deserialize)]
+struct TorCheckResponse {
+    #[serde(rename = "IsTor")]
+    is_tor: bool,
+}
 
 fn js_error(context: &str, error: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&format!("{context}: {error}"))
+}
+
+fn log_tor_progress(message: &str, log_type: LogType) {
+    let rendered = JsValue::from_str(&format!("[Anonymous signaling] {message}"));
+    match log_type {
+        LogType::Error => web_sys::console::error_1(&rendered),
+        LogType::Info | LogType::Success => web_sys::console::info_1(&rendered),
+    }
+}
+
+async fn verify_tor_exit(client: &TorClient) -> Result<(), JsValue> {
+    log_tor_progress("Verifying the Tor exit...", LogType::Info);
+    let response = webtor::with_timeout(
+        TOR_CHECK_TIMEOUT,
+        "Tor exit verification",
+        client.get(TOR_CHECK_URL),
+    )
+    .await
+    .map_err(|error| js_error("Tor exit verification request failed", error))?;
+
+    if !response.is_success() {
+        return Err(JsValue::from_str(&format!(
+            "Tor exit verification returned HTTP {}",
+            response.status
+        )));
+    }
+
+    let check = response
+        .json::<TorCheckResponse>()
+        .map_err(|error| js_error("Tor exit verification response was invalid", error))?;
+    if !check.is_tor {
+        return Err(JsValue::from_str(
+            "Tor exit verification failed: Tor Check did not recognize the connection as Tor",
+        ));
+    }
+
+    log_tor_progress("Tor exit verified.", LogType::Success);
+    Ok(())
 }
 
 type RelayTlsStream = TlsStream<DataStream>;
@@ -57,6 +106,8 @@ impl AnonymousSignalingClient {
             let options = TorClientOptions::snowflake_webrtc()
                 .with_connection_timeout(CONNECTION_TIMEOUT_MS)
                 .with_circuit_timeout(CIRCUIT_TIMEOUT_MS)
+                .with_create_circuit_early(false)
+                .with_on_log(log_tor_progress)
                 .with_circuit_update_interval(None);
             let client = TorClient::new(options)
                 .await
@@ -69,6 +120,7 @@ impl AnonymousSignalingClient {
                 .wait_for_circuit()
                 .await
                 .map_err(|error| js_error("Tor circuit did not become ready", error))?;
+            verify_tor_exit(&client).await?;
 
             Ok(JsValue::from(Self {
                 client: Arc::new(client),

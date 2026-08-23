@@ -11,7 +11,6 @@
 //! 5. Client receives answer and completes WebRTC connection
 
 use crate::error::{Result, TorError};
-use crate::retry::{retry_with_backoff, RetryPolicy};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
@@ -26,6 +25,14 @@ pub const BROKER_URL_DIRECT: &str = "https://snowflake-broker.torproject.net/";
 
 /// Client protocol version
 const CLIENT_VERSION: &str = "1.0";
+
+fn broker_error_is_retryable(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("timed out")
+        || error.contains("no snowflake proxies")
+        || error.contains("no proxies")
+        || error.contains("match")
+}
 
 /// Default bridge fingerprint (Tor Project's primary Snowflake bridge)
 pub const DEFAULT_BRIDGE_FINGERPRINT: &str = "2B280B23E1107BB62ABFC40DDCC8824814F80A72";
@@ -147,7 +154,7 @@ impl BrokerClient {
 
     /// Exchange SDP offer for SDP answer via broker
     /// Returns the SDP answer from a volunteer proxy
-    /// Retries using RetryPolicy::network() if no proxy is available
+    /// The caller retries the complete WebRTC negotiation with a fresh offer.
     pub async fn negotiate(&self, sdp_offer: &str) -> Result<String> {
         let mut request = ClientPollRequest::new(sdp_offer.to_string())
             .with_fingerprint(self.fingerprint.clone());
@@ -159,62 +166,46 @@ impl BrokerClient {
         let body = request.encode()?;
         let proxy_url = format!("{}/client", self.broker_url.trim_end_matches('/'));
 
-        retry_with_backoff(
-            "snowflake_broker_negotiate",
-            RetryPolicy::network(),
-            |e| e.is_retryable(),
-            |attempt| {
-                let body = body.clone();
-                let proxy_url = proxy_url.clone();
-                async move {
-                    info!("Contacting Snowflake broker (attempt {})", attempt);
-                    debug!("Broker URL: {}", proxy_url);
+        info!("Contacting Snowflake broker");
+        debug!("Broker URL: {}", proxy_url);
 
-                    #[cfg(target_arch = "wasm32")]
-                    let response_bytes = self.fetch_wasm(&proxy_url, &body).await?;
+        #[cfg(target_arch = "wasm32")]
+        let response_bytes = self.fetch_wasm(&proxy_url, &body).await?;
 
-                    #[cfg(not(target_arch = "wasm32"))]
-                    let response_bytes = self.fetch_native(&proxy_url, &body).await?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let response_bytes = self.fetch_native(&proxy_url, &body).await?;
 
-                    let response = ClientPollResponse::decode(&response_bytes)?;
+        let response = ClientPollResponse::decode(&response_bytes)?;
 
-                    debug!(
-                        "Broker response: answer={} bytes, error='{}'",
-                        response.answer.len(),
-                        response.error
-                    );
+        debug!(
+            "Broker response: answer={} bytes, error='{}'",
+            response.answer.len(),
+            response.error
+        );
 
-                    if !response.error.is_empty() {
-                        let is_retryable_error = response.error.contains("timed out")
-                            || response.error.contains("no proxies")
-                            || response.error.contains("match");
+        if !response.error.is_empty() {
+            if broker_error_is_retryable(&response.error) {
+                return Err(TorError::network(format!(
+                    "No Snowflake proxy available: {}",
+                    response.error
+                )));
+            } else {
+                return Err(TorError::tor_protocol(format!(
+                    "Snowflake broker error: {}",
+                    response.error
+                )));
+            }
+        }
 
-                        if is_retryable_error {
-                            return Err(TorError::network(format!(
-                                "No Snowflake proxy available: {}",
-                                response.error
-                            )));
-                        } else {
-                            return Err(TorError::tor_protocol(format!(
-                                "Snowflake broker error: {}",
-                                response.error
-                            )));
-                        }
-                    }
+        if response.answer.is_empty() {
+            return Err(TorError::network("Broker returned empty answer"));
+        }
 
-                    if response.answer.is_empty() {
-                        return Err(TorError::network("Broker returned empty answer"));
-                    }
-
-                    info!(
-                        "Got SDP answer from broker ({} bytes)",
-                        response.answer.len()
-                    );
-                    Ok(response.answer)
-                }
-            },
-        )
-        .await
+        info!(
+            "Got SDP answer from broker ({} bytes)",
+            response.answer.len()
+        );
+        Ok(response.answer)
     }
 
     /// Fetch via CORS proxy
@@ -394,5 +385,14 @@ mod tests {
         assert!(response.answer.is_empty());
         assert_eq!(response.error, "no proxies available");
         assert!(!response.is_success());
+    }
+
+    #[test]
+    fn test_deployed_no_proxy_error_is_retryable() {
+        assert!(broker_error_is_retryable(
+            "no snowflake proxies currently available"
+        ));
+        assert!(broker_error_is_retryable("timed out waiting for answer!"));
+        assert!(!broker_error_is_retryable("malformed session description"));
     }
 }

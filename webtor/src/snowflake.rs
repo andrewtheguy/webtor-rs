@@ -148,13 +148,14 @@ impl SnowflakeBridge {
                     warn!("WebRTC connection attempt {} failed: {}", attempt, err_str);
                     last_error = Some(e);
 
-                    // Only retry on timeout errors (proxy didn't respond)
-                    if !err_str.contains("timeout") {
+                    // Broker availability, ICE, and DataChannel failures are transient.
+                    if !last_error.as_ref().unwrap().is_retryable() {
                         return Err(last_error.unwrap());
                     }
 
                     if attempt < MAX_WEBRTC_RETRIES {
                         info!("Retrying with a different volunteer proxy...");
+                        crate::retry::sleep(Duration::from_secs(2)).await;
                     }
                 }
             }

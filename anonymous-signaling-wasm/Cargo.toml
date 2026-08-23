@@ -15,10 +15,12 @@ console_error_panic_hook = "0.1"
 futures = { workspace = true }
 getrandom = { version = "0.4", features = ["wasm_js"] }
 js-sys = { workspace = true }
+serde = { workspace = true }
 subtle-tls = { path = "../subtle-tls" }
 url = { workspace = true }
 wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
+web-sys = { workspace = true }
 webtor = { path = "../webtor" }
 
 [package.metadata.wasm-pack.profile.release]

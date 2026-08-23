@@ -116,7 +116,6 @@ mod wasm {
                     "DataChannel error",
                 )));
             }) as Box<dyn FnMut(web_sys::Event)>);
-            dc.set_onerror(Some(on_error.as_ref().unchecked_ref()));
 
             // onclose handler
             let on_close = Closure::wrap(Box::new(move |_e: web_sys::Event| {
@@ -152,6 +151,7 @@ mod wasm {
 
             // 7. Wait for DataChannel to open
             wait_for_channel_open(&dc).await?;
+            dc.set_onerror(Some(on_error.as_ref().unchecked_ref()));
             info!("WebRTC DataChannel opened!");
 
             Ok(Self {
@@ -335,10 +335,10 @@ mod wasm {
                 let _ = tx.send(Err("DataChannel error during open".to_string()));
             }
         }) as Box<dyn FnMut(web_sys::Event)>);
-        // Note: We already have onerror set, but this is for the opening phase
+        dc.set_onerror(Some(_on_error_open.as_ref().unchecked_ref()));
 
-        // Wait with timeout
-        let timeout = gloo_timers::future::TimeoutFuture::new(30_000);
+        // Match the official Snowflake client's DataChannel timeout.
+        let timeout = gloo_timers::future::TimeoutFuture::new(10_000);
 
         let result = futures::select! {
             r = rx.fuse() => r.map_err(|_| TorError::Network("Channel open cancelled".to_string()))?,
@@ -348,6 +348,7 @@ mod wasm {
         // CRITICAL: Clear the onopen handler before returning to prevent
         // "closure invoked after being dropped" errors
         dc.set_onopen(None);
+        dc.set_onerror(None);
 
         result.map_err(TorError::Network)
     }
