@@ -74,8 +74,8 @@ type RelayTlsStream = TlsStream<DataStream>;
 type RelayWriter = async_tungstenite::WebSocketSender<RelayTlsStream>;
 type RelayReader = async_tungstenite::WebSocketReceiver<RelayTlsStream>;
 
-fn signaling_client_options() -> TorClientOptions {
-    TorClientOptions::direct_snowflake_websocket()
+fn signaling_client_options(stun_urls: Vec<String>) -> TorClientOptions {
+    TorClientOptions::snowflake_webrtc(stun_urls)
         .with_connection_timeout(CONNECTION_TIMEOUT_MS)
         .with_circuit_timeout(CIRCUIT_TIMEOUT_MS)
         .with_create_circuit_early(false)
@@ -133,10 +133,23 @@ pub struct AnonymousSignalingClient {
 #[wasm_bindgen]
 impl AnonymousSignalingClient {
     #[wasm_bindgen(js_name = create)]
-    pub fn create(cached_directory: Option<String>) -> js_sys::Promise {
+    pub fn create(cached_directory: Option<String>, stun_urls: js_sys::Array) -> js_sys::Promise {
         future_to_promise(async move {
             console_error_panic_hook::set_once();
-            let client = TorClient::new(signaling_client_options())
+            let stun_urls = stun_urls
+                .iter()
+                .map(|value| {
+                    value.as_string().ok_or_else(|| {
+                        JsValue::from_str("Anonymous signaling received a non-string STUN URL")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if stun_urls.is_empty() {
+                return Err(JsValue::from_str(
+                    "Anonymous signaling requires at least one STUN URL",
+                ));
+            }
+            let client = TorClient::new(signaling_client_options(stun_urls))
                 .await
                 .map_err(|error| js_error("Failed to initialize webtor", error))?;
             if let Some(encoded) = cached_directory.filter(|value| !value.is_empty()) {
@@ -237,9 +250,20 @@ mod tests {
     #[test]
     fn signaling_reuses_the_verified_circuit() {
         assert_eq!(
-            signaling_client_options().stream_isolation,
+            signaling_client_options(vec!["stun:example.com".to_string()]).stream_isolation,
             StreamIsolationPolicy::None
         );
+    }
+
+    #[test]
+    fn signaling_uses_snowflake_webrtc_with_caller_stun_urls() {
+        let options = signaling_client_options(vec!["stun:example.com".to_string()]);
+        match options.bridge {
+            webtor::config::BridgeType::SnowflakeWebRtc { stun_urls, .. } => {
+                assert_eq!(stun_urls, vec!["stun:example.com"]);
+            }
+            other => panic!("expected Snowflake WebRTC, got {other:?}"),
+        }
     }
 }
 

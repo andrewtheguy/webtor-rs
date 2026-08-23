@@ -17,11 +17,19 @@ impl fmt::Debug for LogCallback {
 
 /// Snowflake bridge identity and direct WebSocket endpoint.
 pub const SNOWFLAKE_FINGERPRINT: &str = "2B280B23E1107BB62ABFC40DDCC8824814F80A72";
+pub const SNOWFLAKE_BROKER_URL: &str = "https://snowflake-broker.torproject.net/";
 pub const DIRECT_SNOWFLAKE_WS_URL: &str = "wss://snowflake.torproject.net/";
 
 /// Bridge type configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BridgeType {
+    /// Standard Snowflake client transport through a volunteer WebRTC proxy.
+    SnowflakeWebRtc {
+        /// Broker used to exchange the WebRTC offer and answer.
+        broker_url: String,
+        /// STUN URLs supplied by the embedding application.
+        stun_urls: Vec<String>,
+    },
     /// Direct connection to the Snowflake bridge WebSocket endpoint.
     DirectSnowflakeWebSocket {
         /// WebSocket URL for the Snowflake bridge.
@@ -145,6 +153,18 @@ pub const MAX_CIRCUITS_PER_ISOLATION_KEY: usize = 1;
 pub const CIRCUIT_PREBUILD_AGE_THRESHOLD_MS: u64 = 80_000; // 90_000 - 10_000
 
 impl TorClientOptions {
+    /// Connect through a Snowflake volunteer proxy using the caller's STUN list.
+    pub fn snowflake_webrtc(stun_urls: Vec<String>) -> Self {
+        Self {
+            bridge: BridgeType::SnowflakeWebRtc {
+                broker_url: SNOWFLAKE_BROKER_URL.to_string(),
+                stun_urls,
+            },
+            bridge_fingerprint: Some(SNOWFLAKE_FINGERPRINT.to_string()),
+            ..Default::default()
+        }
+    }
+
     /// Connect directly to the Snowflake bridge over WebSocket.
     pub fn direct_snowflake_websocket() -> Self {
         Self {

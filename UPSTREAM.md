@@ -5,9 +5,11 @@ This directory is a source-minimized fork of
 at commit `9be6e2f5e606c4c03e9639751c18d0d927a4c19d` (version 0.5.7).
 
 Only the core browser Tor client, its TLS implementation, and the Arti crates
-patched by upstream for WebAssembly are retained. The Snowflake broker and
-WebRTC client transport are removed; anonymous signaling uses the direct
-Snowflake WebSocket bridge transport without a fallback. pTransfer adds:
+patched by upstream for WebAssembly are retained. Anonymous signaling uses the
+Snowflake broker and browser WebRTC client transport with STUN URLs supplied by
+the embedding application. The direct Snowflake WebSocket transport is retained
+as an inactive alternative for a future explicit fallback policy. pTransfer
+adds:
 
 - `TorClient::open_stream`, an exit-side raw TCP stream API;
 - `anonymous-signaling-wasm`, a TLS WebSocket binding used only for Nostr

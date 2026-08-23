@@ -8,6 +8,8 @@ use crate::http::{HttpRequest, HttpResponse, TorHttpClient};
 use crate::relay::RelayManager;
 use crate::retry::{with_timeout_and_cancellation, CancellationToken};
 #[cfg(target_arch = "wasm32")]
+use crate::snowflake_webrtc::{SnowflakeWebRtcConfig, SnowflakeWebRtcStream};
+#[cfg(target_arch = "wasm32")]
 use crate::snowflake_ws::{SnowflakeWsConfig, SnowflakeWsStream};
 use crate::time::system_time_now;
 use crate::wasm_runtime::WasmRuntime;
@@ -412,7 +414,8 @@ impl TorClient {
 
         // Get fingerprint - use the known Snowflake bridge identity if omitted.
         let fingerprint = match &self.options.bridge {
-            BridgeType::DirectSnowflakeWebSocket { .. } => self
+            BridgeType::SnowflakeWebRtc { .. }
+            | BridgeType::DirectSnowflakeWebSocket { .. } => self
                 .options
                 .bridge_fingerprint
                 .as_ref()
@@ -445,6 +448,37 @@ impl TorClient {
 
         // 1. Connect to bridge based on type
         let chan = match &self.options.bridge {
+            BridgeType::SnowflakeWebRtc {
+                broker_url,
+                stun_urls,
+            } => {
+                self.log("Connecting to Snowflake via WebRTC", LogType::Info);
+                self.log(
+                    "Using WebRTC -> Turbo -> KCP -> SMUX -> TLS stack",
+                    LogType::Info,
+                );
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let stream = SnowflakeWebRtcStream::connect(SnowflakeWebRtcConfig {
+                        broker_url: broker_url.clone(),
+                        fingerprint: fingerprint.clone(),
+                        stun_urls: stun_urls.clone(),
+                    })
+                    .await?;
+                    self.log(
+                        "Connected to a Snowflake volunteer proxy via WebRTC",
+                        LogType::Success,
+                    );
+                    self.create_channel_from_stream(stream, rsa_id).await?
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let _ = (broker_url, stun_urls);
+                    return Err(TorError::Internal(
+                        "Snowflake WebRTC is only available in browser WASM".to_string(),
+                    ));
+                }
+            }
             BridgeType::DirectSnowflakeWebSocket { url } => {
                 self.log(
                     "Connecting directly to Snowflake via WebSocket",
