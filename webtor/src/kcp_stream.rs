@@ -241,18 +241,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> KcpStream<S> {
             let check = self.kcp.check(self.current_ms());
             if check > 0 {
                 // Wait a bit before trying again
-                #[cfg(not(target_arch = "wasm32"))]
-                tokio::time::sleep(Duration::from_millis(check.min(10) as u64)).await;
-
-                #[cfg(target_arch = "wasm32")]
-                {
-                    use crate::wasm_runtime::WasmRuntime;
-                    use tor_rtcompat::SleepProvider;
-                    let runtime = WasmRuntime::new();
-                    runtime
-                        .sleep(Duration::from_millis(check.min(10) as u64))
-                        .await;
-                }
+                use crate::wasm_runtime::WasmRuntime;
+                use tor_rtcompat::SleepProvider;
+                let runtime = WasmRuntime::new();
+                runtime
+                    .sleep(Duration::from_millis(check.min(10) as u64))
+                    .await;
             }
         }
     }

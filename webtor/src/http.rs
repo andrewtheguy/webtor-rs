@@ -4,8 +4,6 @@ use crate::circuit::CircuitManager;
 use crate::config::{CIRCUIT_PREBUILD_AGE_THRESHOLD_MS, MAX_CIRCUITS};
 use crate::error::{Result, TorError};
 use crate::isolation::{IsolationKey, StreamIsolationPolicy};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::tls::wrap_with_tls;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use http::Method;
 use std::collections::HashMap;
@@ -188,69 +186,60 @@ impl TorHttpClient {
 
         // Execute request with or without TLS
         let response_bytes = if is_https {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                // Wrap stream with TLS using rustls
-                let tls_stream = wrap_with_tls(stream, &host).await?;
-                execute_http_request(tls_stream, &request_bytes).await?
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                // Use subtle-tls for WASM (SubtleCrypto-based TLS)
-                use subtle_tls::{TlsConfig, TlsConnector, TlsVersion};
+            // SubtleCrypto-based TLS
+            use subtle_tls::{TlsConfig, TlsConnector, TlsVersion};
 
-                let config = TlsConfig {
-                    skip_verification: false,
-                    alpn_protocols: vec!["http/1.1".to_string()],
-                    version: TlsVersion::Tls13,
-                };
-                let connector = TlsConnector::with_config(config);
+            let config = TlsConfig {
+                skip_verification: false,
+                alpn_protocols: vec!["http/1.1".to_string()],
+                version: TlsVersion::Tls13,
+            };
+            let connector = TlsConnector::with_config(config);
 
-                // Try TLS 1.3 first
-                match connector.connect(stream, &host).await {
-                    Ok(mut tls_stream) => {
-                        info!(
-                            "TLS 1.3 connection established with {} (WASM/SubtleCrypto)",
-                            host
-                        );
-                        execute_http_request_wasm(&mut tls_stream, &request_bytes).await?
-                    }
-                    Err(tls13_err) => {
-                        warn!(
-                            "TLS 1.3 handshake failed with {}: {}, trying TLS 1.2...",
-                            host, tls13_err
-                        );
+            // Try TLS 1.3 first
+            match connector.connect(stream, &host).await {
+                Ok(mut tls_stream) => {
+                    info!(
+                        "TLS 1.3 connection established with {} (WASM/SubtleCrypto)",
+                        host
+                    );
+                    execute_http_request_wasm(&mut tls_stream, &request_bytes).await?
+                }
+                Err(tls13_err) => {
+                    warn!(
+                        "TLS 1.3 handshake failed with {}: {}, trying TLS 1.2...",
+                        host, tls13_err
+                    );
 
-                        // Get a new stream for TLS 1.2 retry
-                        let stream_tls12 = {
-                            let mut circuit_write = circuit.write().await;
-                            circuit_write.begin_stream(&host, port).await?
-                        };
+                    // Get a new stream for TLS 1.2 retry
+                    let stream_tls12 = {
+                        let circuit_write = circuit.write().await;
+                        circuit_write.begin_stream(&host, port).await?
+                    };
 
-                        // Try TLS 1.2
-                        let config_tls12 = TlsConfig {
-                            skip_verification: false,
-                            alpn_protocols: vec!["http/1.1".to_string()],
-                            version: TlsVersion::Tls12,
-                        };
-                        let connector_tls12 = TlsConnector::with_config(config_tls12);
+                    // Try TLS 1.2
+                    let config_tls12 = TlsConfig {
+                        skip_verification: false,
+                        alpn_protocols: vec!["http/1.1".to_string()],
+                        version: TlsVersion::Tls12,
+                    };
+                    let connector_tls12 = TlsConnector::with_config(config_tls12);
 
-                        match connector_tls12.connect_tls12(stream_tls12, &host).await {
-                            Ok(mut tls_stream) => {
-                                info!(
-                                    "TLS 1.2 connection established with {} (WASM/SubtleCrypto)",
-                                    host
-                                );
-                                execute_http_request_wasm_tls12(&mut tls_stream, &request_bytes)
-                                    .await?
-                            }
-                            Err(tls12_err) => {
-                                warn!("TLS 1.2 handshake also failed with {}: {}", host, tls12_err);
-                                return Err(TorError::tls(format!(
-                                    "TLS handshake failed - TLS 1.3: {}, TLS 1.2: {}",
-                                    tls13_err, tls12_err
-                                )));
-                            }
+                    match connector_tls12.connect_tls12(stream_tls12, &host).await {
+                        Ok(mut tls_stream) => {
+                            info!(
+                                "TLS 1.2 connection established with {} (WASM/SubtleCrypto)",
+                                host
+                            );
+                            execute_http_request_wasm_tls12(&mut tls_stream, &request_bytes)
+                                .await?
+                        }
+                        Err(tls12_err) => {
+                            warn!("TLS 1.2 handshake also failed with {}: {}", host, tls12_err);
+                            return Err(TorError::tls(format!(
+                                "TLS handshake failed - TLS 1.3: {}, TLS 1.2: {}",
+                                tls13_err, tls12_err
+                            )));
                         }
                     }
                 }
@@ -289,7 +278,6 @@ impl TorHttpClient {
 }
 
 /// Trait for TLS streams that support async read/write operations
-#[cfg(target_arch = "wasm32")]
 #[async_trait::async_trait(?Send)]
 trait WasmTlsStream {
     async fn tls_write(&mut self, buf: &[u8]) -> std::io::Result<usize>;
@@ -297,7 +285,6 @@ trait WasmTlsStream {
     async fn tls_read(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
 }
 
-#[cfg(target_arch = "wasm32")]
 #[async_trait::async_trait(?Send)]
 impl<S> WasmTlsStream for subtle_tls::TlsStream<S>
 where
@@ -314,7 +301,6 @@ where
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 #[async_trait::async_trait(?Send)]
 impl<S> WasmTlsStream for subtle_tls::TlsStream12<S>
 where
@@ -332,7 +318,6 @@ where
 }
 
 /// Execute an HTTP request over a TLS stream in WASM using async methods
-#[cfg(target_arch = "wasm32")]
 async fn execute_http_request_wasm<T: WasmTlsStream>(
     tls_stream: &mut T,
     request_bytes: &[u8],
@@ -378,7 +363,6 @@ async fn execute_http_request_wasm<T: WasmTlsStream>(
 }
 
 /// Wrapper for TLS 1.2 streams to use with execute_http_request_wasm
-#[cfg(target_arch = "wasm32")]
 async fn execute_http_request_wasm_tls12<S>(
     tls_stream: &mut subtle_tls::TlsStream12<S>,
     request_bytes: &[u8],

@@ -258,12 +258,8 @@ mod tests {
     #[test]
     fn signaling_uses_snowflake_webrtc_with_caller_stun_urls() {
         let options = signaling_client_options(vec!["stun:example.com".to_string()]);
-        match options.bridge {
-            webtor::config::BridgeType::SnowflakeWebRtc { stun_urls, .. } => {
-                assert_eq!(stun_urls, vec!["stun:example.com"]);
-            }
-            other => panic!("expected Snowflake WebRTC, got {other:?}"),
-        }
+        let webtor::config::BridgeType::SnowflakeWebRtc { stun_urls, .. } = options.bridge;
+        assert_eq!(stun_urls, vec!["stun:example.com"]);
     }
 }
 

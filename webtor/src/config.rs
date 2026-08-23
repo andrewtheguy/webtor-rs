@@ -15,10 +15,9 @@ impl fmt::Debug for LogCallback {
     }
 }
 
-/// Snowflake bridge identity and direct WebSocket endpoint.
+/// Snowflake bridge identity.
 pub const SNOWFLAKE_FINGERPRINT: &str = "2B280B23E1107BB62ABFC40DDCC8824814F80A72";
 pub const SNOWFLAKE_BROKER_URL: &str = "https://snowflake-broker.torproject.net/";
-pub const DIRECT_SNOWFLAKE_WS_URL: &str = "wss://snowflake.torproject.net/";
 
 /// Bridge type configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,24 +29,13 @@ pub enum BridgeType {
         /// STUN URLs supplied by the embedding application.
         stun_urls: Vec<String>,
     },
-    /// Direct connection to the Snowflake bridge WebSocket endpoint.
-    DirectSnowflakeWebSocket {
-        /// WebSocket URL for the Snowflake bridge.
-        url: String,
-    },
-    /// WebTunnel bridge (HTTPS with HTTP Upgrade)
-    WebTunnel {
-        /// Full URL to the WebTunnel endpoint (e.g., https://example.com/secret-path)
-        url: String,
-        /// Optional: Override server name for TLS SNI
-        server_name: Option<String>,
-    },
 }
 
 impl Default for BridgeType {
     fn default() -> Self {
-        BridgeType::DirectSnowflakeWebSocket {
-            url: DIRECT_SNOWFLAKE_WS_URL.to_string(),
+        BridgeType::SnowflakeWebRtc {
+            broker_url: SNOWFLAKE_BROKER_URL.to_string(),
+            stun_urls: Vec::new(),
         }
     }
 }
@@ -161,41 +149,6 @@ impl TorClientOptions {
                 stun_urls,
             },
             bridge_fingerprint: Some(SNOWFLAKE_FINGERPRINT.to_string()),
-            ..Default::default()
-        }
-    }
-
-    /// Connect directly to the Snowflake bridge over WebSocket.
-    pub fn direct_snowflake_websocket() -> Self {
-        Self {
-            bridge: BridgeType::DirectSnowflakeWebSocket {
-                url: DIRECT_SNOWFLAKE_WS_URL.to_string(),
-            },
-            bridge_fingerprint: Some(SNOWFLAKE_FINGERPRINT.to_string()),
-            ..Default::default()
-        }
-    }
-
-    /// Create options for a WebTunnel bridge
-    pub fn webtunnel(url: String, fingerprint: String) -> Self {
-        Self {
-            bridge: BridgeType::WebTunnel {
-                url,
-                server_name: None,
-            },
-            bridge_fingerprint: Some(fingerprint),
-            ..Default::default()
-        }
-    }
-
-    /// Create options for a WebTunnel bridge with custom server name
-    pub fn webtunnel_with_sni(url: String, fingerprint: String, server_name: String) -> Self {
-        Self {
-            bridge: BridgeType::WebTunnel {
-                url,
-                server_name: Some(server_name),
-            },
-            bridge_fingerprint: Some(fingerprint),
             ..Default::default()
         }
     }

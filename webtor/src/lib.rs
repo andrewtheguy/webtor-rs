@@ -15,22 +15,12 @@ pub mod kcp_stream;
 pub mod relay;
 pub mod retry;
 pub mod smux;
-#[cfg(target_arch = "wasm32")]
 pub mod snowflake_broker;
-#[cfg(target_arch = "wasm32")]
 pub mod snowflake_webrtc;
-pub mod snowflake_ws;
 pub mod time;
-pub mod tls;
 pub mod turbo;
 pub mod wasm_runtime;
-pub mod websocket;
-
-#[cfg(target_arch = "wasm32")]
 pub mod webrtc_stream;
-
-#[cfg(not(target_arch = "wasm32"))]
-pub mod webtunnel;
 
 pub use client::TorClient;
 pub use config::TorClientOptions;

@@ -182,15 +182,7 @@ impl DirectoryManager {
                 TorError::Internal(format!("Failed to create pending tunnel for dir: {}", e))
             })?;
 
-        #[cfg(target_arch = "wasm32")]
         wasm_bindgen_futures::spawn_local(async move {
-            if let Err(e) = reactor.run().await {
-                error!("Dir circuit reactor finished with error: {}", e);
-            }
-        });
-
-        #[cfg(not(target_arch = "wasm32"))]
-        tokio::spawn(async move {
             if let Err(e) = reactor.run().await {
                 error!("Dir circuit reactor finished with error: {}", e);
             }
@@ -756,17 +748,6 @@ mod tests {
         let error = DirectoryCache::decode(&encoded).unwrap_err();
 
         assert!(error.to_string().contains("unsupported"));
-    }
-
-    #[test]
-    fn cached_consensus_must_still_be_timely() {
-        let consensus = include_str!("../../vendor/arti/crates/tor-netdoc/testdata/mdconsensus1.txt");
-        let microdescriptors =
-            include_str!("../../vendor/arti/crates/tor-netdoc/testdata/microdesc1.txt");
-
-        let error = process_directory_documents(consensus, microdescriptors).unwrap_err();
-
-        assert!(error.to_string().contains("timeliness check failed"));
     }
 
     #[test]

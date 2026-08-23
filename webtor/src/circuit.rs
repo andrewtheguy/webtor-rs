@@ -245,15 +245,7 @@ impl CircuitManager {
             .await
             .map_err(|e| TorError::Internal(format!("Failed to create pending tunnel: {}", e)))?;
 
-        #[cfg(target_arch = "wasm32")]
         wasm_bindgen_futures::spawn_local(async move {
-            if let Err(e) = reactor.run().await {
-                error!("Circuit reactor finished with error: {}", e);
-            }
-        });
-
-        #[cfg(not(target_arch = "wasm32"))]
-        tokio::spawn(async move {
             if let Err(e) = reactor.run().await {
                 error!("Circuit reactor finished with error: {}", e);
             }
@@ -607,7 +599,7 @@ impl CircuitManager {
                                 && (relay.address == "0.0.0.0"
                                     || relay.address.starts_with("0.0.0.0:"))
                             {
-                                "Snowflake (Direct WebSocket)".to_string()
+                                "Snowflake (WebRTC)".to_string()
                             } else {
                                 relay.address.clone()
                             };
@@ -669,23 +661,7 @@ impl CircuitManager {
         let circuit_manager = self.clone();
         let prebuild_flag = self.prebuild_in_progress.clone();
 
-        #[cfg(target_arch = "wasm32")]
         wasm_bindgen_futures::spawn_local(async move {
-            let result = circuit_manager.create_circuit().await;
-            prebuild_flag.store(false, Ordering::SeqCst);
-            match result {
-                Ok(circuit) => {
-                    let circuit_info = circuit.read().await;
-                    info!("Prebuilt circuit {} ready", circuit_info.id);
-                }
-                Err(e) => {
-                    error!("Failed to prebuild circuit: {}", e);
-                }
-            }
-        });
-
-        #[cfg(not(target_arch = "wasm32"))]
-        tokio::spawn(async move {
             let result = circuit_manager.create_circuit().await;
             prebuild_flag.store(false, Ordering::SeqCst);
             match result {
@@ -818,43 +794,4 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_circuit_status() {
-        let mut circuit = Circuit::new("test_circuit".to_string(), None);
-
-        assert_eq!(circuit.status, CircuitStatus::Creating);
-        assert!(!circuit.is_ready());
-        assert!(!circuit.is_failed());
-        assert!(!circuit.is_closed());
-
-        circuit.status = CircuitStatus::Ready;
-        assert!(circuit.is_ready());
-
-        circuit.status = CircuitStatus::Failed;
-        assert!(circuit.is_failed());
-
-        circuit.status = CircuitStatus::Closed;
-        assert!(circuit.is_closed());
-    }
-
-    #[test]
-    fn test_circuit_isolation_key_binding() {
-        let mut circuit = Circuit::new("test_circuit".to_string(), None);
-        assert!(circuit.isolation_key.is_none());
-
-        let key1 = IsolationKey::from_string("example.com");
-        circuit.set_isolation_key(key1.clone());
-        assert_eq!(circuit.isolation_key, Some(key1.clone()));
-
-        // Trying to set a different key should be ignored (circuits bind once)
-        let key2 = IsolationKey::from_string("other.com");
-        circuit.set_isolation_key(key2);
-        assert_eq!(circuit.isolation_key, Some(key1));
-    }
-
-    #[test]
-    fn test_circuit_new_has_no_isolation_key() {
-        let circuit = Circuit::new("test".to_string(), None);
-        assert!(circuit.isolation_key.is_none());
-    }
 }

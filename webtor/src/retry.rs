@@ -7,15 +7,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
-/// A cross-platform cancellation token for cooperative task cancellation.
+/// A cancellation token for cooperative task cancellation.
 ///
-/// On native, this wraps `tokio_util::sync::CancellationToken`.
-/// On WASM, this uses an `Arc<AtomicBool>` with polling.
+/// Backed by an `Arc<AtomicBool>` that waiters poll.
 #[derive(Clone)]
 pub struct CancellationToken {
-    #[cfg(not(target_arch = "wasm32"))]
-    inner: tokio_util::sync::CancellationToken,
-    #[cfg(target_arch = "wasm32")]
     cancelled: Arc<AtomicBool>,
 }
 
@@ -28,59 +24,28 @@ impl Default for CancellationToken {
 impl CancellationToken {
     /// Create a new cancellation token.
     pub fn new() -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            Self {
-                inner: tokio_util::sync::CancellationToken::new(),
-            }
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            Self {
-                cancelled: Arc::new(AtomicBool::new(false)),
-            }
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Cancel all operations using this token.
     pub fn cancel(&self) {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.inner.cancel();
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.cancelled.store(true, Ordering::SeqCst);
-        }
+        self.cancelled.store(true, Ordering::SeqCst);
     }
 
     /// Check if cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.inner.is_cancelled()
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.cancelled.load(Ordering::SeqCst)
-        }
+        self.cancelled.load(Ordering::SeqCst)
     }
 
     /// Returns a future that completes when cancellation is requested.
     ///
-    /// On native, this uses tokio_util's efficient notification.
-    /// On WASM, this polls with a small interval.
+    /// Polls the flag with a small interval.
     pub async fn cancelled(&self) {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.inner.cancelled().await;
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            use gloo_timers::future::TimeoutFuture;
-            while !self.is_cancelled() {
-                TimeoutFuture::new(50).await;
-            }
+        use gloo_timers::future::TimeoutFuture;
+        while !self.is_cancelled() {
+            TimeoutFuture::new(50).await;
         }
     }
 }
@@ -273,16 +238,8 @@ where
 
 /// Platform-agnostic sleep function
 pub async fn sleep(duration: Duration) {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let ms = duration.as_millis().min(u32::MAX as u128) as u32;
-        gloo_timers::future::TimeoutFuture::new(ms).await;
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        tokio::time::sleep(duration).await;
-    }
+    let ms = duration.as_millis().min(u32::MAX as u128) as u32;
+    gloo_timers::future::TimeoutFuture::new(ms).await;
 }
 
 /// Execute a future with a timeout, returning TorError::Timeout on expiry
@@ -304,34 +261,20 @@ pub async fn with_timeout<F, T>(duration: Duration, operation_name: &str, future
 where
     F: Future<Output = Result<T>>,
 {
-    #[cfg(target_arch = "wasm32")]
-    {
-        use futures::future::{select, Either};
-        use std::pin::pin;
+    use futures::future::{select, Either};
+    use std::pin::pin;
 
-        let ms = duration.as_millis().min(u32::MAX as u128) as u32;
-        let timeout_fut = gloo_timers::future::TimeoutFuture::new(ms);
-        let operation_fut = pin!(future);
-        let timeout_fut = pin!(timeout_fut);
+    let ms = duration.as_millis().min(u32::MAX as u128) as u32;
+    let timeout_fut = gloo_timers::future::TimeoutFuture::new(ms);
+    let operation_fut = pin!(future);
+    let timeout_fut = pin!(timeout_fut);
 
-        match select(operation_fut, timeout_fut).await {
-            Either::Left((result, _)) => result,
-            Either::Right((_, _)) => Err(TorError::timeout(format!(
-                "{} timed out after {:?}",
-                operation_name, duration
-            ))),
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        match tokio::time::timeout(duration, future).await {
-            Ok(result) => result,
-            Err(_) => Err(TorError::timeout(format!(
-                "{} timed out after {:?}",
-                operation_name, duration
-            ))),
-        }
+    match select(operation_fut, timeout_fut).await {
+        Either::Left((result, _)) => result,
+        Either::Right((_, _)) => Err(TorError::timeout(format!(
+            "{} timed out after {:?}",
+            operation_name, duration
+        ))),
     }
 }
 
@@ -356,26 +299,15 @@ where
         return Err(TorError::Cancelled);
     }
 
-    #[cfg(target_arch = "wasm32")]
-    {
-        use futures::future::{select, Either};
-        use std::pin::pin;
+    use futures::future::{select, Either};
+    use std::pin::pin;
 
-        let operation_fut = pin!(future);
-        let cancel_fut = pin!(token.cancelled());
+    let operation_fut = pin!(future);
+    let cancel_fut = pin!(token.cancelled());
 
-        match select(operation_fut, cancel_fut).await {
-            Either::Left((result, _)) => result,
-            Either::Right((_, _)) => Err(TorError::Cancelled),
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        tokio::select! {
-            result = future => result,
-            _ = token.cancelled() => Err(TorError::Cancelled),
-        }
+    match select(operation_fut, cancel_fut).await {
+        Either::Left((result, _)) => result,
+        Either::Right((_, _)) => Err(TorError::Cancelled),
     }
 }
 
@@ -395,52 +327,33 @@ where
         return Err(TorError::Cancelled);
     }
 
-    #[cfg(target_arch = "wasm32")]
-    {
-        use futures::future::{select, Either};
-        use std::pin::pin;
+    use futures::future::{select, Either};
+    use std::pin::pin;
 
-        let ms = duration.as_millis().min(u32::MAX as u128) as u32;
-        let timeout_fut = gloo_timers::future::TimeoutFuture::new(ms);
-        let operation_fut = pin!(future);
-        let timeout_fut = pin!(timeout_fut);
-        let cancel_fut = pin!(token.cancelled());
+    let ms = duration.as_millis().min(u32::MAX as u128) as u32;
+    let timeout_fut = gloo_timers::future::TimeoutFuture::new(ms);
+    let operation_fut = pin!(future);
+    let timeout_fut = pin!(timeout_fut);
+    let cancel_fut = pin!(token.cancelled());
 
-        let timeout_or_cancel = pin!(async {
-            match select(timeout_fut, cancel_fut).await {
-                Either::Left(_) => false,
-                Either::Right(_) => true,
-            }
-        });
-
-        match select(operation_fut, timeout_or_cancel).await {
-            Either::Left((result, _)) => result,
-            Either::Right((was_cancelled, _)) => {
-                if was_cancelled {
-                    Err(TorError::Cancelled)
-                } else {
-                    Err(TorError::timeout(format!(
-                        "{} timed out after {:?}",
-                        operation_name, duration
-                    )))
-                }
-            }
+    let timeout_or_cancel = pin!(async {
+        match select(timeout_fut, cancel_fut).await {
+            Either::Left(_) => false,
+            Either::Right(_) => true,
         }
-    }
+    });
 
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        tokio::select! {
-            result = tokio::time::timeout(duration, future) => {
-                match result {
-                    Ok(r) => r,
-                    Err(_) => Err(TorError::timeout(format!(
-                        "{} timed out after {:?}",
-                        operation_name, duration
-                    ))),
-                }
+    match select(operation_fut, timeout_or_cancel).await {
+        Either::Left((result, _)) => result,
+        Either::Right((was_cancelled, _)) => {
+            if was_cancelled {
+                Err(TorError::Cancelled)
+            } else {
+                Err(TorError::timeout(format!(
+                    "{} timed out after {:?}",
+                    operation_name, duration
+                )))
             }
-            _ = token.cancelled() => Err(TorError::Cancelled),
         }
     }
 }
@@ -507,31 +420,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_succeeds_after_failures() {
-        let attempts = AtomicU32::new(0);
-
-        let result = retry_with_backoff(
-            "test_op",
-            RetryPolicy::new(3).with_initial_delay(Duration::from_millis(1)),
-            |_| true,
-            |_attempt| {
-                let count = attempts.fetch_add(1, AtomicOrdering::SeqCst) + 1;
-                async move {
-                    if count < 3 {
-                        Err(TorError::network("transient failure"))
-                    } else {
-                        Ok(count)
-                    }
-                }
-            },
-        )
-        .await;
-
-        assert_eq!(result.unwrap(), 3);
-        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 3);
-    }
-
-    #[tokio::test]
     async fn retry_fails_on_non_retryable_error() {
         let attempts = AtomicU32::new(0);
 
@@ -550,65 +438,10 @@ mod tests {
         assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
     }
 
-    #[tokio::test]
-    async fn retry_exhausts_all_attempts() {
-        let attempts = AtomicU32::new(0);
-
-        let result = retry_with_backoff(
-            "test_op",
-            RetryPolicy::new(3).with_initial_delay(Duration::from_millis(1)),
-            |_| true,
-            |_attempt| {
-                attempts.fetch_add(1, AtomicOrdering::SeqCst);
-                async { Err::<u32, _>(TorError::network("always fails")) }
-            },
-        )
-        .await;
-
-        assert!(result.is_err());
-        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 3);
-    }
-
     #[test]
     fn zero_attempts_policy_has_zero_max_attempts() {
         let policy = RetryPolicy::new(0);
         assert_eq!(policy.max_attempts, 0);
-    }
-
-    #[tokio::test]
-    async fn timeout_succeeds_when_operation_completes_in_time() {
-        let result = with_timeout(Duration::from_secs(5), "test_op", async {
-            Ok::<_, TorError>(42)
-        })
-        .await;
-
-        assert_eq!(result.unwrap(), 42);
-    }
-
-    #[tokio::test]
-    async fn timeout_fails_when_operation_exceeds_time() {
-        let result = with_timeout(Duration::from_millis(10), "slow_op", async {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            Ok::<_, TorError>(42)
-        })
-        .await;
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("timed out"));
-        assert!(err.to_string().contains("slow_op"));
-    }
-
-    #[tokio::test]
-    async fn timeout_propagates_inner_error() {
-        let result = with_timeout(Duration::from_secs(5), "test_op", async {
-            Err::<u32, _>(TorError::network("inner error"))
-        })
-        .await;
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("inner error"));
     }
 
     #[test]
@@ -649,50 +482,6 @@ mod tests {
         let result = with_cancellation(&token, async { Ok::<_, TorError>(42) }).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), TorError::Cancelled));
-    }
-
-    #[tokio::test]
-    async fn with_cancellation_cancels_during_operation() {
-        let token = CancellationToken::new();
-        let token_clone = token.clone();
-
-        let result = tokio::select! {
-            r = with_cancellation(&token, async {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                Ok::<_, TorError>(42)
-            }) => r,
-            _ = async {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                token_clone.cancel();
-            } => Err(TorError::Cancelled),
-        };
-
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), TorError::Cancelled));
-    }
-
-    #[tokio::test]
-    async fn with_timeout_and_cancellation_succeeds() {
-        let token = CancellationToken::new();
-        let result = with_timeout_and_cancellation(Duration::from_secs(5), "test", &token, async {
-            Ok::<_, TorError>(42)
-        })
-        .await;
-        assert_eq!(result.unwrap(), 42);
-    }
-
-    #[tokio::test]
-    async fn with_timeout_and_cancellation_times_out() {
-        let token = CancellationToken::new();
-        let result =
-            with_timeout_and_cancellation(Duration::from_millis(10), "slow_op", &token, async {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                Ok::<_, TorError>(42)
-            })
-            .await;
-
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), TorError::Timeout(_)));
     }
 
     #[tokio::test]

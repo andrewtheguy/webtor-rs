@@ -51,35 +51,22 @@ impl WasmSleep {
     fn new(duration: Duration) -> Self {
         let (tx, rx) = futures::channel::oneshot::channel();
 
-        #[cfg(target_arch = "wasm32")]
-        {
-            use wasm_bindgen::prelude::*;
-            use wasm_bindgen::JsCast;
+        use wasm_bindgen::prelude::*;
+        use wasm_bindgen::JsCast;
 
-            let millis =
-                i32::try_from(duration.as_millis().min(i32::MAX as u128)).unwrap_or(i32::MAX);
+        let millis = i32::try_from(duration.as_millis().min(i32::MAX as u128)).unwrap_or(i32::MAX);
 
-            let closure = Closure::once(move || {
-                let _ = tx.send(());
-            });
+        let closure = Closure::once(move || {
+            let _ = tx.send(());
+        });
 
-            let window = web_sys::window().expect("should have a window in this context");
-            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                closure.as_ref().unchecked_ref(),
-                millis,
-            );
+        let window = web_sys::window().expect("should have a window in this context");
+        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            closure.as_ref().unchecked_ref(),
+            millis,
+        );
 
-            closure.forget();
-        }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let duration = duration.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(duration);
-                let _ = tx.send(());
-            });
-        }
+        closure.forget();
 
         Self { rx }
     }

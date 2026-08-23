@@ -384,7 +384,6 @@ mod tests {
         assert!(!exit_relays[0].flags.contains(flags::BAD_EXIT));
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     mod proptests {
         use super::*;
         use proptest::prelude::*;

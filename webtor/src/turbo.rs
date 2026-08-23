@@ -443,7 +443,6 @@ mod tests {
         assert!(TurboFrame::decode(&encoded).unwrap().is_some());
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     mod proptests {
         use super::*;
         use proptest::prelude::*;

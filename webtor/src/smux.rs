@@ -824,7 +824,6 @@ mod tests {
         assert!(SmuxSegment::decode(&buf).is_err());
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     mod proptests {
         use super::*;
         use proptest::prelude::*;
