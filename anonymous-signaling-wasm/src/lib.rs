@@ -145,16 +145,10 @@ impl AnonymousSignalingClient {
             let client = TorClient::new(signaling_client_options(stun_urls))
                 .await
                 .map_err(|error| js_error("Failed to initialize webtor", error))?;
+            // Only a failed directory download reaches for this copy; a normal
+            // start always bootstraps from a freshly downloaded consensus.
             if let Some(encoded) = cached_directory.filter(|value| !value.is_empty()) {
-                if let Err(error) = client.load_directory_cache(&encoded).await {
-                    log_tor_progress(
-                        &format!(
-                            "Cached Tor directory data was rejected; downloading fresh data: {}",
-                            error
-                        ),
-                        LogType::Info,
-                    );
-                }
+                client.set_directory_cache_fallback(&encoded).await;
             }
             client
                 .ensure_ready()

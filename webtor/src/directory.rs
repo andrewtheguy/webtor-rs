@@ -150,10 +150,6 @@ impl DirectoryManager {
         cache.as_ref().map(DirectoryCache::encode).transpose()
     }
 
-    pub async fn has_directory_data(&self) -> bool {
-        !self.relay_manager.read().await.relays.is_empty()
-    }
-
     async fn install_directory(&self, processed: ProcessedDirectory, from_cache: bool) {
         let count = processed.relays.len();
         {
