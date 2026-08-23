@@ -5,6 +5,7 @@ use crate::relay::{Relay, RelayManager};
 use crate::time::system_time_now;
 use futures::{AsyncReadExt, AsyncWriteExt};
 use std::collections::HashMap;
+#[cfg(target_arch = "wasm32")]
 use std::io::Read;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -16,9 +17,15 @@ use tor_proto::channel::Channel;
 use tor_proto::client::circuit::TimeoutEstimator;
 use tracing::{debug, error, info, warn};
 
-/// Base URL for cached consensus files (GitHub Pages)
+/// Bootstrap directory data bundled into the WASM binary.
+///
+/// A Tor circuit cannot fetch fresh directory data until it has enough relay
+/// information to build that first circuit. Embedding the compressed snapshot
+/// avoids a cross-origin bootstrap dependency and works from any static host.
 #[cfg(target_arch = "wasm32")]
-const CACHED_CONSENSUS_BASE_URL: &str = "https://privacy-ethereum.github.io/webtor-rs";
+const CACHED_CONSENSUS: &[u8] = include_bytes!("cached/consensus.txt.br");
+#[cfg(target_arch = "wasm32")]
+const CACHED_MICRODESCRIPTORS: &[u8] = include_bytes!("cached/microdescriptors.txt.br");
 
 /// Directory manager for handling network documents
 pub struct DirectoryManager {
@@ -30,37 +37,26 @@ impl DirectoryManager {
         Self { relay_manager }
     }
 
-    /// Load relays from cached consensus data fetched from static URL.
+    /// Load relays from the bundled cached consensus data.
     /// This is used for WASM builds where we can't fetch consensus before establishing a circuit.
     #[cfg(target_arch = "wasm32")]
     pub async fn load_cached_consensus(&self) -> Result<()> {
-        info!("Fetching cached consensus from static URL...");
-
-        // Fetch brotli-compressed consensus
-        let consensus_url = format!("{}/consensus.txt.br", CACHED_CONSENSUS_BASE_URL);
-        let consensus_bytes = fetch_url(&consensus_url)
-            .await
-            .map_err(|e| TorError::Internal(format!("Failed to fetch cached consensus: {}", e)))?;
+        info!("Loading bundled cached consensus...");
         info!(
-            "Fetched compressed consensus: {} bytes",
-            consensus_bytes.len()
+            "Loaded compressed consensus: {} bytes",
+            CACHED_CONSENSUS.len()
         );
 
-        let consensus_body = decompress_brotli(&consensus_bytes)
+        let consensus_body = decompress_brotli(CACHED_CONSENSUS)
             .map_err(|e| TorError::Internal(format!("Failed to decompress consensus: {}", e)))?;
         info!("Decompressed consensus: {} bytes", consensus_body.len());
 
-        // Fetch brotli-compressed microdescriptors
-        let microdescs_url = format!("{}/microdescriptors.txt.br", CACHED_CONSENSUS_BASE_URL);
-        let microdescs_bytes = fetch_url(&microdescs_url).await.map_err(|e| {
-            TorError::Internal(format!("Failed to fetch cached microdescriptors: {}", e))
-        })?;
         info!(
-            "Fetched compressed microdescriptors: {} bytes",
-            microdescs_bytes.len()
+            "Loaded compressed microdescriptors: {} bytes",
+            CACHED_MICRODESCRIPTORS.len()
         );
 
-        let microdescs_body = decompress_brotli(&microdescs_bytes).map_err(|e| {
+        let microdescs_body = decompress_brotli(CACHED_MICRODESCRIPTORS).map_err(|e| {
             TorError::Internal(format!("Failed to decompress microdescriptors: {}", e))
         })?;
         info!(
@@ -535,45 +531,4 @@ fn decompress_brotli(compressed: &[u8]) -> std::io::Result<String> {
     decoder.read_to_end(&mut decompressed)?;
     String::from_utf8(decompressed)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-}
-
-/// Fetch a URL and return the response body as bytes (WASM only)
-#[cfg(target_arch = "wasm32")]
-async fn fetch_url(url: &str) -> std::result::Result<Vec<u8>, String> {
-    use wasm_bindgen::JsCast;
-    use wasm_bindgen_futures::JsFuture;
-    use web_sys::{Request, RequestInit, Response};
-
-    let window = web_sys::window().ok_or("No window")?;
-
-    let mut opts = RequestInit::new();
-    opts.set_method("GET");
-
-    let request = Request::new_with_str_and_init(url, &opts)
-        .map_err(|e| format!("Failed to create request: {:?}", e))?;
-
-    let resp_value = JsFuture::from(window.fetch_with_request(&request))
-        .await
-        .map_err(|e| format!("Fetch failed: {:?}", e))?;
-
-    let resp: Response = resp_value
-        .dyn_into()
-        .map_err(|_| "Response is not a Response")?;
-
-    if !resp.ok() {
-        return Err(format!("HTTP error: {}", resp.status()));
-    }
-
-    let array_buffer = JsFuture::from(
-        resp.array_buffer()
-            .map_err(|e| format!("Failed to get array buffer: {:?}", e))?,
-    )
-    .await
-    .map_err(|e| format!("Failed to read response: {:?}", e))?;
-
-    let uint8_array = js_sys::Uint8Array::new(&array_buffer);
-    let mut bytes = vec![0u8; uint8_array.length() as usize];
-    uint8_array.copy_to(&mut bytes);
-
-    Ok(bytes)
 }
