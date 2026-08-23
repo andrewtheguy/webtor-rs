@@ -1,4 +1,4 @@
-//! Future direct browser WebSocket transport for the Snowflake bridge.
+//! Direct browser WebSocket transport for the Snowflake bridge.
 
 use crate::error::{Result, TorError};
 use crate::kcp_stream::{KcpConfig, KcpStream};

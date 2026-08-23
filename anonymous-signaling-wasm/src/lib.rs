@@ -16,6 +16,13 @@ const MAX_NOSTR_MESSAGE_BYTES: usize = 1024 * 1024;
 const CONNECTION_TIMEOUT_MS: u64 = 240_000;
 const TOR_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const TOR_CHECK_URL: &str = "https://check.torproject.org/api/ip";
+/// Echoes any frame back verbatim, so a returned nonce is proof of a working
+/// round trip. It must serve TLS 1.3, since subtle-tls offers nothing older:
+/// `ws.postman-echo.com`, for one, is TLS 1.2 only and drops the connection
+/// mid-handshake. This endpoint opens with an unsolicited greeting frame,
+/// which the nonce comparison below skips.
+const WEBSOCKET_CHECK_URL: &str = "wss://echo.websocket.org/";
+const WEBSOCKET_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const RELAY_TCP_TIMEOUT: Duration = Duration::from_secs(30);
 const RELAY_TLS_TIMEOUT: Duration = Duration::from_secs(30);
 const RELAY_WEBSOCKET_TIMEOUT: Duration = Duration::from_secs(30);
@@ -68,12 +75,78 @@ async fn verify_tor_exit(client: &TorClient) -> Result<(), JsValue> {
     Ok(())
 }
 
+/// Runs immediately after the exit is verified and before the caller opens any
+/// relay stream. Proves the verified exit can carry a single `wss` stream, so
+/// a bridge that cannot carry any WebSocket stops looking exactly like Nostr
+/// relays that happen to be unreachable — today both fail the same way, with
+/// every relay stream timing out and nothing to tell the two apart.
+async fn verify_websocket_stream(client: &TorClient) -> Result<(), JsValue> {
+    log_tor_progress("Verifying a WebSocket stream over Tor...", LogType::Info);
+    let url = Url::parse(WEBSOCKET_CHECK_URL)
+        .map_err(|error| js_error("WebSocket verification URL is invalid", error))?;
+
+    let tls_stream = connect_tls(client, &url).await?;
+    let (socket, _) = webtor::with_timeout(
+        RELAY_WEBSOCKET_TIMEOUT,
+        "WebSocket verification handshake",
+        async {
+            async_tungstenite::client_async(url.as_str(), tls_stream)
+                .await
+                .map_err(|error| TorError::websocket_connection(error.to_string()))
+        },
+    )
+    .await
+    .map_err(|error| js_error("WebSocket verification handshake failed", error))?;
+
+    let (mut writer, mut reader) = socket.split();
+    let nonce = format!("ptransfer-websocket-check-{}", js_sys::Math::random());
+    webtor::with_timeout(
+        WEBSOCKET_CHECK_TIMEOUT,
+        "WebSocket verification echo",
+        async {
+            writer
+                .send(Message::Text(nonce.clone().into()))
+                .await
+                .map_err(|error| TorError::websocket_connection(error.to_string()))?;
+            while let Some(message) = reader.next().await {
+                match message
+                    .map_err(|error| TorError::websocket_connection(error.to_string()))?
+                {
+                    Message::Text(text) if text.as_str() == nonce => return Ok(()),
+                    Message::Ping(payload) => {
+                        writer.send(Message::Pong(payload)).await.map_err(|error| {
+                            TorError::websocket_connection(error.to_string())
+                        })?;
+                    }
+                    Message::Close(_) => break,
+                    // A greeting or any other frame is not the echo; keep reading.
+                    _ => continue,
+                }
+            }
+            Err(TorError::websocket_connection(
+                "the echo endpoint closed before returning the nonce".to_string(),
+            ))
+        },
+    )
+    .await
+    .map_err(|error| js_error("WebSocket verification failed", error))?;
+
+    let _ = writer.send(Message::Close(None)).await;
+    log_tor_progress("WebSocket over Tor verified.", LogType::Success);
+    Ok(())
+}
+
 type RelayTlsStream = TlsStream<DataStream>;
 type RelayWriter = async_tungstenite::WebSocketSender<RelayTlsStream>;
 type RelayReader = async_tungstenite::WebSocketReceiver<RelayTlsStream>;
 
-fn signaling_client_options(stun_urls: Vec<String>) -> TorClientOptions {
-    TorClientOptions::snowflake_webrtc(stun_urls)
+fn signaling_client_options(stun_urls: Vec<String>, websocket_bridge: bool) -> TorClientOptions {
+    let options = if websocket_bridge {
+        TorClientOptions::snowflake_websocket()
+    } else {
+        TorClientOptions::snowflake_webrtc(stun_urls)
+    };
+    options
         .with_connection_timeout(CONNECTION_TIMEOUT_MS)
         .with_on_log(log_tor_progress)
 }
@@ -126,7 +199,11 @@ pub struct AnonymousSignalingClient {
 #[wasm_bindgen]
 impl AnonymousSignalingClient {
     #[wasm_bindgen(js_name = create)]
-    pub fn create(cached_directory: Option<String>, stun_urls: js_sys::Array) -> js_sys::Promise {
+    pub fn create(
+        cached_directory: Option<String>,
+        stun_urls: js_sys::Array,
+        websocket_bridge: bool,
+    ) -> js_sys::Promise {
         future_to_promise(async move {
             console_error_panic_hook::set_once();
             let stun_urls = stun_urls
@@ -137,12 +214,14 @@ impl AnonymousSignalingClient {
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            if stun_urls.is_empty() {
+            // The direct WebSocket bridge dials Snowflake itself, so it needs
+            // no STUN; the WebRTC proxy path cannot negotiate without one.
+            if !websocket_bridge && stun_urls.is_empty() {
                 return Err(JsValue::from_str(
-                    "Anonymous signaling requires at least one STUN URL",
+                    "Anonymous signaling over WebRTC requires at least one STUN URL",
                 ));
             }
-            let client = TorClient::new(signaling_client_options(stun_urls))
+            let client = TorClient::new(signaling_client_options(stun_urls, websocket_bridge))
                 .await
                 .map_err(|error| js_error("Failed to initialize webtor", error))?;
             // Only a failed directory download reaches for this copy; a normal
@@ -155,6 +234,7 @@ impl AnonymousSignalingClient {
                 .await
                 .map_err(|error| js_error("Failed to establish Tor connection", error))?;
             verify_tor_exit(&client).await?;
+            verify_websocket_stream(&client).await?;
 
             Ok(JsValue::from(Self {
                 client: Arc::new(client),
@@ -232,11 +312,20 @@ mod tests {
 
     #[test]
     fn signaling_uses_snowflake_webrtc_with_caller_stun_urls() {
-        let options = signaling_client_options(vec!["stun:example.com".to_string()]);
+        let options = signaling_client_options(vec!["stun:example.com".to_string()], false);
         let webtor::BridgeType::SnowflakeWebRtc { stun_urls, .. } = options.bridge else {
             panic!("signaling must use Snowflake WebRTC");
         };
         assert_eq!(stun_urls, vec!["stun:example.com"]);
+    }
+
+    #[test]
+    fn signaling_uses_the_direct_websocket_bridge_when_asked() {
+        let options = signaling_client_options(vec!["stun:example.com".to_string()], true);
+        assert!(matches!(
+            options.bridge,
+            webtor::BridgeType::SnowflakeWebSocket { .. }
+        ));
     }
 }
 

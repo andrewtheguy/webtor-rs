@@ -8,8 +8,8 @@ Only the core browser Tor client, its TLS implementation, and the Arti crates
 patched by upstream for WebAssembly are retained. Anonymous signaling currently
 uses the Snowflake broker and browser WebRTC client transport with STUN URLs
 supplied by the embedding application. The direct browser Snowflake WebSocket
-transport is also retained as an inactive path for a future explicit transport
-policy; it is not an automatic fallback. pTransfer adds:
+transport is also retained, selectable per transfer from the Anonymous signaling
+options; it is not an automatic fallback. pTransfer adds:
 
 - `TorClient::open_stream`, an exit-side raw TCP stream API;
 - `anonymous-signaling-wasm`, a TLS WebSocket binding used only for Nostr

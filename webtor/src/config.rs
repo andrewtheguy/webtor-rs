@@ -28,7 +28,7 @@ pub enum BridgeType {
         broker_url: String,
         stun_urls: Vec<String>,
     },
-    /// Reserved browser WebSocket path for a future explicit transport policy.
+    /// Direct browser WebSocket to the bridge, chosen explicitly by the caller.
     SnowflakeWebSocket { url: String },
 }
 
@@ -59,7 +59,8 @@ impl TorClientOptions {
         }
     }
 
-    /// Construct the future direct browser WebSocket transport explicitly.
+    /// Construct the direct browser WebSocket transport: no broker, no
+    /// volunteer proxy, and no STUN, at the cost of one fixed endpoint.
     pub fn snowflake_websocket() -> Self {
         Self {
             bridge: BridgeType::SnowflakeWebSocket {
