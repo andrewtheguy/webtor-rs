@@ -103,7 +103,7 @@ impl AnonymousSignalingClient {
     pub fn create() -> js_sys::Promise {
         future_to_promise(async move {
             console_error_panic_hook::set_once();
-            let options = TorClientOptions::snowflake_webrtc()
+            let options = TorClientOptions::direct_snowflake_websocket()
                 .with_connection_timeout(CONNECTION_TIMEOUT_MS)
                 .with_circuit_timeout(CIRCUIT_TIMEOUT_MS)
                 .with_create_circuit_early(false)

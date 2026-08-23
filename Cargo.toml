@@ -51,31 +51,12 @@ web-sys = { version = "0.3.69", features = [
     "Request",
     "Headers",
     "RequestInit",
-    # WebRTC features for Snowflake
-    "RtcPeerConnection",
-    "RtcPeerConnectionIceEvent",
-    "RtcIceCandidate",
-    "RtcIceCandidateInit",
-    "RtcSessionDescription",
-    "RtcSessionDescriptionInit",
-    "RtcSdpType",
-    "RtcConfiguration",
-    "RtcIceServer",
-    "RtcDataChannel",
-    "RtcDataChannelEvent",
-    "RtcDataChannelInit",
-    "RtcDataChannelState",
-    "RtcIceConnectionState",
-    "RtcIceGatheringState",
-    "RtcSignalingState",
-    "RtcDataChannelType",
     # HTTP fetch features
     "RequestMode",
     # Performance API for timing
     "Performance"
 ] }
 serde = { version = "1.0", features = ["derive"] }
-serde-wasm-bindgen = "0.6"
 thiserror = "1.0"
 anyhow = "1.0"
 tokio = { version = "1", features = ["sync", "macros", "io-util", "rt", "time"] }

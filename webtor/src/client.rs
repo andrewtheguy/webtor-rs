@@ -1,14 +1,12 @@
 //! Main Tor client implementation
 
 use crate::circuit::{CircuitManager, CircuitStatusInfo};
-use crate::config::{BridgeType, LogType, TorClientOptions, SNOWFLAKE_FINGERPRINT_PRIMARY};
+use crate::config::{BridgeType, LogType, TorClientOptions, SNOWFLAKE_FINGERPRINT};
 use crate::directory::DirectoryManager;
 use crate::error::{Result, TorError};
 use crate::http::{HttpRequest, HttpResponse, TorHttpClient};
 use crate::relay::RelayManager;
 use crate::retry::{with_timeout_and_cancellation, CancellationToken};
-#[cfg(target_arch = "wasm32")]
-use crate::snowflake::{SnowflakeBridge, SnowflakeConfig};
 #[cfg(target_arch = "wasm32")]
 use crate::snowflake_ws::{SnowflakeWsConfig, SnowflakeWsStream};
 use crate::time::system_time_now;
@@ -104,21 +102,17 @@ impl TorClient {
 
     /// Make a one-time fetch request through Tor with a temporary circuit
     pub async fn fetch_one_time(
-        snowflake_url: &str,
         url: &str,
         connection_timeout: Option<u64>,
         circuit_timeout: Option<u64>,
     ) -> Result<HttpResponse> {
-        info!(
-            "Making one-time fetch request to {} through Snowflake {}",
-            url, snowflake_url
-        );
+        info!("Making one-time fetch request to {} through Tor", url);
 
-        let options = TorClientOptions::new(snowflake_url.to_string())
+        let options = TorClientOptions::direct_snowflake_websocket()
             .with_create_circuit_early(true) // Ensure channel is established
             .with_circuit_update_interval(None) // No auto-updates for one-time use
-            .with_connection_timeout(connection_timeout.unwrap_or(15_000))
-            .with_circuit_timeout(circuit_timeout.unwrap_or(90_000));
+            .with_connection_timeout(connection_timeout.unwrap_or(240_000))
+            .with_circuit_timeout(circuit_timeout.unwrap_or(120_000));
 
         let client = Self::new(options).await?;
 
@@ -406,14 +400,14 @@ impl TorClient {
         #[cfg(not(target_arch = "wasm32"))]
         let timeout = self.options.connection_timeout_duration();
 
-        // Get fingerprint - use default for Snowflake if not provided
+        // Get fingerprint - use the known Snowflake bridge identity if omitted.
         let fingerprint = match &self.options.bridge {
-            BridgeType::Snowflake { .. } | BridgeType::SnowflakeWebRtc { .. } => self
+            BridgeType::DirectSnowflakeWebSocket { .. } => self
                 .options
                 .bridge_fingerprint
                 .as_ref()
                 .cloned()
-                .unwrap_or_else(|| SNOWFLAKE_FINGERPRINT_PRIMARY.to_string()),
+                .unwrap_or_else(|| SNOWFLAKE_FINGERPRINT.to_string()),
             BridgeType::WebTunnel { .. } => self
                 .options
                 .bridge_fingerprint
@@ -441,21 +435,23 @@ impl TorClient {
 
         // 1. Connect to bridge based on type
         let chan = match &self.options.bridge {
-            BridgeType::Snowflake { url } => {
-                self.log("Connecting via Snowflake (WebSocket)", LogType::Info);
+            BridgeType::DirectSnowflakeWebSocket { url } => {
+                self.log(
+                    "Connecting directly to Snowflake via WebSocket",
+                    LogType::Info,
+                );
                 self.log(
                     "Using WebSocket -> Turbo -> KCP -> SMUX -> TLS stack",
                     LogType::Info,
                 );
                 #[cfg(target_arch = "wasm32")]
                 {
-                    // Use WebSocket-based Snowflake (simpler, less censorship resistant)
                     let config = SnowflakeWsConfig::default()
                         .with_url(url)
                         .with_fingerprint(&fingerprint);
                     let stream = SnowflakeWsStream::connect(config).await?;
                     self.log(
-                        "Connected to Snowflake bridge via WebSocket",
+                        "Connected directly to Snowflake bridge via WebSocket",
                         LogType::Success,
                     );
                     self.create_channel_from_stream(stream, rsa_id).await?
@@ -465,36 +461,6 @@ impl TorClient {
                     let _ = url; // suppress unused warning
                     return Err(TorError::Internal(
                         "Snowflake WebSocket is only available in WASM. \
-                         Use WebTunnel bridge for native builds."
-                            .to_string(),
-                    ));
-                }
-            }
-            BridgeType::SnowflakeWebRtc { broker_url } => {
-                self.log("Connecting via Snowflake (WebRTC)", LogType::Info);
-                self.log(
-                    "Using WebRTC -> Turbo -> KCP -> SMUX -> TLS stack",
-                    LogType::Info,
-                );
-                self.log(
-                    "This provides better censorship resistance via volunteer proxies",
-                    LogType::Info,
-                );
-                #[cfg(target_arch = "wasm32")]
-                {
-                    // Use WebRTC-based Snowflake (proper architecture)
-                    let config = SnowflakeConfig::with_broker(broker_url.clone())
-                        .with_fingerprint(fingerprint.clone());
-                    let bridge = SnowflakeBridge::with_config(config);
-                    let stream = bridge.connect().await?;
-                    self.log("Connected to Snowflake bridge via WebRTC", LogType::Success);
-                    self.create_channel_from_stream(stream, rsa_id).await?
-                }
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    let _ = broker_url; // suppress unused warning
-                    return Err(TorError::Internal(
-                        "Snowflake WebRTC is only available in WASM. \
                          Use WebTunnel bridge for native builds."
                             .to_string(),
                     ));
@@ -709,13 +675,12 @@ impl Clone for TorClient {
 mod tests {
     use super::*;
 
-    // These tests require a larger stack due to embedded consensus data parsing.
-    // Run with: RUST_MIN_STACK=16777216 cargo test -p webtor client::tests
+    // TorClient construction exceeds the native test harness thread's stack.
 
     #[tokio::test]
-    #[ignore = "requires large stack for consensus parsing"]
+    #[ignore = "requires a larger native test thread stack"]
     async fn test_tor_client_creation() {
-        let options = TorClientOptions::new("wss://snowflake.torproject.net/".to_string())
+        let options = TorClientOptions::direct_snowflake_websocket()
             .with_create_circuit_early(false);
 
         let client = TorClient::new(options).await;
@@ -723,24 +688,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires large stack for consensus parsing"]
-    async fn test_one_time_fetch() {
-        // This will fail because we don't have WASM WebSocket implementation
-        let result = TorClient::fetch_one_time(
-            "wss://snowflake.torproject.net/",
-            "https://httpbin.org/ip",
-            None,
-            None,
-        )
-        .await;
-
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    #[ignore = "requires large stack for consensus parsing"]
+    #[ignore = "requires a larger native test thread stack"]
     async fn test_circuit_status() {
-        let options = TorClientOptions::new("wss://snowflake.torproject.net/".to_string())
+        let options = TorClientOptions::direct_snowflake_websocket()
             .with_create_circuit_early(false);
 
         let client = TorClient::new(options).await.unwrap();

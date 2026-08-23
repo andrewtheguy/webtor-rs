@@ -1,8 +1,8 @@
-//! WebSocket-based Snowflake transport
+//! Direct Snowflake WebSocket transport
 //!
-//! This module provides Snowflake connectivity using WebSocket instead of WebRTC.
-//! This is simpler and more reliable in browsers since WebSocket has native support
-//! without the complexity of WebRTC signaling.
+//! This bypasses the broker and volunteer-proxy WebRTC hop. It is less
+//! censorship-resistant and exposes the client address directly to the
+//! Snowflake bridge, but provides a browser-native byte transport.
 //!
 //! Protocol stack (bottom to top):
 //!   WebSocket (wss://snowflake.torproject.net/)
@@ -17,6 +17,7 @@
 //!       ↓
 //!   Tor protocol
 
+use crate::config::{DIRECT_SNOWFLAKE_WS_URL, SNOWFLAKE_FINGERPRINT};
 use crate::error::{Result, TorError};
 use crate::websocket::WebSocketStream;
 use futures::{AsyncRead, AsyncWrite};
@@ -34,13 +35,6 @@ use crate::turbo::TurboStream;
 #[cfg(target_arch = "wasm32")]
 use subtle_tls::{TlsConfig, TlsConnector, TlsStream};
 
-/// WebSocket Snowflake endpoints
-pub const SNOWFLAKE_WS_URL: &str = "wss://snowflake.torproject.net/";
-pub const SNOWFLAKE_WS_URL_ALT: &str = "wss://snowflake.bamsoftware.com/";
-
-/// Snowflake bridge fingerprint (Tor Project's primary Snowflake bridge)
-pub const SNOWFLAKE_FINGERPRINT: &str = "2B280B23E1107BB62ABFC40DDCC8824814F80A72";
-
 /// WebSocket Snowflake configuration
 #[derive(Debug, Clone)]
 pub struct SnowflakeWsConfig {
@@ -57,7 +51,7 @@ pub struct SnowflakeWsConfig {
 impl Default for SnowflakeWsConfig {
     fn default() -> Self {
         Self {
-            ws_url: SNOWFLAKE_WS_URL.to_string(),
+            ws_url: DIRECT_SNOWFLAKE_WS_URL.to_string(),
             fingerprint: SNOWFLAKE_FINGERPRINT.to_string(),
             kcp_conv: 0,
             smux_stream_id: 3,
@@ -66,10 +60,6 @@ impl Default for SnowflakeWsConfig {
 }
 
 impl SnowflakeWsConfig {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn with_url(mut self, url: &str) -> Self {
         self.ws_url = url.to_string();
         self
@@ -248,11 +238,6 @@ impl AsyncWrite for SnowflakeWsStream {
     }
 }
 
-/// Convenience function to create a WebSocket Snowflake stream
-pub async fn create_snowflake_ws_stream() -> Result<SnowflakeWsStream> {
-    SnowflakeWsStream::connect(SnowflakeWsConfig::default()).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,7 +245,7 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = SnowflakeWsConfig::default();
-        assert_eq!(config.ws_url, SNOWFLAKE_WS_URL);
+        assert_eq!(config.ws_url, DIRECT_SNOWFLAKE_WS_URL);
         assert_eq!(config.fingerprint, SNOWFLAKE_FINGERPRINT);
         assert_eq!(config.kcp_conv, 0);
         assert_eq!(config.smux_stream_id, 3);

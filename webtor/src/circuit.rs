@@ -280,11 +280,11 @@ impl CircuitManager {
         // We don't have the real address easily accessible in string format from OwnedChanTarget without some work,
         // or the ntor key if it wasn't known.
         // For visual consistency in the circuit list, we create a placeholder if needed.
-        // For Snowflake, we use WebRTC so there's no traditional IP address.
+        // The browser WebSocket transport does not expose the bridge address.
         let bridge_relay = Relay::new(
             bridge_fingerprint.clone(),
-            "Snowflake".to_string(), // More meaningful name for the proxy
-            "0.0.0.0".to_string(),   // Placeholder - will be shown as "Snowflake (WebRTC)" in UI
+            "Snowflake".to_string(),
+            "0.0.0.0".to_string(),
             0,
             std::collections::HashSet::new(),
             "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
@@ -602,13 +602,12 @@ impl CircuitManager {
                                 2 => "Exit",
                                 _ => "Unknown",
                             };
-                            // For Snowflake bridges, the address is typically 0.0.0.0 since
-                            // we connect via WebRTC - show something more meaningful
+                            // Browser transports do not expose the bridge socket address.
                             let address = if idx == 0
                                 && (relay.address == "0.0.0.0"
                                     || relay.address.starts_with("0.0.0.0:"))
                             {
-                                "Snowflake (WebRTC)".to_string()
+                                "Snowflake (Direct WebSocket)".to_string()
                             } else {
                                 relay.address.clone()
                             };

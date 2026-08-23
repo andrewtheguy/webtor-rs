@@ -15,26 +15,17 @@ impl fmt::Debug for LogCallback {
     }
 }
 
-/// Known Snowflake bridge fingerprints (from Tor Browser defaults)
-pub const SNOWFLAKE_FINGERPRINT_PRIMARY: &str = "2B280B23E1107BB62ABFC40DDCC8824814F80A72";
-pub const SNOWFLAKE_FINGERPRINT_SECONDARY: &str = "8838024498816A039FCBBAB14E6F40A0843051FA";
-
-/// Known Snowflake broker URLs
-pub const SNOWFLAKE_URL_PRIMARY: &str = "wss://snowflake.torproject.net/";
-pub const SNOWFLAKE_URL_SECONDARY: &str = "wss://snowflake.bamsoftware.com/";
+/// Snowflake bridge identity and direct WebSocket endpoint.
+pub const SNOWFLAKE_FINGERPRINT: &str = "2B280B23E1107BB62ABFC40DDCC8824814F80A72";
+pub const DIRECT_SNOWFLAKE_WS_URL: &str = "wss://snowflake.torproject.net/";
 
 /// Bridge type configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BridgeType {
-    /// Snowflake bridge via direct WebSocket (simpler, less censorship resistant)
-    Snowflake {
-        /// WebSocket URL for Snowflake
+    /// Direct connection to the Snowflake bridge WebSocket endpoint.
+    DirectSnowflakeWebSocket {
+        /// WebSocket URL for the Snowflake bridge.
         url: String,
-    },
-    /// Snowflake bridge via WebRTC (proper architecture, more censorship resistant)
-    SnowflakeWebRtc {
-        /// Broker URL for WebRTC signaling (via CORS proxy)
-        broker_url: String,
     },
     /// WebTunnel bridge (HTTPS with HTTP Upgrade)
     WebTunnel {
@@ -47,9 +38,8 @@ pub enum BridgeType {
 
 impl Default for BridgeType {
     fn default() -> Self {
-        // Default to Snowflake since it's more reliable
-        BridgeType::Snowflake {
-            url: SNOWFLAKE_URL_PRIMARY.to_string(),
+        BridgeType::DirectSnowflakeWebSocket {
+            url: DIRECT_SNOWFLAKE_WS_URL.to_string(),
         }
     }
 }
@@ -59,10 +49,6 @@ impl Default for BridgeType {
 pub struct TorClientOptions {
     /// Bridge configuration
     pub bridge: BridgeType,
-
-    /// The Snowflake bridge WebSocket URL for Tor connections (deprecated, use bridge)
-    #[serde(default)]
-    pub snowflake_url: String,
 
     /// Timeout in milliseconds for establishing initial connections
     #[serde(default = "default_connection_timeout")]
@@ -117,7 +103,6 @@ impl Default for TorClientOptions {
     fn default() -> Self {
         Self {
             bridge: BridgeType::default(),
-            snowflake_url: String::new(),
             connection_timeout: default_connection_timeout(),
             circuit_timeout: default_circuit_timeout(),
             create_circuit_early: default_create_circuit_early(),
@@ -160,46 +145,13 @@ pub const MAX_CIRCUITS_PER_ISOLATION_KEY: usize = 1;
 pub const CIRCUIT_PREBUILD_AGE_THRESHOLD_MS: u64 = 80_000; // 90_000 - 10_000
 
 impl TorClientOptions {
-    /// Create options for Snowflake bridge using default Tor Project broker
-    pub fn snowflake() -> Self {
+    /// Connect directly to the Snowflake bridge over WebSocket.
+    pub fn direct_snowflake_websocket() -> Self {
         Self {
-            bridge: BridgeType::Snowflake {
-                url: SNOWFLAKE_URL_PRIMARY.to_string(),
+            bridge: BridgeType::DirectSnowflakeWebSocket {
+                url: DIRECT_SNOWFLAKE_WS_URL.to_string(),
             },
-            bridge_fingerprint: Some(SNOWFLAKE_FINGERPRINT_PRIMARY.to_string()),
-            ..Default::default()
-        }
-    }
-
-    /// Create options for Snowflake bridge with custom URL
-    pub fn snowflake_with_url(url: String) -> Self {
-        // Determine fingerprint based on URL
-        let fingerprint = if url.contains("bamsoftware.com") {
-            SNOWFLAKE_FINGERPRINT_SECONDARY
-        } else {
-            SNOWFLAKE_FINGERPRINT_PRIMARY
-        };
-
-        Self {
-            bridge: BridgeType::Snowflake { url: url.clone() },
-            snowflake_url: url,
-            bridge_fingerprint: Some(fingerprint.to_string()),
-            ..Default::default()
-        }
-    }
-
-    /// Create options for a Snowflake bridge (legacy - use snowflake() instead)
-    pub fn new(snowflake_url: String) -> Self {
-        Self::snowflake_with_url(snowflake_url)
-    }
-
-    /// Create options for Snowflake bridge via WebRTC (more censorship resistant)
-    pub fn snowflake_webrtc() -> Self {
-        Self {
-            bridge: BridgeType::SnowflakeWebRtc {
-                broker_url: "https://snowflake-broker.torproject.net/".to_string(),
-            },
-            bridge_fingerprint: Some(SNOWFLAKE_FINGERPRINT_PRIMARY.to_string()),
+            bridge_fingerprint: Some(SNOWFLAKE_FINGERPRINT.to_string()),
             ..Default::default()
         }
     }
