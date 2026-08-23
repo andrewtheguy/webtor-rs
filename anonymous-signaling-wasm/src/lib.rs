@@ -11,13 +11,16 @@ use url::Url;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 use webtor::config::LogType;
-use webtor::{DataStream, TorClient, TorClientOptions};
+use webtor::{DataStream, StreamIsolationPolicy, TorClient, TorClientOptions, TorError};
 
 const MAX_NOSTR_MESSAGE_BYTES: usize = 1024 * 1024;
 const CONNECTION_TIMEOUT_MS: u64 = 240_000;
 const CIRCUIT_TIMEOUT_MS: u64 = 120_000;
 const TOR_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const TOR_CHECK_URL: &str = "https://check.torproject.org/api/ip";
+const RELAY_TCP_TIMEOUT: Duration = Duration::from_secs(30);
+const RELAY_TLS_TIMEOUT: Duration = Duration::from_secs(30);
+const RELAY_WEBSOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
 struct TorCheckResponse {
@@ -71,25 +74,55 @@ type RelayTlsStream = TlsStream<DataStream>;
 type RelayWriter = async_tungstenite::WebSocketSender<RelayTlsStream>;
 type RelayReader = async_tungstenite::WebSocketReceiver<RelayTlsStream>;
 
+fn signaling_client_options() -> TorClientOptions {
+    TorClientOptions::direct_snowflake_websocket()
+        .with_connection_timeout(CONNECTION_TIMEOUT_MS)
+        .with_circuit_timeout(CIRCUIT_TIMEOUT_MS)
+        .with_create_circuit_early(false)
+        .with_on_log(log_tor_progress)
+        .with_stream_isolation(StreamIsolationPolicy::None)
+        .with_circuit_update_interval(None)
+}
+
 async fn connect_tls(client: &TorClient, url: &Url) -> Result<RelayTlsStream, JsValue> {
     let host = url
         .host_str()
         .ok_or_else(|| JsValue::from_str("Relay URL has no host"))?;
+    log_tor_progress(
+        &format!("Opening a Tor stream to {host}..."),
+        LogType::Info,
+    );
     let tls13_config = TlsConfig {
         skip_verification: false,
         alpn_protocols: vec!["http/1.1".to_string()],
         version: TlsVersion::Tls13,
     };
     let tls13_connector = TlsConnector::with_config(tls13_config);
-    let stream = client
-        .open_stream(url)
-        .await
-        .map_err(|error| js_error("Failed to open Tor stream", error))?;
+    let stream = webtor::with_timeout(
+        RELAY_TCP_TIMEOUT,
+        "Nostr relay Tor stream",
+        client.open_stream(url),
+    )
+    .await
+    .map_err(|error| js_error("Failed to open Tor stream", error))?;
+    log_tor_progress(
+        &format!("Tor stream to {host} opened; starting TLS..."),
+        LogType::Info,
+    );
 
-    tls13_connector
-        .connect(stream, host)
-        .await
-        .map_err(|error| js_error("Relay TLS 1.3 failed", error))
+    let tls_stream = webtor::with_timeout(RELAY_TLS_TIMEOUT, "Nostr relay TLS handshake", async {
+        tls13_connector
+            .connect(stream, host)
+            .await
+            .map_err(|error| TorError::tls(error.to_string()))
+    })
+    .await
+    .map_err(|error| js_error("Relay TLS 1.3 failed", error))?;
+    log_tor_progress(
+        &format!("TLS established with {host}."),
+        LogType::Success,
+    );
+    Ok(tls_stream)
 }
 
 #[wasm_bindgen]
@@ -103,13 +136,7 @@ impl AnonymousSignalingClient {
     pub fn create() -> js_sys::Promise {
         future_to_promise(async move {
             console_error_panic_hook::set_once();
-            let options = TorClientOptions::direct_snowflake_websocket()
-                .with_connection_timeout(CONNECTION_TIMEOUT_MS)
-                .with_circuit_timeout(CIRCUIT_TIMEOUT_MS)
-                .with_create_circuit_early(false)
-                .with_on_log(log_tor_progress)
-                .with_circuit_update_interval(None);
-            let client = TorClient::new(options)
+            let client = TorClient::new(signaling_client_options())
                 .await
                 .map_err(|error| js_error("Failed to initialize webtor", error))?;
             client
@@ -141,9 +168,25 @@ impl AnonymousSignalingClient {
             }
 
             let tls_stream = connect_tls(&client, &url).await?;
-            let (socket, _) = async_tungstenite::client_async(url.as_str(), tls_stream)
+            log_tor_progress(
+                &format!("Upgrading the Tor stream to WebSocket for {relay_url}..."),
+                LogType::Info,
+            );
+            let (socket, _) = webtor::with_timeout(
+                RELAY_WEBSOCKET_TIMEOUT,
+                "Nostr relay WebSocket handshake",
+                async {
+                    async_tungstenite::client_async(url.as_str(), tls_stream)
+                        .await
+                        .map_err(|error| TorError::websocket_connection(error.to_string()))
+                },
+            )
                 .await
                 .map_err(|error| js_error("Nostr WebSocket handshake failed", error))?;
+            log_tor_progress(
+                &format!("Connected to Nostr relay {relay_url} through Tor."),
+                LogType::Success,
+            );
             let (writer, reader) = socket.split();
 
             Ok(JsValue::from(AnonymousSignalingSocket {
@@ -160,6 +203,19 @@ impl AnonymousSignalingClient {
             client.close().await;
             Ok(JsValue::UNDEFINED)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signaling_reuses_the_verified_circuit() {
+        assert_eq!(
+            signaling_client_options().stream_isolation,
+            StreamIsolationPolicy::None
+        );
     }
 }
 

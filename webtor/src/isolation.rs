@@ -21,7 +21,7 @@ pub enum StreamIsolationPolicy {
     /// Isolate by full origin (scheme + host + port)
     /// e.g., http://example.com and https://example.com use different circuits
     PerOrigin,
-    /// No isolation - all requests share circuits (legacy behavior)
+    /// No isolation - all requests share a circuit
     None,
 }
 
