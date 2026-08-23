@@ -230,6 +230,7 @@ pub struct SmuxStream<S> {
     state: SmuxState,
     read_buffer: Vec<u8>,
     data_buffer: Vec<u8>,
+    pending_control: Vec<u8>,
 }
 
 impl<S> SmuxStream<S> {
@@ -243,6 +244,7 @@ impl<S> SmuxStream<S> {
             state: SmuxState::new(stream_id),
             read_buffer: Vec::with_capacity(4096),
             data_buffer: Vec::new(),
+            pending_control: Vec::new(),
         }
     }
 }
@@ -472,7 +474,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SmuxStream<S> {
     }
 }
 
-impl<S: AsyncRead + Unpin> AsyncRead for SmuxStream<S> {
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for SmuxStream<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -484,6 +486,36 @@ impl<S: AsyncRead + Unpin> AsyncRead for SmuxStream<S> {
             self.data_buffer.len(),
             self.read_buffer.len()
         );
+
+        if !self.pending_control.is_empty() {
+            let pending = std::mem::take(&mut self.pending_control);
+            match Pin::new(&mut self.inner).poll_write(cx, &pending) {
+                Poll::Ready(Ok(0)) => {
+                    self.pending_control = pending;
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "Failed to write SMUX control frame",
+                    )));
+                }
+                Poll::Ready(Ok(written)) if written < pending.len() => {
+                    self.pending_control.extend_from_slice(&pending[written..]);
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Poll::Ready(Ok(_)) => {
+                    if let Poll::Ready(Err(error)) =
+                        Pin::new(&mut self.inner).poll_flush(cx)
+                    {
+                        return Poll::Ready(Err(error));
+                    }
+                }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {
+                    self.pending_control = pending;
+                    return Poll::Pending;
+                }
+            }
+        }
 
         // Drain data buffer first
         if !self.data_buffer.is_empty() {
@@ -526,6 +558,17 @@ impl<S: AsyncRead + Unpin> AsyncRead for SmuxStream<S> {
                                 .self_increment
                                 .wrapping_add(segment.data.len() as u32);
 
+                            if self.state.should_send_update() {
+                                let update = SmuxSegment::upd(
+                                    self.state.stream_id,
+                                    self.state.self_read,
+                                    self.state.self_window,
+                                );
+                                self.pending_control.extend_from_slice(&update.encode());
+                                self.state.self_increment = 0;
+                                cx.waker().wake_by_ref();
+                            }
+
                             let len = std::cmp::min(buf.len(), segment.data.len());
                             buf[..len].copy_from_slice(&segment.data[..len]);
 
@@ -555,6 +598,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for SmuxStream<S> {
                         }
                         SmuxCommand::Nop => {
                             debug!("SMUX poll_read: received NOP");
+                            let response = SmuxSegment::nop(segment.stream_id);
+                            self.pending_control.extend_from_slice(&response.encode());
+                            cx.waker().wake_by_ref();
                             continue;
                         }
                     }
@@ -666,6 +712,41 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for SmuxStream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::executor::block_on;
+
+    struct MockTransport {
+        input: futures::io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl AsyncRead for MockTransport {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.input).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for MockTransport {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.output.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[test]
     fn test_segment_encode_decode() {
@@ -700,6 +781,27 @@ mod tests {
         let update = SmuxUpdate::decode(&segment.data).unwrap();
         assert_eq!(update.consumed, 1000);
         assert_eq!(update.window, 65535);
+    }
+
+    #[test]
+    fn async_read_sends_receive_window_update() {
+        let payload = vec![0x5a; (DEFAULT_WINDOW / 2 + 1) as usize];
+        let transport = MockTransport {
+            input: futures::io::Cursor::new(SmuxSegment::psh(3, payload.clone()).encode()),
+            output: Vec::new(),
+        };
+        let mut stream = SmuxStream::with_stream_id(transport, 3);
+        let mut received = Vec::new();
+
+        block_on(stream.read_to_end(&mut received)).unwrap();
+
+        assert_eq!(received, payload);
+        let (segment, consumed) = SmuxSegment::decode(&stream.inner.output).unwrap().unwrap();
+        assert_eq!(consumed, stream.inner.output.len());
+        assert_eq!(segment.command, SmuxCommand::Upd);
+        let update = SmuxUpdate::decode(&segment.data).unwrap();
+        assert_eq!(update.consumed, DEFAULT_WINDOW / 2 + 1);
+        assert_eq!(update.window, DEFAULT_WINDOW);
     }
 
     #[test]

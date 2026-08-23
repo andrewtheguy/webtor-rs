@@ -18,11 +18,12 @@ use tor_netdoc::doc::netstatus::{MdConsensus, RelayWeight};
 use tor_netdoc::AllowAnnotations;
 use tor_proto::channel::Channel;
 use tor_proto::client::circuit::TimeoutEstimator;
+use tor_proto::client::ClientTunnel;
 use tracing::{debug, error, info, warn};
 
 const RELAYS_PER_ROLE: usize = 32;
 const MIN_RELAYS_PER_ROLE: usize = 10;
-const MICRODESCRIPTOR_CHUNK_SIZE: usize = 64;
+const MICRODESCRIPTOR_CHUNK_SIZE: usize = 16;
 const MAX_DIRECTORY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Directory manager for handling network documents
@@ -46,8 +47,12 @@ impl DirectoryManager {
     }
 
     pub async fn fetch_and_process_consensus(&self, channel: Arc<Channel>) -> Result<()> {
+        self.log("Creating a Tor directory circuit...", LogType::Info);
+        let tunnel = self.create_directory_tunnel(channel).await?;
+        self.log("Tor directory circuit established", LogType::Success);
+
         self.log("Downloading the current Tor consensus...", LogType::Info);
-        let consensus_body = self.fetch_consensus_body(channel.clone()).await?;
+        let consensus_body = self.fetch_consensus_body(tunnel.clone()).await?;
 
         info!("Parsing full consensus");
         let (_, _, unvalidated) = MdConsensus::parse(&consensus_body)
@@ -119,7 +124,7 @@ impl DirectoryManager {
         );
         info!("Selected {} microdescriptor digests", digests.len());
 
-        let microdescs_body = self.fetch_microdescriptors_body(channel, &digests).await?;
+        let microdescs_body = self.fetch_microdescriptors_body(tunnel, &digests).await?;
         info!(
             "Fetched microdescriptors body: {} bytes",
             microdescs_body.len()
@@ -238,10 +243,7 @@ impl DirectoryManager {
         Ok(())
     }
 
-    async fn fetch_consensus_body(&self, channel: Arc<Channel>) -> Result<String> {
-        info!("Fetching consensus from bridge...");
-
-        // 1. Create 1-hop circuit (tunnel)
+    async fn create_directory_tunnel(&self, channel: Arc<Channel>) -> Result<Arc<ClientTunnel>> {
         let (pending_tunnel, reactor) = channel
             .new_tunnel(
                 Arc::new(crate::circuit::SimpleTimeoutEstimator) as Arc<dyn TimeoutEstimator>
@@ -271,14 +273,17 @@ impl DirectoryManager {
             .await
             .map_err(|e| TorError::Internal(format!("Failed to create dir circuit: {}", e)))?;
 
-        // 2. Open directory stream
-        let tunnel_arc = Arc::new(tunnel);
-        let mut stream = tunnel_arc
+        Ok(Arc::new(tunnel))
+    }
+
+    async fn fetch_consensus_body(&self, tunnel: Arc<ClientTunnel>) -> Result<String> {
+        info!("Fetching consensus from bridge...");
+
+        let mut stream = tunnel
             .begin_dir_stream()
             .await
             .map_err(|e| TorError::Internal(format!("Failed to begin dir stream: {}", e)))?;
 
-        // 3. Send HTTP GET request for microdescriptor consensus
         let path = "/tor/status-vote/current/consensus-microdesc";
         let request = format!(
             "GET {} HTTP/1.0\r\n\
@@ -298,7 +303,7 @@ impl DirectoryManager {
             .await
             .map_err(|e| TorError::Network(format!("Failed to flush dir request: {}", e)))?;
 
-        // 4. Read and decode the response. Stop at Content-Length rather than
+        // Read and decode the response. Stop at Content-Length rather than
         // waiting indefinitely for the directory stream to close.
         let response = read_directory_response(&mut stream).await?;
 
@@ -313,10 +318,10 @@ impl DirectoryManager {
 
     async fn fetch_microdescriptors_body(
         &self,
-        channel: Arc<Channel>,
+        tunnel: Arc<ClientTunnel>,
         digests: &[[u8; 32]],
     ) -> Result<String> {
-        const MAX_PARALLEL_CHUNKS: usize = 2;
+        const MAX_PARALLEL_CHUNKS: usize = 1;
 
         info!(
             "Fetching {} microdescriptors in chunks of {} (max {} parallel)...",
@@ -354,7 +359,7 @@ impl DirectoryManager {
                 .map(|(i, chunk)| {
                     let chunk_idx = batch_start + i;
                     self.fetch_microdescriptors_chunk(
-                        channel.clone(),
+                        tunnel.clone(),
                         chunk,
                         chunk_idx,
                         total_chunks,
@@ -376,7 +381,7 @@ impl DirectoryManager {
 
     async fn fetch_microdescriptors_chunk(
         &self,
-        channel: Arc<Channel>,
+        tunnel: Arc<ClientTunnel>,
         digests: &[[u8; 32]],
         chunk_idx: usize,
         total_chunks: usize,
@@ -388,37 +393,7 @@ impl DirectoryManager {
             digests.len()
         );
 
-        let (pending_tunnel, reactor) = channel
-            .new_tunnel(
-                Arc::new(crate::circuit::SimpleTimeoutEstimator) as Arc<dyn TimeoutEstimator>
-            )
-            .await
-            .map_err(|e| {
-                TorError::Internal(format!("Failed to create pending tunnel for dir: {}", e))
-            })?;
-
-        #[cfg(target_arch = "wasm32")]
-        wasm_bindgen_futures::spawn_local(async move {
-            if let Err(e) = reactor.run().await {
-                error!("Dir circuit reactor finished with error: {}", e);
-            }
-        });
-
-        #[cfg(not(target_arch = "wasm32"))]
-        tokio::spawn(async move {
-            if let Err(e) = reactor.run().await {
-                error!("Dir circuit reactor finished with error: {}", e);
-            }
-        });
-
-        let params = crate::circuit::make_circ_params()?;
-        let tunnel = pending_tunnel
-            .create_firsthop_fast(params)
-            .await
-            .map_err(|e| TorError::Internal(format!("Failed to create dir circuit: {}", e)))?;
-
-        let tunnel_arc = Arc::new(tunnel);
-        let mut stream = tunnel_arc
+        let mut stream = tunnel
             .begin_dir_stream()
             .await
             .map_err(|e| TorError::Internal(format!("Failed to begin dir stream: {}", e)))?;
