@@ -16,5 +16,9 @@ adds:
   signaling; and
 - non-extractable Web Crypto key generation/import in `subtle-tls`.
 
+The vendored Arti tree contains only crates present in this workspace's resolved
+Cargo graph. Optional and development-only crates that the project does not
+resolve are not copied into the repository.
+
 The upstream code is MIT-licensed. Vendored Arti crates retain their own
 `MIT OR Apache-2.0` licensing metadata.

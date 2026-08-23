@@ -36,7 +36,7 @@ derive-deftly = { version = "~1.5.0", features = ["full", "beta"] }
 derive_more = { version = "2.0.1", features = ["full"] }
 filetime = { version = "0.2", default-features = false }
 fs-mistrust = { path = "../fs-mistrust", version = "0.13.1", features = ["walkdir"] }
-fslock-guard = { path = "../fslock-guard", version = "0.5.0", optional = true }
+fslock-guard = { version = "0.5.0", optional = true }
 futures = "0.3.14"
 itertools = "0.14.0"
 oneshot-fused-workaround = { path = "../oneshot-fused-workaround", version = "0.5.0" }
@@ -58,7 +58,7 @@ derive-deftly = { version = "~1.5.0", features = ["full", "beta"] }
 humantime = "2"
 itertools = "0.14.0"
 tempfile = "3"
-test-temp-dir = { version = "0.6.0", path = "../test-temp-dir" }
+test-temp-dir = "0.6.0"
 tracing-test = "0.2.4"
 
 [package.metadata.docs.rs]

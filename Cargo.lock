@@ -5340,7 +5340,3 @@ dependencies = [
  "quote",
  "syn 2.0.111",
 ]
-
-[[patch.unused]]
-name = "fslock-guard"
-version = "0.5.1"
