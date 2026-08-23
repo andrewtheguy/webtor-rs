@@ -50,11 +50,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     /// Perform TLS handshake and return encrypted stream
-    pub(crate) async fn connect(
-        mut stream: S,
-        server_name: &str,
-        config: TlsConfig,
-    ) -> Result<Self> {
+    pub async fn connect(mut stream: S, server_name: &str, config: TlsConfig) -> Result<Self> {
         info!("Starting TLS 1.3 handshake with {}", server_name);
 
         let mut handshake = HandshakeState::new(server_name).await?;
@@ -438,6 +434,51 @@ where
         }
     }
 
+    /// Read application data (blocking)
+    pub async fn read_app_data(&mut self) -> Result<Vec<u8>> {
+        loop {
+            let (content_type, data) = self.record_layer.read_record(&mut self.inner).await?;
+
+            match content_type {
+                CONTENT_TYPE_APPLICATION_DATA => {
+                    return Ok(data);
+                }
+                CONTENT_TYPE_ALERT => {
+                    if data.len() >= 2 && data[0] == 1 && data[1] == 0 {
+                        // close_notify
+                        return Err(TlsError::ConnectionClosed);
+                    }
+                    return Err(Self::parse_alert(&data));
+                }
+                CONTENT_TYPE_HANDSHAKE => {
+                    // Post-handshake messages (e.g., NewSessionTicket)
+                    trace!("Ignoring post-handshake message");
+                    continue;
+                }
+                _ => {
+                    warn!("Ignoring unexpected content type: {}", content_type);
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// Write application data (blocking)
+    pub async fn write_app_data(&mut self, data: &[u8]) -> Result<()> {
+        self.record_layer
+            .write_record(&mut self.inner, CONTENT_TYPE_APPLICATION_DATA, data)
+            .await
+    }
+
+    /// Close the TLS connection gracefully
+    pub async fn close(&mut self) -> Result<()> {
+        // Send close_notify alert
+        let alert = [1, 0]; // warning, close_notify
+        self.record_layer
+            .write_record(&mut self.inner, CONTENT_TYPE_ALERT, &alert)
+            .await?;
+        Ok(())
+    }
 }
 
 /// Maximum TLS record size
@@ -696,6 +737,62 @@ where
         }
 
         Pin::new(&mut self.inner).poll_close(cx)
+    }
+}
+
+/// Wrapper that provides blocking-style async methods
+/// This is the recommended way to use TlsStream in WASM
+impl<S> TlsStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    /// Read data using async/await (recommended for WASM)
+    pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // First drain buffer
+        if self.read_pos < self.read_buffer.len() {
+            let available = &self.read_buffer[self.read_pos..];
+            let to_copy = std::cmp::min(buf.len(), available.len());
+            buf[..to_copy].copy_from_slice(&available[..to_copy]);
+            self.read_pos += to_copy;
+
+            if self.read_pos >= self.read_buffer.len() {
+                self.read_buffer.clear();
+                self.read_pos = 0;
+            }
+
+            return Ok(to_copy);
+        }
+
+        // Read more data
+        match self.read_app_data().await {
+            Ok(data) => {
+                let to_copy = std::cmp::min(buf.len(), data.len());
+                buf[..to_copy].copy_from_slice(&data[..to_copy]);
+
+                if to_copy < data.len() {
+                    self.read_buffer = data[to_copy..].to_vec();
+                    self.read_pos = 0;
+                }
+
+                Ok(to_copy)
+            }
+            Err(TlsError::ConnectionClosed) => Ok(0),
+            Err(e) => Err(io::Error::other(e.to_string())),
+        }
+    }
+
+    /// Write data using async/await (recommended for WASM)
+    pub async fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self.write_app_data(buf).await {
+            Ok(()) => Ok(buf.len()),
+            Err(e) => Err(io::Error::other(e.to_string())),
+        }
+    }
+
+    /// Flush the stream
+    pub async fn flush(&mut self) -> io::Result<()> {
+        use futures::io::AsyncWriteExt;
+        self.inner.flush().await
     }
 }
 

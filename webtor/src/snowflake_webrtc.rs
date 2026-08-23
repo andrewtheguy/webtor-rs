@@ -10,7 +10,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use subtle_tls::{TlsConfig, TlsConnector, TlsStream};
+use subtle_tls::{TlsConfig, TlsConnector, TlsStream, TlsVersion};
 use tracing::{info, warn};
 
 const MAX_WEBRTC_ATTEMPTS: u32 = 3;
@@ -79,6 +79,9 @@ impl SnowflakeWebRtcStream {
             // Tor authenticates the bridge through its CERTS cells.
             skip_verification: true,
             alpn_protocols: vec![],
+            // subtle-tls carries TLS 1.2 again, but nothing here negotiates
+            // it: every retained path requires TLS 1.3.
+            version: TlsVersion::Tls13,
         });
         let inner = connector
             .connect(smux, "www.example.com")

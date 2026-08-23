@@ -9,7 +9,7 @@ use futures::{AsyncRead, AsyncWrite};
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use subtle_tls::{TlsConfig, TlsConnector, TlsStream};
+use subtle_tls::{TlsConfig, TlsConnector, TlsStream, TlsVersion};
 
 type SnowflakeWsStack = SmuxStream<KcpStream<TurboStream<WebSocketStream>>>;
 
@@ -31,6 +31,9 @@ impl SnowflakeWsStream {
         let connector = TlsConnector::with_config(TlsConfig {
             skip_verification: true,
             alpn_protocols: Vec::new(),
+            // subtle-tls carries TLS 1.2 again, but nothing here negotiates
+            // it: every retained path requires TLS 1.3.
+            version: TlsVersion::Tls13,
         });
         let inner = connector
             .connect(smux, "www.example.com")

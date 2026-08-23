@@ -1,8 +1,15 @@
 //! Root CA Trust Store
 //!
-//! This module embeds the root CAs needed by the retained signaling paths.
+//! This module provides a two-tier trust store:
+//! 1. Embedded minimal CAs (Let's Encrypt) for Tor infrastructure bootstrap
+//! 2. Lazy-loaded full Mozilla CA bundle fetched via Tor for complete coverage
+//!
+//! The embedded CAs allow connecting to Tor infrastructure (Snowflake broker, etc.)
+//! Once Tor is working, we fetch the full CA bundle through Tor for privacy.
 
 use crate::error::{Result, TlsError};
+use std::cell::RefCell;
+use std::rc::Rc;
 use tracing::info;
 use x509_parser::prelude::*;
 
@@ -110,9 +117,62 @@ impl RootCertificate {
     }
 }
 
-/// Trust store with the roots used by Tor Check and common Nostr relays.
+thread_local! {
+    /// Roots installed by [`load_extended_roots`]. Browser WASM is
+    /// single-threaded, so a thread-local is effectively process-global.
+    /// CertificateVerifier builds a fresh TrustStore per connection, so a
+    /// bundle stored on one instance would be invisible to every later
+    /// handshake — the set has to outlive the store that loaded it.
+    static EXTENDED_ROOTS: RefCell<Rc<Vec<RootCertificate>>> =
+        RefCell::new(Rc::new(Vec::new()));
+}
+
+/// Install additional roots from a PEM bundle, replacing any previous set.
+/// Returns how many certificates were parsed.
+///
+/// Each certificate is sliced at its BEGIN marker before parsing, because a
+/// Mozilla-style bundle labels every entry in plain text and a single scan
+/// would otherwise stop at the first such header.
+pub fn load_extended_roots(pem_bundle: &str) -> Result<usize> {
+    let mut roots = Vec::new();
+    for (offset, _) in pem_bundle.match_indices("-----BEGIN CERTIFICATE-----") {
+        let Ok((_, pem_data)) = parse_x509_pem(&pem_bundle.as_bytes()[offset..]) else {
+            continue;
+        };
+        let Ok((_, certificate)) = X509Certificate::from_der(&pem_data.contents) else {
+            continue;
+        };
+        roots.push(RootCertificate {
+            subject: certificate.subject().to_string(),
+            der: pem_data.contents,
+        });
+    }
+
+    if roots.is_empty() {
+        return Err(TlsError::certificate(
+            "CA bundle contained no usable certificates",
+        ));
+    }
+
+    let count = roots.len();
+    EXTENDED_ROOTS.with(|cell| *cell.borrow_mut() = Rc::new(roots));
+    info!("Loaded {} extended root CAs", count);
+    Ok(count)
+}
+
+/// Number of roots currently installed by [`load_extended_roots`].
+pub fn extended_root_count() -> usize {
+    EXTENDED_ROOTS.with(|cell| cell.borrow().len())
+}
+
+/// Trust store with embedded and lazy-loaded certificates
 pub struct TrustStore {
+    /// Embedded root certificates (Let's Encrypt for Tor infrastructure)
     embedded_roots: Vec<RootCertificate>,
+    /// Roots fetched over Tor, snapshotted from the process-global set.
+    extended_roots: Rc<Vec<RootCertificate>>,
+    /// URL to fetch the full CA bundle from
+    ca_bundle_url: String,
 }
 
 impl TrustStore {
@@ -131,30 +191,99 @@ impl TrustStore {
 
         Ok(Self {
             embedded_roots,
+            extended_roots: EXTENDED_ROOTS.with(|cell| cell.borrow().clone()),
+            ca_bundle_url: "https://curl.se/ca/cacert.pem".to_string(),
         })
+    }
+
+    /// Create a trust store with a custom CA bundle URL
+    pub fn with_ca_bundle_url(mut self, url: &str) -> Self {
+        self.ca_bundle_url = url.to_string();
+        self
+    }
+
+    /// Check if we have the extended CA bundle loaded
+    pub fn has_extended_roots(&self) -> bool {
+        !self.extended_roots.is_empty()
+    }
+
+    /// Every root this store trusts: embedded first, then fetched.
+    pub fn get_roots(&self) -> Vec<&RootCertificate> {
+        self.roots().collect()
+    }
+
+    fn roots(&self) -> impl Iterator<Item = &RootCertificate> {
+        self.embedded_roots.iter().chain(self.extended_roots.iter())
+    }
+
+    /// Find a root certificate that matches the given issuer
+    ///
+    /// Returns the DER-encoded certificate if found. Returns an owned value
+    /// to support both embedded and dynamically-loaded extended roots.
+    pub fn find_root_for_issuer(&self, issuer_der: &[u8]) -> Option<Vec<u8>> {
+        // Parse the issuer to get subject
+        let (_, issuer_cert) = X509Certificate::from_der(issuer_der).ok()?;
+        let issuer_subject = issuer_cert.subject().to_string();
+
+        self.roots()
+            .find(|root| root.subject == issuer_subject)
+            .map(|root| root.der.clone())
+    }
+
+    /// Find a root certificate reference (embedded roots only)
+    ///
+    /// For cases where a reference is needed and extended roots are not required.
+    pub fn find_embedded_root_for_issuer(&self, issuer_der: &[u8]) -> Option<&RootCertificate> {
+        if let Ok((_, issuer_cert)) = X509Certificate::from_der(issuer_der) {
+            let issuer_subject = issuer_cert.subject().to_string();
+
+            for root in &self.embedded_roots {
+                if root.subject == issuer_subject {
+                    return Some(root);
+                }
+            }
+        }
+
+        None
     }
 
     /// Check if a certificate is a trusted root
     pub fn is_trusted_root(&self, cert_der: &[u8]) -> bool {
-        self.embedded_roots
-            .iter()
-            .any(|root| root.der == cert_der)
+        self.roots().any(|root| root.der == cert_der)
     }
 
     /// Check if a certificate was issued by a trusted root
     pub fn is_issued_by_trusted_root(&self, cert_der: &[u8]) -> bool {
-        if let Ok((_, cert)) = X509Certificate::from_der(cert_der) {
-            let issuer = cert.issuer().to_string();
+        let Ok((_, cert)) = X509Certificate::from_der(cert_der) else {
+            return false;
+        };
+        let issuer = cert.issuer().to_string();
 
-            return self
-                .embedded_roots
-                .iter()
-                .any(|root| root.subject == issuer);
-        }
+        self.roots().any(|root| root.subject == issuer)
+    }
 
-        false
+    /// Get the URL for fetching the full CA bundle
+    pub fn ca_bundle_url(&self) -> &str {
+        &self.ca_bundle_url
     }
 }
+
+impl Default for TrustStore {
+    fn default() -> Self {
+        Self::new().expect("Failed to create default trust store")
+    }
+}
+
+/// Build a trust store. Each caller gets its own, snapshotting whatever
+/// [`load_extended_roots`] has installed by then.
+pub fn get_trust_store() -> Result<TrustStore> {
+    TrustStore::new()
+}
+
+/// Embedded root certificate count (for bundle size estimation)
+pub const EMBEDDED_ROOT_COUNT: usize = 3;
+/// Approximate size of embedded roots in bytes
+pub const EMBEDDED_ROOTS_SIZE: usize = 3500; // ~3.5KB for 3 certs
 
 #[cfg(test)]
 mod tests {
@@ -176,6 +305,34 @@ mod tests {
     fn test_isrg_root_x2() {
         let root = RootCertificate::from_pem(ISRG_ROOT_X2_PEM).unwrap();
         assert!(root.subject.contains("ISRG Root X2"));
+    }
+
+    #[test]
+    fn loads_roots_from_a_bundle_with_headers_between_entries() {
+        // A Mozilla-style bundle labels each certificate in plain text. The
+        // scan must not stop at the first such header.
+        let bundle = format!(
+            "## Certificate data\n\nISRG Root X1\n============\n{}\n\nISRG Root X2\n============\n{}\n",
+            ISRG_ROOT_X1_PEM, ISRG_ROOT_X2_PEM
+        );
+
+        assert_eq!(load_extended_roots(&bundle).unwrap(), 2);
+        assert_eq!(extended_root_count(), 2);
+
+        // A store built afterwards trusts them, and the set replaces rather
+        // than appends.
+        let store = TrustStore::new().unwrap();
+        let x1 = RootCertificate::from_pem(ISRG_ROOT_X1_PEM).unwrap();
+        assert!(store.is_trusted_root(&x1.der));
+        assert!(store.has_extended_roots());
+
+        assert_eq!(load_extended_roots(ISRG_ROOT_X2_PEM).unwrap(), 1);
+        assert_eq!(extended_root_count(), 1);
+    }
+
+    #[test]
+    fn rejects_a_bundle_with_no_certificates() {
+        assert!(load_extended_roots("## nothing to see here\n").is_err());
     }
 
     #[test]

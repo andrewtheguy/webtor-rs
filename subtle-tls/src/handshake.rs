@@ -12,8 +12,8 @@ use crate::crypto::{self, EcdhKeyPair, Hkdf, X25519KeyPair};
 use crate::error::{Result, TlsError};
 use tracing::{debug, trace};
 
-// TLS 1.3 wire versions
-pub const TLS_LEGACY_VERSION: u16 = 0x0303;
+// TLS 1.3 constants
+pub const TLS_VERSION_1_2: u16 = 0x0303; // Used in record layer for compatibility
 pub const TLS_VERSION_1_3: u16 = 0x0304;
 
 // Content types
@@ -25,10 +25,15 @@ pub const CONTENT_TYPE_APPLICATION_DATA: u8 = 23;
 // Handshake types
 pub const HANDSHAKE_CLIENT_HELLO: u8 = 1;
 pub const HANDSHAKE_SERVER_HELLO: u8 = 2;
+pub const HANDSHAKE_NEW_SESSION_TICKET: u8 = 4;
+pub const HANDSHAKE_END_OF_EARLY_DATA: u8 = 5;
 pub const HANDSHAKE_ENCRYPTED_EXTENSIONS: u8 = 8;
 pub const HANDSHAKE_CERTIFICATE: u8 = 11;
+pub const HANDSHAKE_CERTIFICATE_REQUEST: u8 = 13;
 pub const HANDSHAKE_CERTIFICATE_VERIFY: u8 = 15;
 pub const HANDSHAKE_FINISHED: u8 = 20;
+pub const HANDSHAKE_KEY_UPDATE: u8 = 24;
+pub const HANDSHAKE_MESSAGE_HASH: u8 = 254;
 
 // Extension types
 pub const EXT_SERVER_NAME: u16 = 0;
@@ -40,6 +45,7 @@ pub const EXT_KEY_SHARE: u16 = 51;
 
 // Cipher suites
 pub const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
+pub const TLS_AES_256_GCM_SHA384: u16 = 0x1302;
 pub const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
 
 // Named groups
@@ -50,6 +56,12 @@ pub const GROUP_X25519: u16 = 0x001d;
 pub const SIG_ECDSA_SECP256R1_SHA256: u16 = 0x0403;
 pub const SIG_RSA_PSS_RSAE_SHA256: u16 = 0x0804;
 pub const SIG_RSA_PKCS1_SHA256: u16 = 0x0401;
+
+/// Key exchange state - supports both P-256 and X25519
+pub enum KeyExchangeState {
+    P256(EcdhKeyPair),
+    X25519(X25519KeyPair),
+}
 
 /// TLS handshake state machine
 pub struct HandshakeState {
@@ -112,9 +124,9 @@ impl HandshakeState {
     pub fn build_client_hello(&self) -> Vec<u8> {
         let mut hello = Vec::new();
 
-        // TLS 1.3 requires 0x0303 in ClientHello's legacy_version wire field.
-        hello.push((TLS_LEGACY_VERSION >> 8) as u8);
-        hello.push(TLS_LEGACY_VERSION as u8);
+        // Legacy version (TLS 1.2 for compatibility)
+        hello.push((TLS_VERSION_1_2 >> 8) as u8);
+        hello.push(TLS_VERSION_1_2 as u8);
 
         // Random (32 bytes)
         hello.extend_from_slice(&self.client_random);
@@ -122,14 +134,15 @@ impl HandshakeState {
         // Legacy session ID (empty)
         hello.push(0);
 
-        // ChaCha20-Poly1305 only, and not merely a preference. Application
-        // data is encrypted from poll_read/poll_write, which cannot await, and
-        // the sync AEAD path is pure Rust ChaCha20 — SubtleCrypto AES-GCM is
-        // async and unreachable from there. Advertising AES-GCM let servers
-        // that prefer it (most Nostr relays do) complete the handshake over
-        // the async path and then fail on the first application write. Any
-        // server that cannot do ChaCha20 must fail the handshake instead.
-        // SHA-384 suites stay out regardless: not implemented.
+        // ChaCha20-Poly1305 only, and not merely a preference. TLS 1.3
+        // application data is encrypted from poll_read/poll_write, which
+        // cannot await, and the sync AEAD path is pure-Rust ChaCha20 —
+        // SubtleCrypto AES-GCM is async and unreachable from there.
+        // Advertising AES-GCM let servers that prefer it (most Nostr relays
+        // do) complete the handshake over the async path and then fail on the
+        // first application write. Any server that cannot do ChaCha20 must
+        // fail the handshake instead. SHA-384 suites stay out regardless: not
+        // implemented.
         let cipher_suites = [TLS_CHACHA20_POLY1305_SHA256];
         hello.push(0);
         hello.push((cipher_suites.len() * 2) as u8);
@@ -326,7 +339,7 @@ impl HandshakeState {
 
         let mut pos = 0;
 
-        // Skip ServerHello's TLS 1.3 legacy_version wire field.
+        // Legacy version (ignore)
         pos += 2;
 
         // Random
@@ -583,6 +596,7 @@ impl HandshakeState {
     fn get_key_size(&self) -> usize {
         match self.cipher_suite {
             TLS_AES_128_GCM_SHA256 => 16,
+            TLS_AES_256_GCM_SHA384 => 32,
             TLS_CHACHA20_POLY1305_SHA256 => 32,
             _ => 16, // Default
         }
@@ -676,6 +690,18 @@ async fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     Ok(uint8_array.to_vec())
 }
 
+/// Parse a handshake message header
+pub fn parse_handshake_header(data: &[u8]) -> Result<(u8, usize)> {
+    if data.len() < 4 {
+        return Err(TlsError::handshake("Handshake message too short"));
+    }
+
+    let msg_type = data[0];
+    let length = ((data[1] as usize) << 16) | ((data[2] as usize) << 8) | (data[3] as usize);
+
+    Ok((msg_type, length))
+}
+
 /// Parse Certificate message
 pub fn parse_certificate(data: &[u8]) -> Result<Vec<Vec<u8>>> {
     if data.len() < 4 {
@@ -759,4 +785,82 @@ pub fn parse_certificate_verify(data: &[u8]) -> Result<(u16, Vec<u8>)> {
 pub fn parse_finished(data: &[u8]) -> Result<Vec<u8>> {
     // Finished message is just the verify_data
     Ok(data.to_vec())
+}
+
+/// Maximum handshake message size (matches TLS spec 24-bit length field: 0 to 2^24-1)
+pub const MAX_HANDSHAKE_MESSAGE_SIZE: usize = (1 << 24) - 1;
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn parse_handshake_header_never_panics() {
+        let data: [u8; 8] = kani::any();
+        let _ = parse_handshake_header(&data);
+    }
+
+    #[kani::proof]
+    fn parse_handshake_header_empty_never_panics() {
+        let data: [u8; 0] = [];
+        let _ = parse_handshake_header(&data);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn parse_handshake_header_short_never_panics() {
+        let data: [u8; 3] = kani::any();
+        let _ = parse_handshake_header(&data);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(20)]
+    fn parse_certificate_never_panics() {
+        // Use smaller input to keep verification tractable
+        let data: [u8; 16] = kani::any();
+        let _ = parse_certificate(&data);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(20)]
+    fn parse_certificate_verify_never_panics() {
+        let data: [u8; 16] = kani::any();
+        let _ = parse_certificate_verify(&data);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn parse_finished_never_panics() {
+        let data: [u8; 8] = kani::any();
+        let _ = parse_finished(&data);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn handshake_header_length_bounded() {
+        let data: [u8; 4] = kani::any();
+        if let Ok((_ty, len)) = parse_handshake_header(&data) {
+            kani::assert(len < (1 << 24), "length exceeds 24-bit max");
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(20)]
+    fn certificate_parse_non_empty_on_ok() {
+        // Use smaller input to keep verification tractable
+        let data: [u8; 16] = kani::any();
+        if let Ok(certs) = parse_certificate(&data) {
+            kani::assert(!certs.is_empty(), "certs should be non-empty on Ok");
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn finished_parse_preserves_length() {
+        let data: [u8; 8] = kani::any();
+        if let Ok(result) = parse_finished(&data) {
+            kani::assert(result.len() == data.len(), "finished preserves length");
+        }
+    }
 }

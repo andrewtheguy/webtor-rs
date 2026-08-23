@@ -5,7 +5,7 @@ use crate::error::{Result, TorError};
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use std::collections::HashMap;
 use std::sync::Arc;
-use subtle_tls::{TlsConfig, TlsConnector};
+use subtle_tls::{TlsConfig, TlsConnector, TlsVersion};
 use tracing::debug;
 use url::Url;
 
@@ -39,6 +39,9 @@ impl TorHttpClient {
         let connector = TlsConnector::with_config(TlsConfig {
             skip_verification: false,
             alpn_protocols: vec!["http/1.1".to_string()],
+            // subtle-tls carries TLS 1.2 again, but nothing here negotiates
+            // it: every retained path requires TLS 1.3.
+            version: TlsVersion::Tls13,
         });
         let mut stream = connector
             .connect(stream, &host)
@@ -191,6 +194,11 @@ pub struct HttpResponse {
 impl HttpResponse {
     pub fn is_success(&self) -> bool {
         (200..300).contains(&self.status)
+    }
+
+    pub fn text(&self) -> Result<String> {
+        String::from_utf8(self.body.clone())
+            .map_err(|error| TorError::serialization(format!("Response is not UTF-8: {error}")))
     }
 
     pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T> {

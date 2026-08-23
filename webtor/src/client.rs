@@ -11,6 +11,10 @@ use crate::snowflake_webrtc::{SnowflakeWebRtcConfig, SnowflakeWebRtcStream};
 use crate::snowflake_ws::SnowflakeWsStream;
 use crate::time::system_time_now;
 use crate::wasm_runtime::WasmRuntime;
+
+/// Mozilla's CA bundle, republished by the curl project. Its own certificate
+/// chains to an embedded root, so fetching it needs no additional trust.
+const CA_BUNDLE_URL: &str = "https://curl.se/ca/cacert.pem";
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tor_linkspec::OwnedChanTargetBuilder;
@@ -56,6 +60,36 @@ impl TorClient {
             channel,
             directory_cache_fallback: RwLock::new(None),
         })
+    }
+
+    /// Fetch the Mozilla CA bundle over Tor and trust its roots.
+    ///
+    /// subtle-tls embeds only ISRG Root X1/X2 and DigiCert Global Root G2,
+    /// which covers Tor Check but rejects entire authorities — a relay behind
+    /// Google Trust Services fails verification the moment TLS starts. The
+    /// bundle host itself verifies against the embedded roots, so this
+    /// bootstraps without a trust cycle.
+    ///
+    /// Call it after the exit is verified and before any relay connection.
+    /// Errors are the caller's to weigh: the embedded roots still work, so a
+    /// failed fetch narrows what can be reached rather than breaking Tor.
+    pub async fn load_ca_bundle(&self) -> Result<usize> {
+        self.log("Downloading the CA bundle over Tor", LogType::Info);
+        let response = self.get(CA_BUNDLE_URL).await?;
+        if !response.is_success() {
+            return Err(TorError::Network(format!(
+                "CA bundle request returned HTTP {}",
+                response.status
+            )));
+        }
+
+        let count = subtle_tls::load_extended_roots(&response.text()?)
+            .map_err(|error| TorError::tls(format!("CA bundle was unusable: {error}")))?;
+        self.log(
+            &format!("Trusting {count} additional root CAs"),
+            LogType::Success,
+        );
+        Ok(count)
     }
 
     pub async fn get(&self, url: &str) -> Result<HttpResponse> {

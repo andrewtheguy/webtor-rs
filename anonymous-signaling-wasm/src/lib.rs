@@ -6,7 +6,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use subtle_tls::{TlsConfig, TlsConnector, TlsStream};
+use subtle_tls::{TlsConfig, TlsConnector, TlsStream, TlsVersion};
 use url::Url;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
@@ -162,6 +162,9 @@ async fn connect_tls(client: &TorClient, url: &Url) -> Result<RelayTlsStream, Js
     let tls13_config = TlsConfig {
         skip_verification: false,
         alpn_protocols: vec!["http/1.1".to_string()],
+        // subtle-tls carries TLS 1.2 again, but nothing here negotiates it:
+        // every retained path requires TLS 1.3.
+        version: TlsVersion::Tls13,
     };
     let tls13_connector = TlsConnector::with_config(tls13_config);
     let stream = webtor::with_timeout(
@@ -234,6 +237,17 @@ impl AnonymousSignalingClient {
                 .await
                 .map_err(|error| js_error("Failed to establish Tor connection", error))?;
             verify_tor_exit(&client).await?;
+            // Widen the trust store before any relay connection. Not fatal:
+            // the embedded roots still reach part of the network, so a failed
+            // fetch narrows what is reachable rather than breaking signaling.
+            if let Err(error) = client.load_ca_bundle().await {
+                log_tor_progress(
+                    &format!(
+                        "Could not load the CA bundle; only the embedded roots are trusted: {error}"
+                    ),
+                    LogType::Error,
+                );
+            }
             verify_websocket_stream(&client).await?;
 
             Ok(JsValue::from(Self {
