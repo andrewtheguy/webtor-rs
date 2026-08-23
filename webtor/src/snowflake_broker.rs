@@ -7,7 +7,6 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Request, RequestInit, RequestMode, Response};
 
-pub const BROKER_URL: &str = "https://snowflake-broker.torproject.net/";
 const CLIENT_VERSION: &str = "1.0";
 
 fn broker_error_is_retryable(error: &str) -> bool {

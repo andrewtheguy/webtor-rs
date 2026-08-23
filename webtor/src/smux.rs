@@ -11,7 +11,7 @@
 //! - Bytes 8+: payload
 
 use crate::error::{Result, TorError};
-use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use futures::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -19,9 +19,6 @@ use tracing::{debug, trace, warn};
 
 /// SMUX protocol version
 const SMUX_VERSION: u8 = 2;
-
-/// Default stream ID
-const DEFAULT_STREAM_ID: u32 = 3;
 
 /// Default window size (64KB)
 const DEFAULT_WINDOW: u32 = 65535;
@@ -234,10 +231,6 @@ pub struct SmuxStream<S> {
 }
 
 impl<S> SmuxStream<S> {
-    pub fn new(inner: S) -> Self {
-        Self::with_stream_id(inner, DEFAULT_STREAM_ID)
-    }
-
     pub fn with_stream_id(inner: S, stream_id: u32) -> Self {
         Self {
             inner,
@@ -287,191 +280,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SmuxStream<S> {
         Ok(())
     }
 
-    /// Send data
-    pub async fn send(&mut self, data: &[u8]) -> Result<usize> {
-        if !self.state.syn_sent {
-            self.initialize().await?;
-        }
-
-        // Check flow control
-        if !self.state.can_send(data.len()) {
-            // Wait for window update
-            self.process_incoming().await?;
-            if !self.state.can_send(data.len()) {
-                return Err(TorError::Network("SMUX window full".to_string()));
-            }
-        }
-
-        let segment = SmuxSegment::psh(self.state.stream_id, data.to_vec());
-        self.inner
-            .write_all(&segment.encode())
-            .await
-            .map_err(|e| TorError::Network(format!("Failed to send SMUX data: {}", e)))?;
-
-        self.state.self_write = self.state.self_write.wrapping_add(data.len() as u32);
-
-        Ok(data.len())
-    }
-
-    /// Receive data
-    pub async fn recv(&mut self, buf: &mut [u8]) -> Result<usize> {
-        // First drain data buffer
-        if !self.data_buffer.is_empty() {
-            let len = std::cmp::min(buf.len(), self.data_buffer.len());
-            buf[..len].copy_from_slice(&self.data_buffer[..len]);
-            self.data_buffer.drain(..len);
-            return Ok(len);
-        }
-
-        // Process incoming segments until we get data
-        loop {
-            if let Some(data) = self.process_next_segment().await? {
-                if data.is_empty() {
-                    continue;
-                }
-
-                let len = std::cmp::min(buf.len(), data.len());
-                buf[..len].copy_from_slice(&data[..len]);
-
-                if len < data.len() {
-                    self.data_buffer.extend_from_slice(&data[len..]);
-                }
-
-                return Ok(len);
-            }
-
-            // Read more data
-            let mut temp = [0u8; 4096];
-            let n = self
-                .inner
-                .read(&mut temp)
-                .await
-                .map_err(|e| TorError::Network(format!("SMUX read error: {}", e)))?;
-
-            if n == 0 {
-                return Ok(0); // EOF
-            }
-
-            self.read_buffer.extend_from_slice(&temp[..n]);
-        }
-    }
-
-    /// Process incoming data
-    async fn process_incoming(&mut self) -> Result<()> {
-        let mut temp = [0u8; 4096];
-
-        // Try non-blocking read
-        match futures::future::poll_fn(|cx| Pin::new(&mut self.inner).poll_read(cx, &mut temp))
-            .await
-        {
-            Ok(n) if n > 0 => {
-                self.read_buffer.extend_from_slice(&temp[..n]);
-            }
-            _ => {}
-        }
-
-        // Process all complete segments
-        while let Some(_) = self.process_next_segment().await? {}
-
-        Ok(())
-    }
-
-    /// Process next segment from buffer, returns data if PSH
-    async fn process_next_segment(&mut self) -> Result<Option<Vec<u8>>> {
-        let (segment, consumed) = match SmuxSegment::decode(&self.read_buffer)? {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-
-        self.read_buffer.drain(..consumed);
-
-        // Validate stream ID (allow stream 0 for control messages)
-        if segment.stream_id != self.state.stream_id && segment.stream_id != 0 {
-            trace!(
-                "Ignoring SMUX segment for stream {} (expected {})",
-                segment.stream_id,
-                self.state.stream_id
-            );
-            return Ok(Some(Vec::new())); // Empty = no data but continue
-        }
-
-        match segment.command {
-            SmuxCommand::Syn => {
-                debug!("Received SMUX SYN for stream {}", segment.stream_id);
-                self.state.syn_received = true;
-                Ok(Some(Vec::new()))
-            }
-
-            SmuxCommand::Fin => {
-                debug!("Received SMUX FIN for stream {}", segment.stream_id);
-                Ok(None) // Signal EOF
-            }
-
-            SmuxCommand::Psh => {
-                trace!("Received SMUX PSH: {} bytes", segment.data.len());
-
-                // Update read counters
-                self.state.self_read = self.state.self_read.wrapping_add(segment.data.len() as u32);
-                self.state.self_increment = self
-                    .state
-                    .self_increment
-                    .wrapping_add(segment.data.len() as u32);
-
-                // Send window update if needed
-                if self.state.should_send_update() {
-                    let upd = SmuxSegment::upd(
-                        self.state.stream_id,
-                        self.state.self_read,
-                        self.state.self_window,
-                    );
-                    self.inner
-                        .write_all(&upd.encode())
-                        .await
-                        .map_err(|e| TorError::Network(format!("Failed to send UPD: {}", e)))?;
-                    self.state.self_increment = 0;
-                }
-
-                Ok(Some(segment.data))
-            }
-
-            SmuxCommand::Nop => {
-                trace!("Received SMUX NOP, sending NOP response");
-                // Respond with NOP (ping-pong)
-                let nop = SmuxSegment::nop(segment.stream_id);
-                self.inner
-                    .write_all(&nop.encode())
-                    .await
-                    .map_err(|e| TorError::Network(format!("Failed to send NOP: {}", e)))?;
-                Ok(Some(Vec::new()))
-            }
-
-            SmuxCommand::Upd => {
-                let update = SmuxUpdate::decode(&segment.data)?;
-                trace!(
-                    "Received SMUX UPD: consumed={}, window={}",
-                    update.consumed,
-                    update.window
-                );
-                self.state.peer_consumed = update.consumed;
-                self.state.peer_window = update.window;
-                Ok(Some(Vec::new()))
-            }
-        }
-    }
-
-    /// Close the stream
-    pub async fn close(&mut self) -> Result<()> {
-        let fin = SmuxSegment::fin(self.state.stream_id);
-        self.inner
-            .write_all(&fin.encode())
-            .await
-            .map_err(|e| TorError::Network(format!("Failed to send FIN: {}", e)))?;
-        self.inner
-            .flush()
-            .await
-            .map_err(|e| TorError::Network(format!("Failed to flush FIN: {}", e)))?;
-        Ok(())
-    }
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for SmuxStream<S> {
@@ -713,6 +521,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for SmuxStream<S> {
 mod tests {
     use super::*;
     use futures::executor::block_on;
+    use futures::AsyncReadExt;
 
     struct MockTransport {
         input: futures::io::Cursor<Vec<u8>>,

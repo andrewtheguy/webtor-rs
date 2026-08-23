@@ -6,16 +6,14 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use subtle_tls::{TlsConfig, TlsConnector, TlsStream, TlsVersion};
+use subtle_tls::{TlsConfig, TlsConnector, TlsStream};
 use url::Url;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
-use webtor::config::LogType;
-use webtor::{DataStream, StreamIsolationPolicy, TorClient, TorClientOptions, TorError};
+use webtor::{DataStream, LogType, TorClient, TorClientOptions, TorError};
 
 const MAX_NOSTR_MESSAGE_BYTES: usize = 1024 * 1024;
 const CONNECTION_TIMEOUT_MS: u64 = 240_000;
-const CIRCUIT_TIMEOUT_MS: u64 = 120_000;
 const TOR_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const TOR_CHECK_URL: &str = "https://check.torproject.org/api/ip";
 const RELAY_TCP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -77,11 +75,7 @@ type RelayReader = async_tungstenite::WebSocketReceiver<RelayTlsStream>;
 fn signaling_client_options(stun_urls: Vec<String>) -> TorClientOptions {
     TorClientOptions::snowflake_webrtc(stun_urls)
         .with_connection_timeout(CONNECTION_TIMEOUT_MS)
-        .with_circuit_timeout(CIRCUIT_TIMEOUT_MS)
-        .with_create_circuit_early(false)
         .with_on_log(log_tor_progress)
-        .with_stream_isolation(StreamIsolationPolicy::None)
-        .with_circuit_update_interval(None)
 }
 
 async fn connect_tls(client: &TorClient, url: &Url) -> Result<RelayTlsStream, JsValue> {
@@ -95,7 +89,6 @@ async fn connect_tls(client: &TorClient, url: &Url) -> Result<RelayTlsStream, Js
     let tls13_config = TlsConfig {
         skip_verification: false,
         alpn_protocols: vec!["http/1.1".to_string()],
-        version: TlsVersion::Tls13,
     };
     let tls13_connector = TlsConnector::with_config(tls13_config);
     let stream = webtor::with_timeout(
@@ -167,10 +160,6 @@ impl AnonymousSignalingClient {
                 .ensure_ready()
                 .await
                 .map_err(|error| js_error("Failed to establish Tor connection", error))?;
-            client
-                .wait_for_circuit()
-                .await
-                .map_err(|error| js_error("Tor circuit did not become ready", error))?;
             verify_tor_exit(&client).await?;
 
             Ok(JsValue::from(Self {
@@ -248,17 +237,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn signaling_reuses_the_verified_circuit() {
-        assert_eq!(
-            signaling_client_options(vec!["stun:example.com".to_string()]).stream_isolation,
-            StreamIsolationPolicy::None
-        );
-    }
-
-    #[test]
     fn signaling_uses_snowflake_webrtc_with_caller_stun_urls() {
         let options = signaling_client_options(vec!["stun:example.com".to_string()]);
-        let webtor::config::BridgeType::SnowflakeWebRtc { stun_urls, .. } = options.bridge;
+        let webtor::BridgeType::SnowflakeWebRtc { stun_urls, .. } = options.bridge else {
+            panic!("signaling must use Snowflake WebRTC");
+        };
         assert_eq!(stun_urls, vec!["stun:example.com"]);
     }
 }

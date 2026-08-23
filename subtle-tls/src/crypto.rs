@@ -5,7 +5,7 @@
 //! - AES-GCM encryption (via SubtleCrypto)
 //! - ChaCha20-Poly1305 encryption (via pure Rust - not in SubtleCrypto)
 //! - HKDF key derivation
-//! - SHA-256/SHA-384 hashing
+//! - SHA-256 hashing
 
 use crate::error::{Result, TlsError};
 use chacha20poly1305::{
@@ -58,7 +58,6 @@ pub fn random_bytes(len: usize) -> Result<Vec<u8>> {
 /// ECDH key pair for key exchange
 pub struct EcdhKeyPair {
     pub private_key: CryptoKey,
-    pub public_key: CryptoKey,
     pub public_key_bytes: Vec<u8>,
 }
 
@@ -101,7 +100,6 @@ impl EcdhKeyPair {
 
         Ok(Self {
             private_key,
-            public_key,
             public_key_bytes,
         })
     }
@@ -221,45 +219,9 @@ impl X25519KeyPair {
     }
 }
 
-/// Unified key exchange that supports both P-256 and X25519
-pub enum KeyExchange {
-    P256(EcdhKeyPair),
-    X25519(X25519KeyPair),
-}
-
-impl KeyExchange {
-    /// Generate a P-256 key pair
-    pub async fn generate_p256() -> Result<Self> {
-        Ok(KeyExchange::P256(EcdhKeyPair::generate().await?))
-    }
-
-    /// Generate an X25519 key pair
-    pub fn generate_x25519() -> Result<Self> {
-        Ok(KeyExchange::X25519(X25519KeyPair::generate()?))
-    }
-
-    /// Get the public key bytes
-    pub fn public_key_bytes(&self) -> &[u8] {
-        match self {
-            KeyExchange::P256(kp) => &kp.public_key_bytes,
-            KeyExchange::X25519(kp) => &kp.public_key_bytes,
-        }
-    }
-
-    /// Get the named group code for TLS
-    pub fn named_group(&self) -> u16 {
-        match self {
-            KeyExchange::P256(_) => 0x0017,   // secp256r1
-            KeyExchange::X25519(_) => 0x001d, // x25519
-        }
-    }
-}
-
 /// AES-GCM cipher for record encryption
 pub struct AesGcm {
     key: CryptoKey,
-    #[allow(dead_code)]
-    key_size: usize,
 }
 
 impl AesGcm {
@@ -268,18 +230,6 @@ impl AesGcm {
         if key_bytes.len() != 16 {
             return Err(TlsError::crypto("AES-128-GCM requires 16-byte key"));
         }
-        Self::new(key_bytes, 128).await
-    }
-
-    /// Create AES-256-GCM cipher from key bytes
-    pub async fn new_256(key_bytes: &[u8]) -> Result<Self> {
-        if key_bytes.len() != 32 {
-            return Err(TlsError::crypto("AES-256-GCM requires 32-byte key"));
-        }
-        Self::new(key_bytes, 256).await
-    }
-
-    async fn new(key_bytes: &[u8], bits: usize) -> Result<Self> {
         let subtle = get_subtle_crypto()?;
         let key_data = Uint8Array::from(key_bytes);
 
@@ -289,7 +239,7 @@ impl AesGcm {
         Reflect::set(
             &algorithm,
             &"length".into(),
-            &JsValue::from_f64(bits as f64),
+            &JsValue::from_f64(128.0),
         )
         .map_err(|_| TlsError::subtle_crypto("Failed to set key length"))?;
 
@@ -307,7 +257,6 @@ impl AesGcm {
 
         Ok(Self {
             key: key.unchecked_into(),
-            key_size: bits / 8,
         })
     }
 
@@ -405,141 +354,6 @@ impl AesGcm {
     }
 }
 
-/// AES-CBC cipher for TLS 1.2 record encryption
-/// Note: CBC mode requires separate MAC (not AEAD)
-#[cfg(feature = "tls12")]
-pub struct AesCbc {
-    key: CryptoKey,
-    #[allow(dead_code)]
-    key_size: usize,
-}
-
-#[cfg(feature = "tls12")]
-impl AesCbc {
-    /// Create AES-128-CBC cipher from key bytes
-    pub async fn new_128(key_bytes: &[u8]) -> Result<Self> {
-        if key_bytes.len() != 16 {
-            return Err(TlsError::crypto("AES-128-CBC requires 16-byte key"));
-        }
-        Self::new(key_bytes, 128).await
-    }
-
-    /// Create AES-256-CBC cipher from key bytes
-    pub async fn new_256(key_bytes: &[u8]) -> Result<Self> {
-        if key_bytes.len() != 32 {
-            return Err(TlsError::crypto("AES-256-CBC requires 32-byte key"));
-        }
-        Self::new(key_bytes, 256).await
-    }
-
-    async fn new(key_bytes: &[u8], bits: usize) -> Result<Self> {
-        let subtle = get_subtle_crypto()?;
-        let key_data = Uint8Array::from(key_bytes);
-
-        let algorithm = Object::new();
-        Reflect::set(&algorithm, &"name".into(), &"AES-CBC".into())
-            .map_err(|_| TlsError::subtle_crypto("Failed to set algorithm name"))?;
-        Reflect::set(
-            &algorithm,
-            &"length".into(),
-            &JsValue::from_f64(bits as f64),
-        )
-        .map_err(|_| TlsError::subtle_crypto("Failed to set key length"))?;
-
-        let key_usages = Array::new();
-        key_usages.push(&"encrypt".into());
-        key_usages.push(&"decrypt".into());
-
-        let key = JsFuture::from(
-            subtle
-                .import_key_with_object("raw", &key_data.buffer(), &algorithm, false, &key_usages)
-                .map_err(|e| TlsError::subtle_crypto(format!("Failed to import key: {:?}", e)))?,
-        )
-        .await
-        .map_err(|e| TlsError::subtle_crypto(format!("Key import failed: {:?}", e)))?;
-
-        Ok(Self {
-            key: key.unchecked_into(),
-            key_size: bits / 8,
-        })
-    }
-
-    /// Encrypt plaintext with the given IV
-    /// SubtleCrypto AES-CBC uses PKCS#7 padding automatically
-    pub async fn encrypt(&self, iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
-        if iv.len() != 16 {
-            return Err(TlsError::crypto("AES-CBC requires 16-byte IV"));
-        }
-
-        let subtle = get_subtle_crypto()?;
-        let iv_array = Uint8Array::from(iv);
-        let plaintext_array = Uint8Array::from(plaintext);
-
-        let algorithm = Object::new();
-        Reflect::set(&algorithm, &"name".into(), &"AES-CBC".into())
-            .map_err(|_| TlsError::subtle_crypto("Failed to set algorithm name"))?;
-        Reflect::set(&algorithm, &"iv".into(), &iv_array)
-            .map_err(|_| TlsError::subtle_crypto("Failed to set iv"))?;
-
-        let ciphertext = JsFuture::from(
-            subtle
-                .encrypt_with_object_and_buffer_source(
-                    &algorithm,
-                    &self.key,
-                    &plaintext_array.buffer(),
-                )
-                .map_err(|e| TlsError::subtle_crypto(format!("Encryption failed: {:?}", e)))?,
-        )
-        .await
-        .map_err(|e| TlsError::subtle_crypto(format!("Encryption failed: {:?}", e)))?;
-
-        let array_buffer: ArrayBuffer = ciphertext.unchecked_into();
-        let uint8_array = Uint8Array::new(&array_buffer);
-        Ok(uint8_array.to_vec())
-    }
-
-    /// Decrypt ciphertext with the given IV
-    /// SubtleCrypto AES-CBC removes PKCS#7 padding automatically
-    pub async fn decrypt(&self, iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
-        if iv.len() != 16 {
-            return Err(TlsError::crypto("AES-CBC requires 16-byte IV"));
-        }
-        if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
-            return Err(TlsError::crypto(
-                "AES-CBC ciphertext must be multiple of 16 bytes",
-            ));
-        }
-
-        let subtle = get_subtle_crypto()?;
-        let iv_array = Uint8Array::from(iv);
-        let ciphertext_array = Uint8Array::from(ciphertext);
-
-        let algorithm = Object::new();
-        Reflect::set(&algorithm, &"name".into(), &"AES-CBC".into())
-            .map_err(|_| TlsError::subtle_crypto("Failed to set algorithm name"))?;
-        Reflect::set(&algorithm, &"iv".into(), &iv_array)
-            .map_err(|_| TlsError::subtle_crypto("Failed to set iv"))?;
-
-        let plaintext = JsFuture::from(
-            subtle
-                .decrypt_with_object_and_buffer_source(
-                    &algorithm,
-                    &self.key,
-                    &ciphertext_array.buffer(),
-                )
-                .map_err(|e| TlsError::subtle_crypto(format!("Decryption failed: {:?}", e)))?,
-        )
-        .await
-        .map_err(|e| {
-            TlsError::subtle_crypto(format!("Decryption failed (bad padding?): {:?}", e))
-        })?;
-
-        let array_buffer: ArrayBuffer = plaintext.unchecked_into();
-        let uint8_array = Uint8Array::new(&array_buffer);
-        Ok(uint8_array.to_vec())
-    }
-}
-
 /// ChaCha20-Poly1305 cipher for record encryption (pure Rust)
 /// This is used when the server negotiates TLS_CHACHA20_POLY1305_SHA256
 pub struct ChaCha20Poly1305Cipher {
@@ -601,7 +415,6 @@ impl ChaCha20Poly1305Cipher {
 /// Unified cipher interface supporting multiple AEAD algorithms
 pub enum Cipher {
     Aes128Gcm(AesGcm),
-    Aes256Gcm(AesGcm),
     ChaCha20Poly1305(ChaCha20Poly1305Cipher),
 }
 
@@ -609,11 +422,6 @@ impl Cipher {
     /// Create AES-128-GCM cipher
     pub async fn aes_128_gcm(key: &[u8]) -> Result<Self> {
         Ok(Cipher::Aes128Gcm(AesGcm::new_128(key).await?))
-    }
-
-    /// Create AES-256-GCM cipher
-    pub async fn aes_256_gcm(key: &[u8]) -> Result<Self> {
-        Ok(Cipher::Aes256Gcm(AesGcm::new_256(key).await?))
     }
 
     /// Create ChaCha20-Poly1305 cipher
@@ -624,7 +432,7 @@ impl Cipher {
     /// Encrypt with the cipher
     pub async fn encrypt(&self, nonce: &[u8], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
         match self {
-            Cipher::Aes128Gcm(c) | Cipher::Aes256Gcm(c) => c.encrypt(nonce, aad, plaintext).await,
+            Cipher::Aes128Gcm(c) => c.encrypt(nonce, aad, plaintext).await,
             Cipher::ChaCha20Poly1305(c) => c.encrypt(nonce, aad, plaintext),
         }
     }
@@ -632,7 +440,7 @@ impl Cipher {
     /// Decrypt with the cipher
     pub async fn decrypt(&self, nonce: &[u8], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
         match self {
-            Cipher::Aes128Gcm(c) | Cipher::Aes256Gcm(c) => c.decrypt(nonce, aad, ciphertext).await,
+            Cipher::Aes128Gcm(c) => c.decrypt(nonce, aad, ciphertext).await,
             Cipher::ChaCha20Poly1305(c) => c.decrypt(nonce, aad, ciphertext),
         }
     }
@@ -657,24 +465,14 @@ impl Cipher {
         }
     }
 
-    /// Check if this cipher supports synchronous operations
-    pub fn supports_sync(&self) -> bool {
-        matches!(self, Cipher::ChaCha20Poly1305(_))
-    }
-
     /// Get the key size for this cipher
     pub fn key_size(&self) -> usize {
         match self {
             Cipher::Aes128Gcm(_) => 16,
-            Cipher::Aes256Gcm(_) => 32,
             Cipher::ChaCha20Poly1305(_) => 32,
         }
     }
 
-    /// Get the IV/nonce size for this cipher
-    pub fn iv_size(&self) -> usize {
-        12 // All TLS 1.3 AEAD ciphers use 12-byte nonce
-    }
 }
 
 /// HKDF for key derivation
@@ -819,24 +617,6 @@ pub async fn sha256(data: &[u8]) -> Result<Vec<u8>> {
     )
     .await
     .map_err(|e| TlsError::subtle_crypto(format!("SHA-256 failed: {:?}", e)))?;
-
-    let array_buffer: ArrayBuffer = hash.unchecked_into();
-    let uint8_array = Uint8Array::new(&array_buffer);
-    Ok(uint8_array.to_vec())
-}
-
-/// SHA-384 hash function
-pub async fn sha384(data: &[u8]) -> Result<Vec<u8>> {
-    let subtle = get_subtle_crypto()?;
-    let data_array = Uint8Array::from(data);
-
-    let hash = JsFuture::from(
-        subtle
-            .digest_with_str_and_buffer_source("SHA-384", &data_array.buffer())
-            .map_err(|e| TlsError::subtle_crypto(format!("SHA-384 failed: {:?}", e)))?,
-    )
-    .await
-    .map_err(|e| TlsError::subtle_crypto(format!("SHA-384 failed: {:?}", e)))?;
 
     let array_buffer: ArrayBuffer = hash.unchecked_into();
     let uint8_array = Uint8Array::new(&array_buffer);

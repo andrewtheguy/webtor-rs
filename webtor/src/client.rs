@@ -1,495 +1,168 @@
-//! Main Tor client implementation
+//! Browser Tor client used by anonymous Nostr signaling.
 
-use crate::circuit::{CircuitManager, CircuitStatusInfo};
+use crate::circuit::CircuitManager;
 use crate::config::{BridgeType, LogType, TorClientOptions, SNOWFLAKE_FINGERPRINT};
 use crate::directory::DirectoryManager;
 use crate::error::{Result, TorError};
-use crate::http::{HttpRequest, HttpResponse, TorHttpClient};
+use crate::http::{HttpResponse, TorHttpClient};
 use crate::relay::RelayManager;
-use crate::retry::{with_timeout_and_cancellation, CancellationToken};
+use crate::retry::with_timeout;
 use crate::snowflake_webrtc::{SnowflakeWebRtcConfig, SnowflakeWebRtcStream};
+use crate::snowflake_ws::SnowflakeWsStream;
 use crate::time::system_time_now;
 use crate::wasm_runtime::WasmRuntime;
-use http::Method;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tor_linkspec::OwnedChanTargetBuilder;
 use tor_llcrypto::pk::rsa::RsaIdentity;
 use tor_memquota::MemoryQuotaTracker;
 use tor_proto::channel::ChannelBuilder;
 use tor_proto::client::stream::DataStream;
 use tor_proto::memquota::{ChannelAccount, SpecificAccount};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use url::Url;
 
-/// Main Tor client that manages circuits and HTTP requests
 pub struct TorClient {
     options: TorClientOptions,
-    circuit_manager: Arc<RwLock<CircuitManager>>,
+    circuit_manager: Arc<CircuitManager>,
     directory_manager: Arc<DirectoryManager>,
-    http_client: Arc<TorHttpClient>,
-    is_initialized: Arc<RwLock<bool>>,
-    // Store the channel to prevent it from being dropped
+    http_client: TorHttpClient,
+    initialized: RwLock<bool>,
+    bootstrap_lock: Mutex<()>,
     channel: Arc<RwLock<Option<Arc<tor_proto::channel::Channel>>>>,
-    update_task: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
-    /// Shutdown token for cooperative cancellation of long-running operations
-    shutdown_token: CancellationToken,
 }
 
 impl TorClient {
-    /// Create a new Tor client with the given options
     pub async fn new(options: TorClientOptions) -> Result<Self> {
-        info!("TorClient::new START");
-
-        // Initialize WASM modules (placeholder for now)
-        Self::init_wasm_modules().await?;
-
-        // Channel storage
         let channel = Arc::new(RwLock::new(None));
-
-        // Create relay manager with empty relay list (will be populated later)
-        let relay_manager = RelayManager::new(Vec::new());
-        let relay_manager_arc = Arc::new(RwLock::new(relay_manager));
-
+        let relay_manager = Arc::new(RwLock::new(RelayManager::new(Vec::new())));
         let directory_manager = Arc::new(DirectoryManager::new(
-            relay_manager_arc.clone(),
+            relay_manager.clone(),
             options.on_log.clone(),
         ));
+        let circuit_manager = Arc::new(CircuitManager::new(relay_manager, channel.clone()));
 
-        let circuit_manager = Arc::new(RwLock::new(CircuitManager::new(
-            relay_manager_arc.clone(),
-            channel.clone(),
-        )));
-        let http_client = TorHttpClient::new(circuit_manager.clone(), options.stream_isolation);
-
-        let client = Self {
-            options: options.clone(),
+        Ok(Self {
+            options,
+            http_client: TorHttpClient::new(circuit_manager.clone()),
             circuit_manager,
             directory_manager,
-            http_client: Arc::new(http_client),
-            is_initialized: Arc::new(RwLock::new(false)),
+            initialized: RwLock::new(false),
+            bootstrap_lock: Mutex::new(()),
             channel,
-            update_task: Arc::new(RwLock::new(None)),
-            shutdown_token: CancellationToken::new(),
-        };
-
-        // Create initial circuit if requested
-        if options.create_circuit_early {
-            info!("Establishing connection early");
-
-            // Establish the channel
-            info!("TorClient::new: calling establish_channel");
-            if let Err(e) = client.establish_channel().await {
-                error!("Failed to establish channel: {}", e);
-                // Don't fail the client creation, just log the error
-            }
-            info!("TorClient::new: establish_channel returned");
-        }
-
-        info!("TorClient::new RETURNING");
-        Ok(client)
+        })
     }
 
-    /// Bootstrap the client with current directory data and a ready circuit.
-    pub async fn bootstrap(&self) -> Result<()> {
-        self.log("Bootstrapping Tor client...", LogType::Info);
-        self.ensure_ready().await
-    }
-
-    /// Make a fetch request through the persistent Tor circuit
-    pub async fn fetch(&self, url: &str) -> Result<HttpResponse> {
-        self.log(&format!("Starting fetch request to {}", url), LogType::Info);
-
-        let url = Url::parse(url)?;
-        let request = HttpRequest::new(url);
-
-        self.http_client.request(request).await
-    }
-
-    /// Make a GET request
     pub async fn get(&self, url: &str) -> Result<HttpResponse> {
-        self.fetch(url).await
+        self.ensure_ready().await?;
+        self.http_client.get(Url::parse(url)?).await
     }
 
-    /// Make a POST request
-    pub async fn post(&self, url: &str, body: Vec<u8>) -> Result<HttpResponse> {
-        let url = Url::parse(url)?;
-        let request = HttpRequest::new(url)
-            .with_method(Method::POST)
-            .with_body(body);
-
-        self.http_client.request(request).await
-    }
-
-    /// Make a generic HTTP request with full control over method, headers, body, and timeout
-    pub async fn request(
-        &self,
-        method: Method,
-        url: &str,
-        headers: std::collections::HashMap<String, String>,
-        body: Option<Vec<u8>>,
-        timeout: Option<Duration>,
-    ) -> Result<HttpResponse> {
-        let url = Url::parse(url)?;
-        let mut request = HttpRequest::new(url).with_method(method);
-
-        for (key, value) in headers {
-            request = request.with_header(&key, &value);
-        }
-
-        if let Some(body) = body {
-            request = request.with_body(body);
-        }
-
-        if let Some(timeout) = timeout {
-            request = request.with_timeout(timeout);
-        }
-
-        self.http_client.request(request).await
-    }
-
-    /// Open a raw TCP stream through Tor for protocols other than HTTP.
-    ///
-    /// Hostname resolution happens at the exit relay. Circuit selection uses
-    /// the client's configured isolation policy so unrelated relay origins do
-    /// not silently share an exit circuit.
     pub async fn open_stream(&self, url: &Url) -> Result<DataStream> {
         self.ensure_ready().await?;
-
         let host = url
             .host_str()
             .ok_or_else(|| TorError::Configuration("URL has no host".to_string()))?;
         let port = url
             .port_or_known_default()
             .ok_or_else(|| TorError::Configuration("URL has no port".to_string()))?;
-        let isolation_key =
-            crate::isolation::IsolationKey::from_url(url, self.options.stream_isolation);
-
-        let circuit = {
-            let circuit_manager = self.circuit_manager.read().await;
-            circuit_manager
-                .get_circuit_for_isolation_key(isolation_key)
-                .await?
-        };
-        let circuit = circuit.read().await;
-        circuit.begin_stream(host, port).await
+        self.circuit_manager
+            .ready_circuit()
+            .await?
+            .begin_stream(host, port)
+            .await
     }
 
-    /// Update the circuit by creating a new one
-    /// The deadline parameter specifies the maximum time to wait for circuit creation
-    pub async fn update_circuit(&self, deadline: Duration) -> Result<()> {
-        with_timeout_and_cancellation(deadline, "update_circuit", &self.shutdown_token, async {
-            info!("Creating new circuit...");
-            self.log("Creating new circuit...", LogType::Info);
-
-            let circuit_manager = self.circuit_manager.read().await;
-            match circuit_manager.create_circuit().await {
-                Ok(circuit) => {
-                    let circuit_info = circuit.read().await;
-                    let relay_names: Vec<_> = circuit_info
-                        .relays
-                        .iter()
-                        .map(|r| r.nickname.clone())
-                        .collect();
-                    self.log(
-                        &format!("New circuit: {}", relay_names.join(" → ")),
-                        LogType::Success,
-                    );
-                    Ok(())
-                }
-                Err(e) => {
-                    self.log(&format!("Failed to create circuit: {}", e), LogType::Error);
-                    Err(e)
-                }
-            }
-        })
-        .await
-    }
-
-    /// Wait for a circuit to be ready (uses circuit_timeout from options)
-    pub async fn wait_for_circuit(&self) -> Result<()> {
-        let timeout = self.options.circuit_timeout_duration();
-        with_timeout_and_cancellation(timeout, "wait_for_circuit", &self.shutdown_token, async {
-            info!("Waiting for circuit to be ready");
-
-            let circuit_manager = self.circuit_manager.read().await;
-            let circuit = circuit_manager.get_ready_circuit().await?;
-
-            let circuit_read = circuit.read().await;
-            if !circuit_read.is_ready() {
-                return Err(TorError::circuit_creation("Circuit is not ready"));
-            }
-
-            info!("Circuit is ready");
-            Ok(())
-        })
-        .await
-    }
-
-    /// Get current circuit status
-    pub async fn get_circuit_status(&self) -> CircuitStatusInfo {
-        let circuit_manager = self.circuit_manager.read().await;
-        circuit_manager.get_circuit_status().await
-    }
-
-    /// Get human-readable circuit status string
-    pub async fn get_circuit_status_string(&self) -> String {
-        let status = self.get_circuit_status().await;
-
-        if !status.has_ready_circuits() && status.creating_circuits > 0 {
-            return "Creating...".to_string();
-        }
-
-        if !status.has_ready_circuits() {
-            return "None".to_string();
-        }
-
-        if status.failed_circuits > 0 {
-            return format!("Ready ({} failed circuits)", status.failed_circuits);
-        }
-
-        "Ready".to_string()
-    }
-
-    /// Get relay information from the current circuit
-    pub async fn get_circuit_relays(&self) -> Option<Vec<crate::circuit::CircuitRelayInfo>> {
-        let circuit_manager = self.circuit_manager.read().await;
-        circuit_manager.get_circuit_relays().await
-    }
-
-    /// Ensure the client is ready for making requests
     pub async fn ensure_ready(&self) -> Result<()> {
-        // Establish channel if not already done
-        if !*self.is_initialized.read().await {
-            self.establish_channel().await?;
+        if *self.initialized.read().await {
+            return Ok(());
         }
 
-        Ok(())
-    }
-
-    /// Refresh consensus by fetching from the network
-    /// Returns the number of relays loaded
-    pub async fn refresh_consensus(&self) -> Result<usize> {
-        // Ensure channel is established first
-        let channel_guard = self.channel.read().await;
-        if channel_guard.is_none() {
-            drop(channel_guard);
-            self.establish_channel().await?;
-        } else {
-            drop(channel_guard);
+        let _bootstrap_guard = self.bootstrap_lock.lock().await;
+        if *self.initialized.read().await {
+            return Ok(());
         }
 
-        // Get channel
-        let channel_guard = self.channel.read().await;
-        let channel = channel_guard
-            .as_ref()
-            .ok_or_else(|| TorError::Internal("Channel not established".to_string()))?
-            .clone();
-        drop(channel_guard);
-
-        // Fetch and process consensus
-        self.directory_manager
-            .fetch_and_process_consensus(channel)
-            .await?;
-
-        // Return relay count
-        let relay_manager = self.directory_manager.relay_manager.read().await;
-        Ok(relay_manager.relays.len())
-    }
-
-    /// Validate and install a serialized directory cache before bootstrap.
-    pub async fn load_directory_cache(&self, encoded: &str) -> Result<()> {
-        self.directory_manager.load_cache(encoded).await
-    }
-
-    /// Serialize the validated directory data used by this client.
-    pub async fn directory_cache_json(&self) -> Result<Option<String>> {
-        self.directory_manager.cache_json().await
-    }
-
-    /// Get consensus status string
-    pub async fn get_consensus_status(&self) -> String {
-        let relay_manager = self.directory_manager.relay_manager.read().await;
-        let count = relay_manager.relays.len();
-        if count == 0 {
-            "No consensus loaded".to_string()
-        } else {
-            format!("{} relays loaded", count)
-        }
-    }
-
-    /// Check if consensus needs refresh (stub - always returns false for now)
-    pub fn needs_consensus_refresh(&self) -> bool {
-        false
-    }
-
-    /// Close the Tor client and clean up resources
-    pub async fn close(&self) {
-        info!("Closing Tor client");
-
-        // Signal cancellation to all in-flight operations
-        self.shutdown_token.cancel();
-
-        // Stop update task if running
-        if let Some(task) = self.update_task.write().await.take() {
-            task.abort();
-        }
-
-        // Clean up circuits
-        let circuit_manager = self.circuit_manager.write().await;
-        if let Err(e) = circuit_manager.cleanup_circuits().await {
-            warn!("Error during circuit cleanup: {}", e);
-        }
-
-        *self.is_initialized.write().await = false;
-        info!("Tor client closed");
-    }
-
-    /// Abort all in-flight operations.
-    ///
-    /// This cancels long-running operations like circuit creation and HTTP requests.
-    /// Operations will return `TorError::Cancelled`.
-    pub fn abort(&self) {
-        info!("Aborting all in-flight operations");
-        self.shutdown_token.cancel();
-    }
-
-    /// Check if the client has been aborted/shutdown.
-    pub fn is_aborted(&self) -> bool {
-        self.shutdown_token.is_cancelled()
-    }
-
-    /// Get the shutdown token for advanced cancellation use cases.
-    pub fn shutdown_token(&self) -> &CancellationToken {
-        &self.shutdown_token
-    }
-
-    /// Establish the Tor channel (called during construction if requested)
-    async fn establish_channel(&self) -> Result<()> {
-        let timeout = self.options.connection_timeout_duration();
-        with_timeout_and_cancellation(
-            timeout,
-            "establish_channel",
-            &self.shutdown_token,
-            self.establish_channel_impl(),
+        with_timeout(
+            self.options.connection_timeout(),
+            "Tor bootstrap",
+            self.establish_channel(),
         )
         .await
     }
 
-    /// Internal implementation of establish_channel (without timeout wrapper)
-    async fn establish_channel_impl(&self) -> Result<()> {
-        self.log("Establishing channel", LogType::Info);
+    pub async fn load_directory_cache(&self, encoded: &str) -> Result<()> {
+        self.directory_manager.load_cache(encoded).await
+    }
 
-        // Get fingerprint - use the known Snowflake bridge identity if omitted.
-        let fingerprint = self
-            .options
-            .bridge_fingerprint
-            .clone()
-            .unwrap_or_else(|| SNOWFLAKE_FINGERPRINT.to_string());
+    pub async fn directory_cache_json(&self) -> Result<Option<String>> {
+        self.directory_manager.cache_json().await
+    }
 
-        // Parse fingerprint to RSA identity
-        let rsa_id = {
-            let bytes = hex::decode(&fingerprint)
-                .map_err(|e| TorError::Configuration(format!("Invalid fingerprint hex: {}", e)))?;
-            if bytes.len() != 20 {
-                return Err(TorError::Configuration(
-                    "Fingerprint must be 40 hex characters (20 bytes)".to_string(),
-                ));
-            }
-            RsaIdentity::from_bytes(&bytes)
-                .ok_or_else(|| TorError::Configuration("Invalid RSA identity bytes".to_string()))?
-        };
+    pub async fn close(&self) {
+        self.circuit_manager.close().await;
+        *self.channel.write().await = None;
+        *self.initialized.write().await = false;
+    }
 
-        // 1. Connect to the Snowflake bridge via WebRTC
-        let chan: Arc<tor_proto::channel::Channel> = {
-            let BridgeType::SnowflakeWebRtc {
+    async fn establish_channel(&self) -> Result<()> {
+        self.log("Establishing Snowflake bridge channel", LogType::Info);
+        let rsa_identity = parse_snowflake_identity()?;
+
+        let channel = match &self.options.bridge {
+            BridgeType::SnowflakeWebRtc {
                 broker_url,
                 stun_urls,
-            } = &self.options.bridge;
-            self.log("Connecting to Snowflake via WebRTC", LogType::Info);
-            self.log(
-                "Using WebRTC -> Turbo -> KCP -> SMUX -> TLS stack",
-                LogType::Info,
-            );
-            let stream = SnowflakeWebRtcStream::connect(SnowflakeWebRtcConfig {
-                broker_url: broker_url.clone(),
-                fingerprint: fingerprint.clone(),
-                stun_urls: stun_urls.clone(),
-            })
-            .await?;
-            self.log(
-                "Connected to a Snowflake volunteer proxy via WebRTC",
-                LogType::Success,
-            );
-            self.create_channel_from_stream(stream, rsa_id).await?
+            } => {
+                self.log("Connecting to Snowflake via WebRTC", LogType::Info);
+                let stream = SnowflakeWebRtcStream::connect(SnowflakeWebRtcConfig {
+                    broker_url: broker_url.clone(),
+                    fingerprint: SNOWFLAKE_FINGERPRINT.to_string(),
+                    stun_urls: stun_urls.clone(),
+                })
+                .await?;
+                self.create_channel(stream, rsa_identity).await?
+            }
+            BridgeType::SnowflakeWebSocket { url } => {
+                self.log("Connecting to Snowflake via WebSocket", LogType::Info);
+                let stream = SnowflakeWsStream::connect(url).await?;
+                self.create_channel(stream, rsa_identity).await?
+            }
         };
 
-        // Store the channel to keep it alive
-        *self.channel.write().await = Some(chan.clone());
-
-        self.log("Channel established", LogType::Success);
+        *self.channel.write().await = Some(channel.clone());
+        self.log("Snowflake bridge channel established", LogType::Success);
 
         if self.directory_manager.has_directory_data().await {
             self.log(
-                "Using validated cached Tor directory data; skipping download",
+                "Using validated cached Tor directory data",
                 LogType::Success,
             );
         } else {
-            // A bridge channel can open a one-hop directory stream without a relay
-            // snapshot. Require validated directory data before choosing the middle
-            // and exit so rotating ntor keys can never come from an expired cache.
-            self.log(
-                "Fetching current Tor directory data through Snowflake...",
-                LogType::Info,
-            );
-            if let Err(e) = self
-                .directory_manager
-                .fetch_and_process_consensus(chan)
-                .await
-            {
-                self.log(
-                    &format!("Failed to fetch current Tor directory data: {}", e),
-                    LogType::Error,
-                );
-                return Err(e);
-            }
-            self.log("Current Tor directory data loaded", LogType::Success);
+            self.log("Downloading current Tor directory data", LogType::Info);
+            self.directory_manager
+                .fetch_and_process_consensus(channel)
+                .await?;
         }
 
-        // Now create the actual circuit through the Tor network
-        self.log("Creating circuit through Tor network...", LogType::Info);
-
-        let circuit_manager = self.circuit_manager.read().await;
-        match circuit_manager.create_circuit().await {
-            Ok(circuit) => {
-                let circuit_info = circuit.read().await;
-                let relay_names: Vec<_> = circuit_info
-                    .relays
-                    .iter()
-                    .map(|r| r.nickname.clone())
-                    .collect();
-                self.log(
-                    &format!("Circuit created: {}", relay_names.join(" → ")),
-                    LogType::Success,
-                );
-            }
-            Err(e) => {
-                self.log(&format!("Failed to create circuit: {}", e), LogType::Error);
-                return Err(e);
-            }
-        }
-
-        *self.is_initialized.write().await = true;
-
+        let circuit = self.circuit_manager.create_circuit().await?;
+        let relay_names: Vec<&str> = circuit
+            .relays
+            .iter()
+            .map(|relay| relay.nickname.as_str())
+            .collect();
+        self.log(
+            &format!("Tor circuit created: Snowflake → {}", relay_names.join(" → ")),
+            LogType::Success,
+        );
+        *self.initialized.write().await = true;
         Ok(())
     }
 
-    /// Create Tor channel from a connected stream and spawn the reactor
-    async fn create_channel_from_stream<S>(
+    async fn create_channel<S>(
         &self,
         stream: S,
-        rsa_id: RsaIdentity,
+        rsa_identity: RsaIdentity,
     ) -> Result<Arc<tor_proto::channel::Channel>>
     where
         S: futures::AsyncRead
@@ -500,125 +173,71 @@ impl TorClient {
             + tor_rtcompat::CertifiedConn
             + 'static,
     {
-        let runtime = WasmRuntime::new();
-
-        // Extract the peer certificate from the TLS stream BEFORE moving it
-        // The peer certificate is needed later for the check() call
-        let peer_cert = stream
+        let peer_certificate = stream
             .peer_certificate()
-            .map_err(|e| TorError::Network(format!("Failed to get peer certificate: {}", e)))?
-            .ok_or_else(|| TorError::Network("No peer certificate from TLS".to_string()))?;
-        debug!("Got peer certificate: {} bytes", peer_cert.len());
+            .map_err(|error| {
+                TorError::Network(format!("Failed to read bridge certificate: {error}"))
+            })?
+            .ok_or_else(|| TorError::Network("Bridge supplied no certificate".to_string()))?;
 
-        // Create a no-op memory quota for now
-        let mq = MemoryQuotaTracker::new_noop();
-
-        // Create ChannelAccount directly from tracker
-        let chan_account = ChannelAccount::new(&mq)
-            .map_err(|e| TorError::Internal(format!("Failed to create channel account: {}", e)))?;
-
-        let builder = ChannelBuilder::new();
-        debug!("Launching Tor channel client handshake...");
-        let handshake = builder.launch_client(stream, runtime, chan_account);
-
-        debug!("Starting handshake connect...");
-        let unverified = handshake.connect(system_time_now).await.map_err(|e| {
-            error!("Handshake connect error details: {:?}", e);
-            TorError::Network(format!("Handshake connect failed: {}", e))
+        let quota = MemoryQuotaTracker::new_noop();
+        let account = ChannelAccount::new(&quota).map_err(|error| {
+            TorError::Internal(format!("Failed to create channel quota account: {error}"))
         })?;
-        debug!("Handshake connect completed, verifying...");
+        let handshake = ChannelBuilder::new().launch_client(stream, WasmRuntime::new(), account);
+        let unverified = handshake.connect(system_time_now).await.map_err(|error| {
+            TorError::Network(format!("Tor channel handshake failed: {error}"))
+        })?;
 
-        // Construct peer target
-        let mut peer_builder = OwnedChanTargetBuilder::default();
-        peer_builder.rsa_identity(rsa_id);
-
-        let peer = peer_builder
+        let mut peer = OwnedChanTargetBuilder::default();
+        peer.rsa_identity(rsa_identity);
+        let peer = peer
             .build()
-            .map_err(|e| TorError::Internal(format!("Failed to build peer target: {}", e)))?;
-
-        // Pass the peer certificate to check() - this verifies that the CERTS cells
-        // properly authenticate the TLS certificate we received
-        // Note: We must pass the current time explicitly because SystemTime::now() panics on WASM
-        let (chan, reactor) = unverified
-            .check(&peer, &peer_cert, Some(system_time_now()))
-            .map_err(|e| TorError::Network(format!("Handshake check failed: {}", e)))?
+            .map_err(|error| TorError::Internal(format!("Invalid bridge target: {error}")))?;
+        let (channel, reactor) = unverified
+            .check(&peer, &peer_certificate, Some(system_time_now()))
+            .map_err(|error| {
+                TorError::Network(format!("Bridge authentication failed: {error}"))
+            })?
             .finish()
             .await
-            .map_err(|e| TorError::Network(format!("Handshake finish failed: {}", e)))?;
+            .map_err(|error| {
+                TorError::Network(format!("Tor channel handshake failed: {error}"))
+            })?;
 
-        // Spawn reactor
         wasm_bindgen_futures::spawn_local(async move {
-            let _ = reactor.run().await;
-        });
-
-        Ok(chan)
-    }
-
-    /// Initialize WASM modules (placeholder)
-    async fn init_wasm_modules() -> Result<()> {
-        // This will be implemented in the WASM bindings
-        // For now, just log that we're initializing
-        debug!("Initializing WASM modules");
-        Ok(())
-    }
-
-    /// Log a message (uses callback if provided)
-    fn log(&self, message: &str, log_type: LogType) {
-        if let Some(ref on_log) = self.options.on_log {
-            (on_log.0)(message, log_type);
-        } else {
-            // Default logging
-            match log_type {
-                LogType::Info => info!("{}", message),
-                LogType::Success => info!(" {}", message),
-                LogType::Error => error!(" {}", message),
+            if let Err(error) = reactor.run().await {
+                debug!("Tor channel reactor stopped: {}", error);
             }
+        });
+        Ok(channel)
+    }
+
+    fn log(&self, message: &str, log_type: LogType) {
+        if let Some(callback) = &self.options.on_log {
+            (callback.0)(message, log_type);
+            return;
+        }
+        match log_type {
+            LogType::Info | LogType::Success => info!("{}", message),
+            LogType::Error => error!("{}", message),
         }
     }
 }
 
-impl Clone for TorClient {
-    fn clone(&self) -> Self {
-        Self {
-            options: self.options.clone(),
-            circuit_manager: self.circuit_manager.clone(),
-            directory_manager: self.directory_manager.clone(),
-            http_client: self.http_client.clone(),
-            is_initialized: self.is_initialized.clone(),
-            channel: self.channel.clone(),
-            update_task: self.update_task.clone(),
-            shutdown_token: self.shutdown_token.clone(),
-        }
-    }
+fn parse_snowflake_identity() -> Result<RsaIdentity> {
+    let bytes = hex::decode(SNOWFLAKE_FINGERPRINT)
+        .map_err(|error| TorError::Configuration(format!("Invalid bridge identity: {error}")))?;
+    RsaIdentity::from_bytes(&bytes)
+        .ok_or_else(|| TorError::Configuration("Invalid bridge identity length".to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // TorClient construction exceeds the native test harness thread's stack.
-
-    #[tokio::test]
-    #[ignore = "requires a larger native test thread stack"]
-    async fn test_tor_client_creation() {
-        let options = TorClientOptions::snowflake_webrtc(vec!["stun:example.com".to_string()])
-            .with_create_circuit_early(false);
-
-        let client = TorClient::new(options).await;
-        assert!(client.is_ok());
-    }
-
-    #[tokio::test]
-    #[ignore = "requires a larger native test thread stack"]
-    async fn test_circuit_status() {
-        let options = TorClientOptions::snowflake_webrtc(vec!["stun:example.com".to_string()])
-            .with_create_circuit_early(false);
-
-        let client = TorClient::new(options).await.unwrap();
-        let status = client.get_circuit_status().await;
-
-        assert_eq!(status.total_circuits, 0);
-        assert_eq!(status.ready_circuits, 0);
-        assert!(!status.has_ready_circuits());
+    #[test]
+    fn snowflake_identity_is_valid() {
+        assert!(parse_snowflake_identity().is_ok());
     }
 }

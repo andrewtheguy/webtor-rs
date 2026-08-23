@@ -16,15 +16,15 @@ use tracing::{info, warn};
 const MAX_WEBRTC_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Clone)]
-pub struct SnowflakeWebRtcConfig {
-    pub broker_url: String,
-    pub fingerprint: String,
-    pub stun_urls: Vec<String>,
+pub(crate) struct SnowflakeWebRtcConfig {
+    pub(crate) broker_url: String,
+    pub(crate) fingerprint: String,
+    pub(crate) stun_urls: Vec<String>,
 }
 
 type SnowflakeWebRtcStack = SmuxStream<KcpStream<TurboStream<WebRtcStream>>>;
 
-pub struct SnowflakeWebRtcStream {
+pub(crate) struct SnowflakeWebRtcStream {
     inner: TlsStream<SnowflakeWebRtcStack>,
 }
 
@@ -33,7 +33,7 @@ pub struct SnowflakeWebRtcStream {
 unsafe impl Send for SnowflakeWebRtcStream {}
 
 impl SnowflakeWebRtcStream {
-    pub async fn connect(config: SnowflakeWebRtcConfig) -> Result<Self> {
+    pub(crate) async fn connect(config: SnowflakeWebRtcConfig) -> Result<Self> {
         let mut connected = None;
         let mut last_error = None;
 
@@ -79,7 +79,6 @@ impl SnowflakeWebRtcStream {
             // Tor authenticates the bridge through its CERTS cells.
             skip_verification: true,
             alpn_protocols: vec![],
-            ..Default::default()
         });
         let inner = connector
             .connect(smux, "www.example.com")

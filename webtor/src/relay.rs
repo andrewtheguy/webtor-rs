@@ -176,22 +176,6 @@ impl RelayCriteria {
         self
     }
 
-    pub fn without_fingerprints(mut self, fingerprints: Vec<String>) -> Self {
-        for fp in fingerprints {
-            self.exclude_fingerprints.insert(fp);
-        }
-        self
-    }
-
-    pub fn with_min_bandwidth(mut self, bandwidth: u64) -> Self {
-        self.min_bandwidth = bandwidth;
-        self
-    }
-
-    pub fn with_max_selection(mut self, max: usize) -> Self {
-        self.max_selection = max;
-        self
-    }
 }
 
 /// Relay manager for selecting appropriate relays
@@ -279,13 +263,6 @@ impl RelayManager {
             .ok_or_else(|| TorError::relay_selection("Failed to choose random relay"))
     }
 
-    /// Get relay by fingerprint
-    pub fn get_relay(&self, fingerprint: &str) -> Option<&Relay> {
-        self.relays
-            .iter()
-            .find(|relay| relay.fingerprint == fingerprint)
-    }
-
     /// Update relay list from consensus
     pub fn update_relays(&mut self, new_relays: Vec<Relay>) {
         info!(
@@ -299,15 +276,21 @@ impl RelayManager {
 
 /// Common relay flag constants
 pub mod flags {
+    #[cfg(test)]
     pub const AUTHORITY: &str = "Authority";
     pub const BAD_EXIT: &str = "BadExit";
     pub const EXIT: &str = "Exit";
     pub const FAST: &str = "Fast";
+    #[cfg(test)]
     pub const GUARD: &str = "Guard";
+    #[cfg(test)]
     pub const HSDIR: &str = "HSDir";
+    #[cfg(test)]
     pub const NAMED: &str = "Named";
     pub const STABLE: &str = "Stable";
+    #[cfg(test)]
     pub const RUNNING: &str = "Running";
+    #[cfg(test)]
     pub const VALID: &str = "Valid";
     pub const V2DIR: &str = "V2Dir";
 }
@@ -333,13 +316,6 @@ pub mod selection {
             .without_flag(flags::BAD_EXIT)
     }
 
-    /// Select guard relays (Fast, Stable, Guard)
-    pub fn guard_relays() -> RelayCriteria {
-        RelayCriteria::new()
-            .with_flag(flags::FAST)
-            .with_flag(flags::STABLE)
-            .with_flag(flags::GUARD)
-    }
 }
 
 #[cfg(test)]

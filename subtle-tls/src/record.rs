@@ -6,8 +6,8 @@
 use crate::crypto::Cipher;
 use crate::error::{Result, TlsError};
 use crate::handshake::{
-    CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_HANDSHAKE, TLS_AES_128_GCM_SHA256,
-    TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256, TLS_VERSION_1_2,
+    CONTENT_TYPE_APPLICATION_DATA, TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256,
+    TLS_LEGACY_VERSION,
 };
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, trace};
@@ -79,7 +79,6 @@ impl RecordLayer {
     async fn create_cipher(&self, key: &[u8]) -> Result<Cipher> {
         match self.cipher_suite {
             TLS_AES_128_GCM_SHA256 => Cipher::aes_128_gcm(key).await,
-            TLS_AES_256_GCM_SHA384 => Cipher::aes_256_gcm(key).await,
             TLS_CHACHA20_POLY1305_SHA256 => Cipher::chacha20_poly1305(key),
             _ => Err(TlsError::protocol(format!(
                 "Unsupported cipher suite: 0x{:04x}",
@@ -231,8 +230,8 @@ impl RecordLayer {
             let ciphertext_len = plaintext.len() + 16; // +16 for auth tag
             let aad = [
                 CONTENT_TYPE_APPLICATION_DATA,
-                (TLS_VERSION_1_2 >> 8) as u8,
-                TLS_VERSION_1_2 as u8,
+                (TLS_LEGACY_VERSION >> 8) as u8,
+                TLS_LEGACY_VERSION as u8,
                 (ciphertext_len >> 8) as u8,
                 ciphertext_len as u8,
             ];
@@ -248,8 +247,8 @@ impl RecordLayer {
         // Build record header
         let mut record = Vec::with_capacity(5 + body.len());
         record.push(record_type);
-        record.push((TLS_VERSION_1_2 >> 8) as u8);
-        record.push(TLS_VERSION_1_2 as u8);
+        record.push((TLS_LEGACY_VERSION >> 8) as u8);
+        record.push(TLS_LEGACY_VERSION as u8);
         record.push((body.len() >> 8) as u8);
         record.push(body.len() as u8);
         record.extend_from_slice(&body);
@@ -262,42 +261,6 @@ impl RecordLayer {
         Ok(())
     }
 
-    /// Read multiple handshake messages from the stream
-    /// Returns handshake messages as a vector
-    pub async fn read_handshake_messages<S>(&mut self, stream: &mut S) -> Result<Vec<(u8, Vec<u8>)>>
-    where
-        S: AsyncRead + Unpin,
-    {
-        let mut messages = Vec::new();
-
-        let (content_type, data) = self.read_record(stream).await?;
-
-        if content_type != CONTENT_TYPE_HANDSHAKE {
-            return Err(TlsError::UnexpectedMessage {
-                expected: "Handshake".to_string(),
-                got: format!("ContentType {}", content_type),
-            });
-        }
-
-        // Parse handshake messages from the data
-        let mut pos = 0;
-        while pos + 4 <= data.len() {
-            let msg_type = data[pos];
-            let length = ((data[pos + 1] as usize) << 16)
-                | ((data[pos + 2] as usize) << 8)
-                | (data[pos + 3] as usize);
-            pos += 4;
-
-            if pos + length > data.len() {
-                return Err(TlsError::record("Handshake message extends beyond record"));
-            }
-
-            messages.push((msg_type, data[pos..pos + length].to_vec()));
-            pos += length;
-        }
-
-        Ok(messages)
-    }
 }
 
 impl Default for RecordLayer {
@@ -310,11 +273,6 @@ impl RecordLayer {
     /// Check if read cipher is active
     pub fn has_read_cipher(&self) -> bool {
         self.read_cipher.is_some()
-    }
-
-    /// Check if write cipher is active
-    pub fn has_write_cipher(&self) -> bool {
-        self.write_cipher.is_some()
     }
 
     /// Decrypt a record synchronously (for use in poll_read)
@@ -355,8 +313,8 @@ impl RecordLayer {
             let ciphertext_len = plaintext.len() + 16; // +16 for auth tag
             let header = [
                 CONTENT_TYPE_APPLICATION_DATA,
-                (TLS_VERSION_1_2 >> 8) as u8,
-                TLS_VERSION_1_2 as u8,
+                (TLS_LEGACY_VERSION >> 8) as u8,
+                TLS_LEGACY_VERSION as u8,
                 (ciphertext_len >> 8) as u8,
                 ciphertext_len as u8,
             ];
@@ -374,8 +332,8 @@ impl RecordLayer {
             // No cipher active, send unencrypted
             let mut record = Vec::with_capacity(5 + data.len());
             record.push(content_type);
-            record.push((TLS_VERSION_1_2 >> 8) as u8);
-            record.push(TLS_VERSION_1_2 as u8);
+            record.push((TLS_LEGACY_VERSION >> 8) as u8);
+            record.push(TLS_LEGACY_VERSION as u8);
             record.push((data.len() >> 8) as u8);
             record.push(data.len() as u8);
             record.extend_from_slice(data);
@@ -392,6 +350,5 @@ mod tests {
     fn test_record_layer_new() {
         let layer = RecordLayer::new();
         assert!(!layer.has_read_cipher());
-        assert!(!layer.has_write_cipher());
     }
 }

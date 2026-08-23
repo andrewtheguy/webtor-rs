@@ -22,8 +22,6 @@ tor-units = { workspace = true }
 tor-netdoc = { workspace = true }
 tor-linkspec = { workspace = true }
 tor-llcrypto = { workspace = true }
-tor-cell = { workspace = true }
-tor-error = { workspace = true }
 tor-memquota = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
 
@@ -34,10 +32,6 @@ base64 = { workspace = true }
 
 # Networking
 url = { workspace = true }
-http = { workspace = true }
-
-# Public Suffix List for eTLD+1 extraction
-psl = "2"
 
 # Serialization
 serde = { workspace = true }
@@ -45,7 +39,6 @@ serde_json = "1.0"
 
 # Compression
 flate2 = "1.0"
-uuid = { version = "1.0", features = ["v4", "js"] }
 rand = { version = "0.8", features = ["std", "std_rng"] }
 web-sys = { workspace = true }
 wasm-bindgen = { workspace = true }
@@ -60,7 +53,6 @@ gloo-timers = { workspace = true }
 
 # WASM TLS (SubtleCrypto-based)
 subtle-tls = { path = "../subtle-tls" }
-async-trait = "0.1"
 
 [dev-dependencies]
 proptest = "1"

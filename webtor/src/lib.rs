@@ -1,39 +1,30 @@
-//! Webtor - A Tor client library for web browsers
+//! Browser WASM Tor transport for pTransfer's anonymous Nostr signaling.
 //!
-//! This library provides a Rust implementation of a Tor client that can be
-//! compiled to WebAssembly and embedded in web pages. It supports anonymous
-//! HTTP/HTTPS requests through the Tor network using Snowflake bridges.
+//! The active entry path uses Snowflake WebRTC. A direct browser Snowflake
+//! WebSocket entry path is retained for a future explicit transport policy.
 
-pub mod circuit;
-pub mod client;
-pub mod config;
-pub mod directory;
-pub mod error;
-pub mod http;
-pub mod isolation;
-pub mod kcp_stream;
-pub mod relay;
-pub mod retry;
-pub mod smux;
-pub mod snowflake_broker;
-pub mod snowflake_webrtc;
-pub mod time;
-pub mod turbo;
-pub mod wasm_runtime;
-pub mod webrtc_stream;
+mod circuit;
+mod client;
+mod config;
+mod directory;
+mod error;
+mod http;
+mod kcp_stream;
+mod relay;
+mod retry;
+mod smux;
+mod snowflake_broker;
+mod snowflake_webrtc;
+mod snowflake_ws;
+mod time;
+mod turbo;
+mod wasm_runtime;
+mod webrtc_stream;
+mod websocket;
 
 pub use client::TorClient;
-pub use config::TorClientOptions;
-pub use error::{Result, TorError, TorErrorKind};
-pub use isolation::{IsolationKey, StreamIsolationPolicy};
-pub use retry::{
-    retry_with_backoff, with_cancellation, with_timeout, with_timeout_and_cancellation,
-    CancellationToken, RetryPolicy,
-};
-
-// Re-export commonly used types
+pub use config::{BridgeType, LogType, TorClientOptions};
+pub use error::{Result, TorError};
 pub use http::HttpResponse;
-pub use url::Url;
-
-// Re-export Tor stream types for advanced usage
+pub use retry::with_timeout;
 pub use tor_proto::client::stream::DataStream;

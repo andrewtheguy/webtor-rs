@@ -17,7 +17,7 @@
 //! - Bits 6-0: 7 bits of length
 
 use crate::error::{Result, TorError};
-use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use futures::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -44,7 +44,8 @@ impl TurboFrame {
         }
     }
 
-    pub fn padding(data: Vec<u8>) -> Self {
+    #[cfg(test)]
+    fn padding(data: Vec<u8>) -> Self {
         Self {
             data,
             is_padding: true,
@@ -207,52 +208,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> TurboStream<S> {
         Ok(())
     }
 
-    /// Send a frame
-    pub async fn send_frame(&mut self, data: &[u8]) -> Result<()> {
-        if !self.initialized {
-            self.initialize().await?;
-        }
-
-        let frame = TurboFrame::new(data.to_vec());
-        let encoded = frame.encode();
-
-        self.inner
-            .write_all(&encoded)
-            .await
-            .map_err(|e| TorError::Network(format!("Failed to send Turbo frame: {}", e)))?;
-
-        Ok(())
-    }
-
-    /// Receive a frame (skips padding frames)
-    pub async fn recv_frame(&mut self) -> Result<Vec<u8>> {
-        loop {
-            // Try to decode from buffer first
-            if let Some((frame, consumed)) = TurboFrame::decode(&self.read_buffer)? {
-                self.read_buffer.drain(..consumed);
-
-                if frame.is_padding {
-                    continue; // Skip padding frames
-                }
-
-                return Ok(frame.data);
-            }
-
-            // Need more data
-            let mut temp = [0u8; 4096];
-            let n = self
-                .inner
-                .read(&mut temp)
-                .await
-                .map_err(|e| TorError::Network(format!("Failed to read Turbo data: {}", e)))?;
-
-            if n == 0 {
-                return Err(TorError::Network("Turbo connection closed".to_string()));
-            }
-
-            self.read_buffer.extend_from_slice(&temp[..n]);
-        }
-    }
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for TurboStream<S> {

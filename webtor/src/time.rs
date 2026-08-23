@@ -22,9 +22,6 @@ impl Instant {
         Duration::from_secs_f64((now - self.0) / 1000.0)
     }
 
-    pub fn duration_since(&self, earlier: Instant) -> Duration {
-        Duration::from_secs_f64((self.0 - earlier.0).max(0.0) / 1000.0)
-    }
 }
 
 impl std::ops::Add<Duration> for Instant {

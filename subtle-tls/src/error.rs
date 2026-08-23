@@ -30,9 +30,6 @@ pub enum TlsError {
     #[error("Unexpected message: expected {expected}, got {got}")]
     UnexpectedMessage { expected: String, got: String },
 
-    #[error("Connection closed")]
-    ConnectionClosed,
-
     #[error("SubtleCrypto error: {0}")]
     SubtleCrypto(String),
 }
