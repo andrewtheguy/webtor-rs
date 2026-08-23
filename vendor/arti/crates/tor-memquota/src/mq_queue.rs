@@ -540,7 +540,7 @@ impl<T: HasMemoryCost + Debug + Send + 'static, C: ChannelSpec> Receiver<T, C> {
 
 impl<T: Debug + Send + 'static, C: ChannelSpec> ReceiverInner<T, C> {
     /// Convenience function to take the lock
-    fn lock(&self) -> MutexGuard<Result<ReceiverState<T, C>, CollapsedDueToReclaim>> {
+    fn lock(&self) -> MutexGuard<'_, Result<ReceiverState<T, C>, CollapsedDueToReclaim>> {
         self.state.lock().expect("mq_mpsc lock poisoned")
     }
 }

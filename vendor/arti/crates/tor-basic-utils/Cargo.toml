@@ -24,12 +24,6 @@ slab = "0.4.4"
 smallvec = "1.10"
 thiserror = "2"
 
-[dev-dependencies]
-derive_more = { version = "2.0.1", features = ["full"] }
-educe = "0.4.22"
-serde = { version = "1.0.103", features = ["derive"] }
-serde-value = "0.7.0"
-serde_json = "1.0.50"
 
 [features]
 full = ["serde"]

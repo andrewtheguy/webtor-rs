@@ -26,7 +26,10 @@ pub(crate) mod rt {
         fn now(&self) -> Instant;
     }
 
-    impl<R: tor_rtcompat::Runtime> RuntimeSupport for R {
+    impl<R> RuntimeSupport for R
+    where
+        R: Spawn + tor_rtcompat::SleepProvider + 'static,
+    {
         fn sleep(&self, duration: Duration) -> BoxFuture<'_, ()> {
             Box::pin(tor_rtcompat::SleepProvider::sleep(self, duration))
         }
@@ -41,9 +44,10 @@ pub(crate) mod rt {
     /// Try to install `runtime` as a global runtime to be used for rate-limited logging.
     ///
     /// Return an error (and make no changes) if there there was already a runtime installed.
-    pub fn install_runtime<R: tor_rtcompat::Runtime>(
-        runtime: R,
-    ) -> Result<(), InstallRuntimeError> {
+    pub fn install_runtime<R>(runtime: R) -> Result<(), InstallRuntimeError>
+    where
+        R: Spawn + tor_rtcompat::SleepProvider + 'static,
+    {
         let rt = Box::new(runtime);
         RUNTIME_SUPPORT
             .set(rt)

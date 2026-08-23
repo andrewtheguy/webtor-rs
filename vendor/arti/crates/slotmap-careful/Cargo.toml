@@ -17,8 +17,6 @@ serde = "1.0"
 slotmap = { version = "1.0.7", features = ["serde"] }
 thiserror = "2"
 
-[dev-dependencies]
-serde_json = "1.0.50"
 
 [features]
 full = []

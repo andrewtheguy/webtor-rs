@@ -22,8 +22,6 @@ tor-error = { path = "../tor-error", version = "0.37.0", default-features = fals
 tor-llcrypto = { path = "../tor-llcrypto", version = "0.37.0", optional = true }
 zeroize = { version = "1", features = ["derive"] }
 
-[dev-dependencies]
-hex-literal = "1.0"
 
 [features]
 default = ["tor-llcrypto"]

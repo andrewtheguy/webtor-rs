@@ -4,7 +4,6 @@ use safelog::Redactable;
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display};
 use std::net::SocketAddr;
-use tor_config::impl_standard_builder;
 use tor_llcrypto::pk;
 
 use crate::{
@@ -40,8 +39,6 @@ pub struct RelayIds {
     #[builder(default, setter(strip_option))]
     rsa_identity: Option<pk::rsa::RsaIdentity>,
 }
-impl_standard_builder! { RelayIds : !Deserialize + !Builder + !Default }
-
 impl HasRelayIds for RelayIds {
     fn identity(&self, key_type: RelayIdType) -> Option<crate::RelayIdRef<'_>> {
         match key_type {
@@ -52,6 +49,11 @@ impl HasRelayIds for RelayIds {
 }
 
 impl RelayIds {
+    /// Return a fresh relay identity builder.
+    pub fn builder() -> RelayIdsBuilder {
+        RelayIdsBuilder::default()
+    }
+
     /// Return an empty set of identities.
     ///
     /// This is _not_ a `Default` method, since this is not what you should
@@ -107,8 +109,6 @@ pub struct OwnedChanTarget {
     #[builder(sub_builder)]
     ids: RelayIds,
 }
-impl_standard_builder! { OwnedChanTarget : !Deserialize + !Builder + !Default }
-
 impl OwnedChanTargetBuilder {
     /// Set the ed25519 identity in this builder to `id`.
     pub fn ed_identity(&mut self, id: pk::ed25519::Ed25519Identity) -> &mut Self {
@@ -149,6 +149,11 @@ impl HasRelayIds for OwnedChanTarget {
 impl ChanTarget for OwnedChanTarget {}
 
 impl OwnedChanTarget {
+    /// Return a fresh channel target builder.
+    pub fn builder() -> OwnedChanTargetBuilder {
+        OwnedChanTargetBuilder::default()
+    }
+
     /// Construct a OwnedChanTarget from a given ChanTarget.
     pub fn from_chan_target<C>(target: &C) -> Self
     where
@@ -198,9 +203,12 @@ pub struct OwnedCircTarget {
     /// The subprotocol versions that this CircTarget supports.
     protocols: tor_protover::Protocols,
 }
-impl_standard_builder! { OwnedCircTarget : !Deserialize + !Builder + !Default }
-
 impl OwnedCircTarget {
+    /// Return a fresh circuit target builder.
+    pub fn builder() -> OwnedCircTargetBuilder {
+        OwnedCircTargetBuilder::default()
+    }
+
     /// Construct an OwnedCircTarget from a given CircTarget.
     pub fn from_circ_target<C>(target: &C) -> Self
     where

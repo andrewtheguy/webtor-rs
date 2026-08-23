@@ -40,7 +40,6 @@ use rand::distr::Distribution;
 use tracing::error;
 
 use tor_cell::chancell::msg::{Padding, PaddingNegotiate};
-use tor_config::impl_standard_builder;
 use tor_error::into_internal;
 use tor_rtcompat::SleepProvider;
 use tor_units::IntegerMilliseconds;
@@ -156,9 +155,12 @@ impl ParametersBuilder {
     }
 }
 
-impl_standard_builder! { Parameters: !Deserialize + !Builder + !Default }
-
 impl Parameters {
+    /// Return a fresh channel-padding parameter builder.
+    pub fn builder() -> ParametersBuilder {
+        ParametersBuilder::default()
+    }
+
     /// Return a `PADDING_NEGOTIATE START` cell specifying precisely these parameters
     ///
     /// This function does not take account of the need to avoid sending particular

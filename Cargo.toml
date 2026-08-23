@@ -6,7 +6,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.5.10"
+version = "0.5.11"
 edition = "2021"
 authors = ["Webtor Contributors"]
 license = "MIT"
@@ -59,7 +59,7 @@ tor-proto = { version = "0.37.0", default-features = false }
 tor-netdoc = { version = "0.37.0", default-features = false }
 tor-linkspec = "0.37.0"
 tor-llcrypto = "0.37.0"
-tor-memquota = "0.37.0"
+tor-memquota = { version = "0.37.0", default-features = false }
 tor-protover = "0.37.0"
 tor-units = "0.37.0"
 
@@ -79,7 +79,6 @@ tor-basic-utils = { path = "vendor/arti/crates/tor-basic-utils" }
 tor-proto = { path = "vendor/arti/crates/tor-proto" }
 tor-rtcompat = { path = "vendor/arti/crates/tor-rtcompat" }
 tor-async-utils = { path = "vendor/arti/crates/tor-async-utils" }
-tor-rtmock = { path = "vendor/arti/crates/tor-rtmock" }
 tor-memquota = { path = "vendor/arti/crates/tor-memquota" }
 tor-units = { path = "vendor/arti/crates/tor-units" }
 tor-log-ratelim = { path = "vendor/arti/crates/tor-log-ratelim" }
@@ -90,21 +89,12 @@ oneshot-fused-workaround = { path = "vendor/arti/crates/oneshot-fused-workaround
 tor-bytes = { path = "vendor/arti/crates/tor-bytes" }
 tor-cell = { path = "vendor/arti/crates/tor-cell" }
 tor-cert = { path = "vendor/arti/crates/tor-cert" }
-tor-config = { path = "vendor/arti/crates/tor-config" }
 tor-error = { path = "vendor/arti/crates/tor-error" }
 tor-linkspec = { path = "vendor/arti/crates/tor-linkspec" }
 tor-llcrypto = { path = "vendor/arti/crates/tor-llcrypto" }
 tor-protover = { path = "vendor/arti/crates/tor-protover" }
-tor-relay-crypto = { path = "vendor/arti/crates/tor-relay-crypto" }
-tor-config-path = { path = "vendor/arti/crates/tor-config-path" }
-tor-persist = { path = "vendor/arti/crates/tor-persist" }
-tor-general-addr = { path = "vendor/arti/crates/tor-general-addr" }
-tor-hscrypto = { path = "vendor/arti/crates/tor-hscrypto" }
-tor-key-forge = { path = "vendor/arti/crates/tor-key-forge" }
-tor-keymgr = { path = "vendor/arti/crates/tor-keymgr" }
 tor-checkable = { path = "vendor/arti/crates/tor-checkable" }
 tor-netdoc = { path = "vendor/arti/crates/tor-netdoc" }
-fs-mistrust = { path = "vendor/arti/crates/fs-mistrust" }
 
 # Release profile optimized for WASM bundle size
 [profile.release]

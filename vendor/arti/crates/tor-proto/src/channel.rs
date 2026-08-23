@@ -127,8 +127,6 @@ use tracing::{instrument, trace};
 
 // reexport
 pub use super::client::channel::handshake::ClientInitiatorHandshake;
-#[cfg(feature = "relay")]
-pub use super::relay::channel::handshake::RelayInitiatorHandshake;
 use crate::channel::unique_id::CircUniqIdContext;
 
 use kist::KistParams;

@@ -51,10 +51,3 @@ tor-checkable = { path = "../tor-checkable", version = "0.37.0" }
 tor-error = { path = "../tor-error", version = "0.37.0" }
 tor-llcrypto = { path = "../tor-llcrypto", version = "0.37.0" }
 x509-cert = { version = "0.2.5", features = ["builder", "hazmat"], optional = true }
-
-[dev-dependencies]
-base64ct = "1.5.1"
-hex-literal = "1.0"
-humantime = "2"
-rand = "0.9.1"
-tor-basic-utils = { path = "../tor-basic-utils", version = "0.37.0" }

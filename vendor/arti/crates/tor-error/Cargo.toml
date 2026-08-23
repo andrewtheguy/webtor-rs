@@ -39,9 +39,6 @@ thiserror = "2"
 tracing = { version = "0.1.36", optional = true }
 void = "1"
 
-[dev-dependencies]
-anyhow = "1.0.72"
-tracing-test = "0.2.4"
 
 [package.metadata.docs.rs]
 all-features = true

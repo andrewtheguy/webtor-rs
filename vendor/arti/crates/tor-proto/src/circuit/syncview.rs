@@ -18,10 +18,6 @@ impl<'a> CircSyncView<'a> {
 pub(crate) enum CircSyncViewInner<'a> {
     /// A view of a client circuit's internals.
     Client(ClientCircSyncView<'a>),
-    /// A view of a relay circuit's internals.
-    #[cfg(feature = "relay")]
-    #[allow(dead_code)] // TODO(relay)
-    Relay(/* TODO(relay) */),
 }
 
 impl<'a> CircSyncView<'a> {
@@ -31,8 +27,6 @@ impl<'a> CircSyncView<'a> {
 
         match &self.0 {
             Client(c) => c.n_open_streams(),
-            #[cfg(feature = "relay")]
-            Relay() => todo!(),
         }
     }
 

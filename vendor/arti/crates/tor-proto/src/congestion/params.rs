@@ -6,8 +6,22 @@
 use caret::caret_int;
 use derive_builder::Builder;
 
-use tor_config::{ConfigBuildError, impl_standard_builder};
 use tor_units::Percentage;
+
+/// Error returned when a congestion-control builder is missing a required field.
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("Field was not provided: {field}")]
+pub struct ConfigBuildError {
+    field: String,
+}
+
+impl From<derive_builder::UninitializedFieldError> for ConfigBuildError {
+    fn from(error: derive_builder::UninitializedFieldError) -> Self {
+        Self {
+            field: error.field_name().to_owned(),
+        }
+    }
+}
 
 /// Fixed window parameters that are for the SENDME v0 world of fixed congestion window.
 #[non_exhaustive]
@@ -24,7 +38,12 @@ pub struct FixedWindowParams {
     #[getter(as_copy)]
     circ_window_max: u16,
 }
-impl_standard_builder! { FixedWindowParams: !Deserialize + !Default }
+impl FixedWindowParams {
+    /// Return a fresh fixed-window parameter builder.
+    pub fn builder() -> FixedWindowParamsBuilder {
+        FixedWindowParamsBuilder::default()
+    }
+}
 
 /// Vegas queuing parameters taken from the consensus only which are different depending if the
 /// circuit is an onion service one, an exit or used for SBWS.
@@ -85,7 +104,12 @@ pub struct VegasParams {
     #[getter(as_copy)]
     cwnd_full_per_cwnd: u32,
 }
-impl_standard_builder! { VegasParams: !Deserialize + !Default }
+impl VegasParams {
+    /// Return a fresh Vegas parameter builder.
+    pub fn builder() -> VegasParamsBuilder {
+        VegasParamsBuilder::default()
+    }
+}
 
 /// The different congestion control algorithms. Each contain their parameters taken from the
 /// consensus.
@@ -150,7 +174,12 @@ pub struct RoundTripEstimatorParams {
     /// the congestion window hits cwnd_min.
     rtt_reset_pct: Percentage<u32>,
 }
-impl_standard_builder! { RoundTripEstimatorParams: !Deserialize + !Default }
+impl RoundTripEstimatorParams {
+    /// Return a fresh round-trip estimator parameter builder.
+    pub fn builder() -> RoundTripEstimatorParamsBuilder {
+        RoundTripEstimatorParamsBuilder::default()
+    }
+}
 
 /// The parameters of what constitute a congestion window. This is used by all congestion control
 /// algorithms as in it is not specific to an algorithm.
@@ -180,7 +209,12 @@ pub struct CongestionWindowParams {
     #[getter(as_copy)]
     sendme_inc: u32,
 }
-impl_standard_builder! { CongestionWindowParams: !Deserialize + !Default}
+impl CongestionWindowParams {
+    /// Return a fresh congestion-window parameter builder.
+    pub fn builder() -> CongestionWindowParamsBuilder {
+        CongestionWindowParamsBuilder::default()
+    }
+}
 
 impl CongestionWindowParams {
     /// Set the `sendme_inc` value.
@@ -213,7 +247,12 @@ pub struct CongestionControlParams {
     /// RTT calculation parameters.
     rtt_params: RoundTripEstimatorParams,
 }
-impl_standard_builder! { CongestionControlParams: !Deserialize + !Default }
+impl CongestionControlParams {
+    /// Return a fresh congestion-control parameter builder.
+    pub fn builder() -> CongestionControlParamsBuilder {
+        CongestionControlParamsBuilder::default()
+    }
+}
 
 impl CongestionControlParams {
     /// Return true iff congestion control is enabled that is the algorithm is anything other than

@@ -19,7 +19,6 @@ full = [
     "safelog/full",
     "tor-basic-utils/full",
     "tor-bytes/full",
-    "tor-config/full",
     "tor-llcrypto/full",
     "tor-protover/full",
     "tor-memquota/full",
@@ -46,15 +45,10 @@ strum = { version = "0.27.1", features = ["derive"] }
 thiserror = "2"
 tor-basic-utils = { path = "../tor-basic-utils", version = "0.37.0" }
 tor-bytes = { path = "../tor-bytes", version = "0.37.0" }
-tor-config = { path = "../tor-config", version = "0.37.0" }
 tor-llcrypto = { path = "../tor-llcrypto", version = "0.37.0", features = ["memquota-memcost"] }
 tor-memquota = { version = "0.37.0", path = "../tor-memquota", default-features = false }
 tor-protover = { path = "../tor-protover", version = "0.37.0" }
 
-[dev-dependencies]
-hex-literal = "1.0"
-itertools = "0.14.0"
-serde_test = "1.0.124"
 
 [package.metadata.docs.rs]
 all-features = true

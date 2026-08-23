@@ -20,13 +20,13 @@ experimental = ["experimental-udp", "hs", "hs-pow-full", "conflux", "testing"]
 experimental-udp = ["__is_experimental"]
 
 # "hs" = (all) hidden service support, either client or server
-hs = ["tor-hscrypto", "__is_experimental"]
+hs = []
 
 # Enable testing only API
 testing = ["experimental-udp", "__is_experimental"]
 
 # Onion service proof of work schemes
-hs-pow-full = ["tor-hscrypto/hs-pow-full", "__is_experimental"]
+hs-pow-full = []
 
 full = [
     "caret/full",
@@ -34,7 +34,6 @@ full = [
     "tor-bytes/full",
     "tor-cert/full",
     "tor-error/full",
-    "tor-hscrypto?/full",
     "tor-linkspec/full",
     "tor-llcrypto/full",
     "tor-memquota/full",
@@ -60,7 +59,6 @@ tor-basic-utils = { path = "../tor-basic-utils", version = "0.37.0" }
 tor-bytes = { path = "../tor-bytes", version = "0.37.0" }
 tor-cert = { path = "../tor-cert", version = "0.37.0" }
 tor-error = { path = "../tor-error", version = "0.37.0" }
-tor-hscrypto = { path = "../tor-hscrypto", version = "0.37.0", optional = true, features = ["memquota-memcost"] }
 tor-linkspec = { path = "../tor-linkspec", version = "0.37.0" }
 tor-llcrypto = { path = "../tor-llcrypto", version = "0.37.0", features = ["memquota-memcost"] }
 tor-memquota = { version = "0.37.0", path = "../tor-memquota", default-features = false }
@@ -68,8 +66,6 @@ tor-protover = { path = "../tor-protover", version = "0.37.0", features = ["tor-
 tor-units = { path = "../tor-units", version = "0.37.0", features = ["memquota-memcost"] }
 void = "1"
 
-[dev-dependencies]
-hex = "0.4"
-hex-literal = "1.0"
+
 [package.metadata.docs.rs]
 all-features = true
