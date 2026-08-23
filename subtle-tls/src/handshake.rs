@@ -122,8 +122,15 @@ impl HandshakeState {
         // Legacy session ID (empty)
         hello.push(0);
 
-        // Cipher suites (only SHA-256 based suites for now, SHA-384 not implemented)
-        let cipher_suites = [TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256];
+        // ChaCha20-Poly1305 only, and not merely a preference. Application
+        // data is encrypted from poll_read/poll_write, which cannot await, and
+        // the sync AEAD path is pure Rust ChaCha20 — SubtleCrypto AES-GCM is
+        // async and unreachable from there. Advertising AES-GCM let servers
+        // that prefer it (most Nostr relays do) complete the handshake over
+        // the async path and then fail on the first application write. Any
+        // server that cannot do ChaCha20 must fail the handshake instead.
+        // SHA-384 suites stay out regardless: not implemented.
+        let cipher_suites = [TLS_CHACHA20_POLY1305_SHA256];
         hello.push(0);
         hello.push((cipher_suites.len() * 2) as u8);
         for cs in cipher_suites {
