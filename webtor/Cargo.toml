@@ -1,0 +1,104 @@
+[package]
+name = "webtor"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core Tor client implementation for web browsers"
+
+[dependencies]
+# Core async runtime
+tokio = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Tor protocol implementation
+tor-rtcompat = { workspace = true }
+tor-proto = { workspace = true }
+tor-protover = { workspace = true }
+tor-units = { workspace = true }
+tor-netdoc = { workspace = true }
+tor-linkspec = { workspace = true }
+tor-llcrypto = { workspace = true }
+tor-cell = { workspace = true }
+tor-error = { workspace = true }
+tor-async-utils = { workspace = true }
+tor-memquota = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+
+# Cryptography
+rsa = { workspace = true }
+x25519-dalek = { workspace = true }
+ed25519-dalek = { workspace = true }
+chacha20poly1305 = { workspace = true }
+sha1 = { workspace = true }
+sha3 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+
+# Networking
+url = { workspace = true }
+http = { workspace = true }
+
+# Public Suffix List for eTLD+1 extraction
+psl = "2"
+
+# Serialization
+serde = { workspace = true }
+serde_json = "1.0"
+
+# Compression
+flate2 = "1.0"
+brotli = "7.0"
+uuid = { version = "1.0", features = ["v4", "js"] }
+rand = { version = "0.8", features = ["std", "std_rng"] }
+web-sys = { workspace = true }
+wasm-bindgen = { workspace = true }
+js-sys = { workspace = true }
+httparse = "1.10.1"
+tor-checkable = "0.37.0"
+
+# KCP reliable transport
+kcp = { workspace = true }
+
+# WASM utilities
+gloo-timers = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# WASM TLS (SubtleCrypto-based)
+subtle-tls = { path = "../subtle-tls" }
+async-trait = "0.1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Native TLS (non-WASM only) - ring doesn't compile to WASM
+rustls = { workspace = true }
+futures-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+rustls-pki-types = { workspace = true }
+tokio-rustls = { workspace = true }
+
+# Native WebSocket (non-WASM only)
+tokio-tungstenite = { workspace = true }
+
+# Tokio compatibility utilities (includes CancellationToken)
+tokio-util = { version = "0.7", features = ["compat"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+criterion = "0.5"
+proptest = "1"
+
+# Integration benchmark (manual, requires network)
+[[bench]]
+name = "tor_benchmark"
+harness = false
+
+# Criterion microbenchmarks (deterministic, no network)
+[[bench]]
+name = "circuit_params"
+harness = false
