@@ -8,6 +8,7 @@ use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 use flate2::read::ZlibDecoder;
 use futures::{AsyncReadExt, AsyncWriteExt};
 use rand::seq::SliceRandom;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::sync::Arc;
@@ -25,11 +26,64 @@ const RELAYS_PER_ROLE: usize = 32;
 const MIN_RELAYS_PER_ROLE: usize = 10;
 const MICRODESCRIPTOR_CHUNK_SIZE: usize = 16;
 const MAX_DIRECTORY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const DIRECTORY_CACHE_VERSION: u32 = 1;
+const MAX_DIRECTORY_CACHE_BYTES: usize = MAX_DIRECTORY_RESPONSE_BYTES * 2 + 1024 * 1024;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct DirectoryCache {
+    version: u32,
+    consensus: String,
+    microdescriptors: String,
+}
+
+impl DirectoryCache {
+    fn decode(encoded: &str) -> Result<Self> {
+        if encoded.len() > MAX_DIRECTORY_CACHE_BYTES {
+            return Err(TorError::ConsensusFetch(format!(
+                "Directory cache exceeded {} bytes",
+                MAX_DIRECTORY_CACHE_BYTES
+            )));
+        }
+
+        let cache: Self = serde_json::from_str(encoded).map_err(|error| {
+            TorError::serialization(format!("Directory cache was invalid JSON: {}", error))
+        })?;
+        if cache.version != DIRECTORY_CACHE_VERSION {
+            return Err(TorError::ConsensusFetch(format!(
+                "Directory cache version {} is unsupported",
+                cache.version
+            )));
+        }
+        if cache.consensus.len() > MAX_DIRECTORY_RESPONSE_BYTES
+            || cache.microdescriptors.len() > MAX_DIRECTORY_RESPONSE_BYTES
+        {
+            return Err(TorError::ConsensusFetch(
+                "Directory cache contained an oversized document".to_string(),
+            ));
+        }
+
+        Ok(cache)
+    }
+
+    fn encode(&self) -> Result<String> {
+        serde_json::to_string(self).map_err(|error| {
+            TorError::serialization(format!("Failed to serialize directory cache: {}", error))
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ProcessedDirectory {
+    relays: Vec<Relay>,
+    middle_count: usize,
+    exit_count: usize,
+}
 
 /// Directory manager for handling network documents
 pub struct DirectoryManager {
     pub relay_manager: Arc<RwLock<RelayManager>>,
     on_log: Option<LogCallback>,
+    cache: Arc<RwLock<Option<DirectoryCache>>>,
 }
 
 impl DirectoryManager {
@@ -37,6 +91,7 @@ impl DirectoryManager {
         Self {
             relay_manager,
             on_log,
+            cache: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -53,67 +108,7 @@ impl DirectoryManager {
 
         self.log("Downloading the current Tor consensus...", LogType::Info);
         let consensus_body = self.fetch_consensus_body(tunnel.clone()).await?;
-
-        info!("Parsing full consensus");
-        let (_, _, unvalidated) = MdConsensus::parse(&consensus_body)
-            .map_err(|e| TorError::serialization(format!("Failed to parse consensus: {}", e)))?;
-        let consensus = unvalidated
-            .check_valid_at(&system_time_now())
-            .map_err(|e| {
-                TorError::ConsensusFetch(format!("Consensus timeliness check failed: {}", e))
-            })?;
-
-        let inner_consensus = &consensus.consensus;
-
-        let mut middle_digests: Vec<[u8; 32]> = inner_consensus
-            .relays()
-            .iter()
-            .filter(|router| {
-                router.is_flagged_fast()
-                    && router.is_flagged_stable()
-                    && router.is_flagged_v2dir()
-                    && router.weight().is_nonzero()
-            })
-            .map(|r| *r.md_digest())
-            .collect();
-        let mut exit_digests: Vec<[u8; 32]> = inner_consensus
-            .relays()
-            .iter()
-            .filter(|router| {
-                router.is_flagged_fast()
-                    && router.is_flagged_stable()
-                    && router.is_flagged_exit()
-                    && !router.is_flagged_bad_exit()
-                    && router.weight().is_nonzero()
-            })
-            .map(|r| *r.md_digest())
-            .collect();
-
-        let mut rng = rand::thread_rng();
-        middle_digests.shuffle(&mut rng);
-        exit_digests.shuffle(&mut rng);
-        middle_digests.truncate(RELAYS_PER_ROLE);
-        exit_digests.truncate(RELAYS_PER_ROLE);
-
-        if middle_digests.len() < MIN_RELAYS_PER_ROLE {
-            return Err(TorError::ConsensusFetch(format!(
-                "Consensus has only {} eligible middle relays",
-                middle_digests.len()
-            )));
-        }
-        if exit_digests.len() < MIN_RELAYS_PER_ROLE {
-            return Err(TorError::ConsensusFetch(format!(
-                "Consensus has only {} eligible exit relays",
-                exit_digests.len()
-            )));
-        }
-
-        let mut seen = HashSet::new();
-        let digests: Vec<[u8; 32]> = middle_digests
-            .into_iter()
-            .chain(exit_digests)
-            .filter(|digest| seen.insert(*digest))
-            .collect();
+        let digests = select_microdescriptor_digests(&consensus_body)?;
 
         self.log(
             &format!(
@@ -130,117 +125,51 @@ impl DirectoryManager {
             microdescs_body.len()
         );
 
-        let mut router_statuses = HashMap::new();
-        for router in inner_consensus.relays() {
-            router_statuses.insert(*router.md_digest(), router.clone());
-        }
+        let processed = process_directory_documents(&consensus_body, &microdescs_body)?;
+        self.install_directory(processed, false).await;
+        *self.cache.write().await = Some(DirectoryCache {
+            version: DIRECTORY_CACHE_VERSION,
+            consensus: consensus_body,
+            microdescriptors: microdescs_body,
+        });
 
-        let mut relays = Vec::new();
-        let reader =
-            MicrodescReader::new(&microdescs_body, &AllowAnnotations::AnnotationsNotAllowed)?;
-        for microdesc in reader {
-            let microdesc = match microdesc {
-                Ok(md) => md.into_microdesc(),
-                Err(e) => {
-                    warn!("Failed to parse microdescriptor: {}", e);
-                    continue;
-                }
-            };
+        Ok(())
+    }
 
-            if let Some(router) = router_statuses.get(microdesc.digest()) {
-                let nickname = router.nickname().to_string();
-                let fingerprint = hex::encode(router.rsa_identity().as_bytes());
+    pub async fn load_cache(&self, encoded: &str) -> Result<()> {
+        self.log("Validating cached Tor directory data...", LogType::Info);
+        let cache = DirectoryCache::decode(encoded)?;
+        let processed = process_directory_documents(&cache.consensus, &cache.microdescriptors)?;
+        self.install_directory(processed, true).await;
+        *self.cache.write().await = Some(cache);
+        Ok(())
+    }
 
-                let address = if let Some(addr) = router.addrs().next() {
-                    addr.ip().to_string()
-                } else {
-                    continue;
-                };
+    pub async fn cache_json(&self) -> Result<Option<String>> {
+        let cache = self.cache.read().await;
+        cache.as_ref().map(DirectoryCache::encode).transpose()
+    }
 
-                let or_port = router.addrs().next().map(|a| a.port()).unwrap_or(0);
+    pub async fn has_directory_data(&self) -> bool {
+        !self.relay_manager.read().await.relays.is_empty()
+    }
 
-                let mut flags = std::collections::HashSet::new();
-                if router.is_flagged_fast() {
-                    flags.insert("Fast".to_string());
-                }
-                if router.is_flagged_stable() {
-                    flags.insert("Stable".to_string());
-                }
-                if router.is_flagged_guard() {
-                    flags.insert("Guard".to_string());
-                }
-                if router.is_flagged_exit() && microdesc.ipv4_policy().allows_port(443) {
-                    flags.insert("Exit".to_string());
-                }
-                if router.is_flagged_bad_exit() {
-                    flags.insert("BadExit".to_string());
-                }
-                if router.is_flagged_hsdir() {
-                    flags.insert("HSDir".to_string());
-                }
-                if router.is_flagged_v2dir() {
-                    flags.insert("V2Dir".to_string());
-                }
-
-                let ntor_onion_key = hex::encode(microdesc.ntor_key().as_bytes());
-
-                let mut relay = Relay::new(
-                    fingerprint,
-                    nickname,
-                    address,
-                    or_port,
-                    flags,
-                    ntor_onion_key,
-                );
-
-                relay.ed25519_identity = Some(hex::encode(microdesc.ed25519_id().as_bytes()));
-                relay.consensus_weight = relay_weight_value(router.weight());
-
-                relays.push(relay);
-            }
-        }
-
-        let count = relays.len();
-        let middle_count = relays
-            .iter()
-            .filter(|relay| {
-                relay.flags.contains("Fast")
-                    && relay.flags.contains("Stable")
-                    && relay.flags.contains("V2Dir")
-            })
-            .count();
-        let exit_count = relays
-            .iter()
-            .filter(|relay| {
-                relay.flags.contains("Fast")
-                    && relay.flags.contains("Stable")
-                    && relay.flags.contains("Exit")
-                    && !relay.flags.contains("BadExit")
-            })
-            .count();
-
-        if middle_count < MIN_RELAYS_PER_ROLE || exit_count < MIN_RELAYS_PER_ROLE {
-            return Err(TorError::ConsensusFetch(format!(
-                "Directory returned insufficient usable relays (middle: {}, HTTPS exit: {})",
-                middle_count, exit_count
-            )));
-        }
-
+    async fn install_directory(&self, processed: ProcessedDirectory, from_cache: bool) {
+        let count = processed.relays.len();
         {
             let mut manager = self.relay_manager.write().await;
-            manager.update_relays(relays);
+            manager.update_relays(processed.relays);
         }
 
         info!("Updated RelayManager with {} relays", count);
+        let source = if from_cache { "cached" } else { "current" };
         self.log(
             &format!(
-                "Loaded {} current Tor relays ({} middle, {} HTTPS exit)",
-                count, middle_count, exit_count
+                "Loaded {} {} Tor relays ({} middle, {} HTTPS exit)",
+                count, source, processed.middle_count, processed.exit_count
             ),
             LogType::Success,
         );
-
-        Ok(())
     }
 
     async fn create_directory_tunnel(&self, channel: Arc<Channel>) -> Result<Arc<ClientTunnel>> {
@@ -438,6 +367,198 @@ impl DirectoryManager {
     }
 }
 
+fn select_microdescriptor_digests(consensus_body: &str) -> Result<Vec<[u8; 32]>> {
+    info!("Parsing full consensus");
+    let (_, _, unvalidated) = MdConsensus::parse(consensus_body)
+        .map_err(|error| TorError::serialization(format!("Failed to parse consensus: {}", error)))?;
+    let consensus = unvalidated
+        .check_valid_at(&system_time_now())
+        .map_err(|error| {
+            TorError::ConsensusFetch(format!(
+                "Consensus timeliness check failed: {}",
+                error
+            ))
+        })?;
+    let inner_consensus = &consensus.consensus;
+
+    let mut middle_digests: Vec<[u8; 32]> = inner_consensus
+        .relays()
+        .iter()
+        .filter(|router| {
+            router.is_flagged_fast()
+                && router.is_flagged_stable()
+                && router.is_flagged_v2dir()
+                && router.weight().is_nonzero()
+        })
+        .map(|router| *router.md_digest())
+        .collect();
+    let mut exit_digests: Vec<[u8; 32]> = inner_consensus
+        .relays()
+        .iter()
+        .filter(|router| {
+            router.is_flagged_fast()
+                && router.is_flagged_stable()
+                && router.is_flagged_exit()
+                && !router.is_flagged_bad_exit()
+                && router.weight().is_nonzero()
+        })
+        .map(|router| *router.md_digest())
+        .collect();
+
+    let mut rng = rand::thread_rng();
+    middle_digests.shuffle(&mut rng);
+    exit_digests.shuffle(&mut rng);
+    middle_digests.truncate(RELAYS_PER_ROLE);
+    exit_digests.truncate(RELAYS_PER_ROLE);
+
+    if middle_digests.len() < MIN_RELAYS_PER_ROLE {
+        return Err(TorError::ConsensusFetch(format!(
+            "Consensus has only {} eligible middle relays",
+            middle_digests.len()
+        )));
+    }
+    if exit_digests.len() < MIN_RELAYS_PER_ROLE {
+        return Err(TorError::ConsensusFetch(format!(
+            "Consensus has only {} eligible exit relays",
+            exit_digests.len()
+        )));
+    }
+
+    let mut seen = HashSet::new();
+    Ok(middle_digests
+        .into_iter()
+        .chain(exit_digests)
+        .filter(|digest| seen.insert(*digest))
+        .collect())
+}
+
+fn process_directory_documents(
+    consensus_body: &str,
+    microdescriptors_body: &str,
+) -> Result<ProcessedDirectory> {
+    if consensus_body.len() > MAX_DIRECTORY_RESPONSE_BYTES
+        || microdescriptors_body.len() > MAX_DIRECTORY_RESPONSE_BYTES
+    {
+        return Err(TorError::ConsensusFetch(
+            "Directory document exceeded the cache size limit".to_string(),
+        ));
+    }
+
+    let (_, _, unvalidated) = MdConsensus::parse(consensus_body)
+        .map_err(|error| TorError::serialization(format!("Failed to parse consensus: {}", error)))?;
+    let consensus = unvalidated
+        .check_valid_at(&system_time_now())
+        .map_err(|error| {
+            TorError::ConsensusFetch(format!(
+                "Consensus timeliness check failed: {}",
+                error
+            ))
+        })?;
+    let inner_consensus = &consensus.consensus;
+
+    let mut router_statuses = HashMap::new();
+    for router in inner_consensus.relays() {
+        router_statuses.insert(*router.md_digest(), router.clone());
+    }
+
+    let mut relays = Vec::new();
+    let mut seen_microdescriptors = HashSet::new();
+    let reader = MicrodescReader::new(
+        microdescriptors_body,
+        &AllowAnnotations::AnnotationsNotAllowed,
+    )?;
+    for microdescriptor in reader {
+        let microdescriptor = match microdescriptor {
+            Ok(document) => document.into_microdesc(),
+            Err(error) => {
+                warn!("Failed to parse microdescriptor: {}", error);
+                continue;
+            }
+        };
+        if !seen_microdescriptors.insert(*microdescriptor.digest()) {
+            continue;
+        }
+
+        if let Some(router) = router_statuses.get(microdescriptor.digest()) {
+            let nickname = router.nickname().to_string();
+            let fingerprint = hex::encode(router.rsa_identity().as_bytes());
+            let address = if let Some(address) = router.addrs().next() {
+                address.ip().to_string()
+            } else {
+                continue;
+            };
+            let or_port = router.addrs().next().map(|address| address.port()).unwrap_or(0);
+
+            let mut flags = HashSet::new();
+            if router.is_flagged_fast() {
+                flags.insert("Fast".to_string());
+            }
+            if router.is_flagged_stable() {
+                flags.insert("Stable".to_string());
+            }
+            if router.is_flagged_guard() {
+                flags.insert("Guard".to_string());
+            }
+            if router.is_flagged_exit() && microdescriptor.ipv4_policy().allows_port(443) {
+                flags.insert("Exit".to_string());
+            }
+            if router.is_flagged_bad_exit() {
+                flags.insert("BadExit".to_string());
+            }
+            if router.is_flagged_hsdir() {
+                flags.insert("HSDir".to_string());
+            }
+            if router.is_flagged_v2dir() {
+                flags.insert("V2Dir".to_string());
+            }
+
+            let ntor_onion_key = hex::encode(microdescriptor.ntor_key().as_bytes());
+            let mut relay = Relay::new(
+                fingerprint,
+                nickname,
+                address,
+                or_port,
+                flags,
+                ntor_onion_key,
+            );
+            relay.ed25519_identity = Some(hex::encode(microdescriptor.ed25519_id().as_bytes()));
+            relay.consensus_weight = relay_weight_value(router.weight());
+            relays.push(relay);
+        }
+    }
+
+    let middle_count = relays
+        .iter()
+        .filter(|relay| {
+            relay.flags.contains("Fast")
+                && relay.flags.contains("Stable")
+                && relay.flags.contains("V2Dir")
+        })
+        .count();
+    let exit_count = relays
+        .iter()
+        .filter(|relay| {
+            relay.flags.contains("Fast")
+                && relay.flags.contains("Stable")
+                && relay.flags.contains("Exit")
+                && !relay.flags.contains("BadExit")
+        })
+        .count();
+
+    if middle_count < MIN_RELAYS_PER_ROLE || exit_count < MIN_RELAYS_PER_ROLE {
+        return Err(TorError::ConsensusFetch(format!(
+            "Directory returned insufficient usable relays (middle: {}, HTTPS exit: {})",
+            middle_count, exit_count
+        )));
+    }
+
+    Ok(ProcessedDirectory {
+        relays,
+        middle_count,
+        exit_count,
+    })
+}
+
 fn relay_weight_value(weight: &RelayWeight) -> u32 {
     match weight {
         RelayWeight::Unmeasured(value) | RelayWeight::Measured(value) => *value,
@@ -607,6 +728,46 @@ mod tests {
     use super::*;
     use flate2::{write::ZlibEncoder, Compression};
     use std::io::Write;
+
+    #[test]
+    fn directory_cache_round_trips() {
+        let cache = DirectoryCache {
+            version: DIRECTORY_CACHE_VERSION,
+            consensus: "consensus".to_string(),
+            microdescriptors: "microdescriptors".to_string(),
+        };
+
+        let decoded = DirectoryCache::decode(&cache.encode().unwrap()).unwrap();
+
+        assert_eq!(decoded.version, DIRECTORY_CACHE_VERSION);
+        assert_eq!(decoded.consensus, "consensus");
+        assert_eq!(decoded.microdescriptors, "microdescriptors");
+    }
+
+    #[test]
+    fn directory_cache_rejects_unknown_versions() {
+        let encoded = serde_json::json!({
+            "version": DIRECTORY_CACHE_VERSION + 1,
+            "consensus": "consensus",
+            "microdescriptors": "microdescriptors"
+        })
+        .to_string();
+
+        let error = DirectoryCache::decode(&encoded).unwrap_err();
+
+        assert!(error.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn cached_consensus_must_still_be_timely() {
+        let consensus = include_str!("../../vendor/arti/crates/tor-netdoc/testdata/mdconsensus1.txt");
+        let microdescriptors =
+            include_str!("../../vendor/arti/crates/tor-netdoc/testdata/microdesc1.txt");
+
+        let error = process_directory_documents(consensus, microdescriptors).unwrap_err();
+
+        assert!(error.to_string().contains("timeliness check failed"));
+    }
 
     #[test]
     fn microdescriptor_digest_uses_unpadded_standard_base64() {

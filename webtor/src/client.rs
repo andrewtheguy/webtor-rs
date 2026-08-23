@@ -324,6 +324,16 @@ impl TorClient {
         Ok(relay_manager.relays.len())
     }
 
+    /// Validate and install a serialized directory cache before bootstrap.
+    pub async fn load_directory_cache(&self, encoded: &str) -> Result<()> {
+        self.directory_manager.load_cache(encoded).await
+    }
+
+    /// Serialize the validated directory data used by this client.
+    pub async fn directory_cache_json(&self) -> Result<Option<String>> {
+        self.directory_manager.cache_json().await
+    }
+
     /// Get consensus status string
     pub async fn get_consensus_status(&self) -> String {
         let relay_manager = self.directory_manager.relay_manager.read().await;
@@ -494,25 +504,32 @@ impl TorClient {
 
         self.log("Channel established", LogType::Success);
 
-        // A bridge channel can open a one-hop directory stream without a relay
-        // snapshot. Require current directory data before choosing the middle and
-        // exit so rotating ntor keys can never come from a stale bundled cache.
-        self.log(
-            "Fetching current Tor directory data through Snowflake...",
-            LogType::Info,
-        );
-        if let Err(e) = self
-            .directory_manager
-            .fetch_and_process_consensus(chan)
-            .await
-        {
+        if self.directory_manager.has_directory_data().await {
             self.log(
-                &format!("Failed to fetch current Tor directory data: {}", e),
-                LogType::Error,
+                "Using validated cached Tor directory data; skipping download",
+                LogType::Success,
             );
-            return Err(e);
+        } else {
+            // A bridge channel can open a one-hop directory stream without a relay
+            // snapshot. Require validated directory data before choosing the middle
+            // and exit so rotating ntor keys can never come from an expired cache.
+            self.log(
+                "Fetching current Tor directory data through Snowflake...",
+                LogType::Info,
+            );
+            if let Err(e) = self
+                .directory_manager
+                .fetch_and_process_consensus(chan)
+                .await
+            {
+                self.log(
+                    &format!("Failed to fetch current Tor directory data: {}", e),
+                    LogType::Error,
+                );
+                return Err(e);
+            }
+            self.log("Current Tor directory data loaded", LogType::Success);
         }
-        self.log("Current Tor directory data loaded", LogType::Success);
 
         // Now create the actual circuit through the Tor network
         self.log("Creating circuit through Tor network...", LogType::Info);

@@ -133,12 +133,23 @@ pub struct AnonymousSignalingClient {
 #[wasm_bindgen]
 impl AnonymousSignalingClient {
     #[wasm_bindgen(js_name = create)]
-    pub fn create() -> js_sys::Promise {
+    pub fn create(cached_directory: Option<String>) -> js_sys::Promise {
         future_to_promise(async move {
             console_error_panic_hook::set_once();
             let client = TorClient::new(signaling_client_options())
                 .await
                 .map_err(|error| js_error("Failed to initialize webtor", error))?;
+            if let Some(encoded) = cached_directory.filter(|value| !value.is_empty()) {
+                if let Err(error) = client.load_directory_cache(&encoded).await {
+                    log_tor_progress(
+                        &format!(
+                            "Cached Tor directory data was rejected; downloading fresh data: {}",
+                            error
+                        ),
+                        LogType::Info,
+                    );
+                }
+            }
             client
                 .ensure_ready()
                 .await
@@ -152,6 +163,19 @@ impl AnonymousSignalingClient {
             Ok(JsValue::from(Self {
                 client: Arc::new(client),
             }))
+        })
+    }
+
+    #[wasm_bindgen(js_name = directoryCache)]
+    pub fn directory_cache(&self) -> js_sys::Promise {
+        let client = self.client.clone();
+        future_to_promise(async move {
+            let encoded = client
+                .directory_cache_json()
+                .await
+                .map_err(|error| js_error("Failed to export Tor directory cache", error))?
+                .ok_or_else(|| JsValue::from_str("Tor directory cache is unavailable"))?;
+            Ok(JsValue::from_str(&encoded))
         })
     }
 
