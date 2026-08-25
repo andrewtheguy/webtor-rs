@@ -203,7 +203,7 @@ pub struct AnonymousSignalingClient {
 impl AnonymousSignalingClient {
     #[wasm_bindgen(js_name = create)]
     pub fn create(
-        cached_directory: Option<String>,
+        directory_seed: Option<String>,
         stun_urls: js_sys::Array,
         websocket_bridge: bool,
     ) -> js_sys::Promise {
@@ -227,10 +227,10 @@ impl AnonymousSignalingClient {
             let client = TorClient::new(signaling_client_options(stun_urls, websocket_bridge))
                 .await
                 .map_err(|error| js_error("Failed to initialize webtor", error))?;
-            // Only a failed directory download reaches for this copy; a normal
-            // start always bootstraps from a freshly downloaded consensus.
-            if let Some(encoded) = cached_directory.filter(|value| !value.is_empty()) {
-                client.set_directory_cache_fallback(&encoded).await;
+            // Bootstrap starts from this directory data when it is present and
+            // still valid; otherwise webtor downloads a consensus itself.
+            if let Some(encoded) = directory_seed.filter(|value| !value.is_empty()) {
+                client.set_directory_seed(&encoded).await;
             }
             client
                 .ensure_ready()
