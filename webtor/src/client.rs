@@ -34,10 +34,11 @@ pub struct TorClient {
     initialized: RwLock<bool>,
     bootstrap_lock: Mutex<()>,
     channel: Arc<RwLock<Option<Arc<tor_proto::channel::Channel>>>>,
-    /// Encoded directory data to fall back on, used only when the live
-    /// download fails. Never validated or installed while a fresh consensus
-    /// can be fetched.
-    directory_cache_fallback: RwLock<Option<String>>,
+    /// Encoded directory data to bootstrap from. Downloading the consensus
+    /// and the microdescriptors over a single bridge circuit is the least
+    /// reliable step of a bootstrap, so a caller-supplied directory is tried
+    /// first and the download only runs when there is none or it is rejected.
+    directory_seed: RwLock<Option<String>>,
 }
 
 impl TorClient {
@@ -58,7 +59,7 @@ impl TorClient {
             initialized: RwLock::new(false),
             bootstrap_lock: Mutex::new(()),
             channel,
-            directory_cache_fallback: RwLock::new(None),
+            directory_seed: RwLock::new(None),
         })
     }
 
@@ -130,11 +131,11 @@ impl TorClient {
         .await
     }
 
-    /// Register previously exported directory data as a bootstrap fallback.
-    /// Bootstrap always downloads a fresh consensus first and only reaches for
-    /// this copy when that download fails.
-    pub async fn set_directory_cache_fallback(&self, encoded: &str) {
-        *self.directory_cache_fallback.write().await = Some(encoded.to_string());
+    /// Supply directory data for bootstrap to start from. It is validated and
+    /// installed before any download; a missing, stale or unusable seed falls
+    /// through to downloading the consensus over the bridge channel.
+    pub async fn set_directory_seed(&self, encoded: &str) {
+        *self.directory_seed.write().await = Some(encoded.to_string());
     }
 
     pub async fn directory_cache_json(&self) -> Result<Option<String>> {
@@ -175,13 +176,11 @@ impl TorClient {
         *self.channel.write().await = Some(channel.clone());
         self.log("Snowflake bridge channel established", LogType::Success);
 
-        self.log("Downloading current Tor directory data", LogType::Info);
-        if let Err(error) = self
-            .directory_manager
-            .fetch_and_process_consensus(channel)
-            .await
-        {
-            self.use_directory_cache_fallback(error).await?;
+        if !self.install_directory_seed().await {
+            self.log("Downloading current Tor directory data", LogType::Info);
+            self.directory_manager
+                .fetch_and_process_consensus(channel)
+                .await?;
         }
 
         let circuit = self.circuit_manager.create_circuit().await?;
@@ -198,29 +197,25 @@ impl TorClient {
         Ok(())
     }
 
-    /// Last resort after a failed directory download. Reports the download
-    /// error, not the cache error, since a stale or rejected cache is a
-    /// symptom of the download having failed rather than the cause.
-    async fn use_directory_cache_fallback(&self, download_error: TorError) -> Result<()> {
-        let Some(encoded) = self.directory_cache_fallback.read().await.clone() else {
-            return Err(download_error);
+    /// Install the caller-supplied directory data, if any. Returns false when
+    /// there is none or it cannot be used, leaving the caller to download a
+    /// consensus instead. A seed that is merely expired is the normal reason
+    /// to fall through, so a rejection is reported and not fatal.
+    async fn install_directory_seed(&self) -> bool {
+        let Some(encoded) = self.directory_seed.read().await.clone() else {
+            return false;
         };
 
-        self.log(
-            &format!("Tor directory download failed: {download_error}"),
-            LogType::Error,
-        );
-        self.log("Trying the cached Tor directory data", LogType::Info);
-        if let Err(cache_error) = self.directory_manager.load_cache(&encoded).await {
+        self.log("Loading the supplied Tor directory data", LogType::Info);
+        if let Err(error) = self.directory_manager.load_cache(&encoded).await {
             self.log(
-                &format!("Cached Tor directory data was rejected: {cache_error}"),
+                &format!("Supplied Tor directory data was rejected: {error}"),
                 LogType::Error,
             );
-            return Err(download_error);
+            return false;
         }
 
-        self.log("Using validated cached Tor directory data", LogType::Success);
-        Ok(())
+        true
     }
 
     async fn create_channel<S>(

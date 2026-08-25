@@ -208,16 +208,16 @@ if (!('encodeInto' in cachedTextEncoder)) {
 
 let WASM_VECTOR_LEN = 0;
 
+function wasm_bindgen_80478907236fa2b9___convert__closures_____invoke______(arg0, arg1) {
+    wasm.wasm_bindgen_80478907236fa2b9___convert__closures_____invoke______(arg0, arg1);
+}
+
 function wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___web_sys_91ba62fe70348d71___features__gen_CloseEvent__CloseEvent_____(arg0, arg1, arg2) {
     wasm.wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___web_sys_91ba62fe70348d71___features__gen_CloseEvent__CloseEvent_____(arg0, arg1, arg2);
 }
 
 function wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___wasm_bindgen_80478907236fa2b9___JsValue_____(arg0, arg1, arg2) {
     wasm.wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___wasm_bindgen_80478907236fa2b9___JsValue_____(arg0, arg1, arg2);
-}
-
-function wasm_bindgen_80478907236fa2b9___convert__closures_____invoke______(arg0, arg1) {
-    wasm.wasm_bindgen_80478907236fa2b9___convert__closures_____invoke______(arg0, arg1);
 }
 
 function wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___wasm_bindgen_80478907236fa2b9___JsValue__wasm_bindgen_80478907236fa2b9___JsValue_____(arg0, arg1, arg2, arg3) {
@@ -277,13 +277,13 @@ export class AnonymousSignalingClient {
         return ret;
     }
     /**
-     * @param {string | null | undefined} cached_directory
+     * @param {string | null | undefined} directory_seed
      * @param {Array<any>} stun_urls
      * @param {boolean} websocket_bridge
      * @returns {Promise<any>}
      */
-    static create(cached_directory, stun_urls, websocket_bridge) {
-        var ptr0 = isLikeNone(cached_directory) ? 0 : passStringToWasm0(cached_directory, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    static create(directory_seed, stun_urls, websocket_bridge) {
+        var ptr0 = isLikeNone(directory_seed) ? 0 : passStringToWasm0(directory_seed, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         var len0 = WASM_VECTOR_LEN;
         const ret = wasm.anonymoussignalingclient_create(ptr0, len0, stun_urls, websocket_bridge);
         return ret;

@@ -7,7 +7,7 @@ export class AnonymousSignalingClient {
   [Symbol.dispose](): void;
   directoryCache(): Promise<any>;
   close(): Promise<any>;
-  static create(cached_directory: string | null | undefined, stun_urls: Array<any>, websocket_bridge: boolean): Promise<any>;
+  static create(directory_seed: string | null | undefined, stun_urls: Array<any>, websocket_bridge: boolean): Promise<any>;
   connect(relay_url: string): Promise<any>;
 }
 
@@ -33,12 +33,12 @@ export interface InitOutput {
   readonly anonymoussignalingsocket_close: (a: number) => any;
   readonly anonymoussignalingsocket_receive: (a: number) => any;
   readonly anonymoussignalingsocket_send: (a: number, b: number, c: number) => any;
+  readonly wasm_bindgen_80478907236fa2b9___convert__closures_____invoke______: (a: number, b: number) => void;
+  readonly wasm_bindgen_80478907236fa2b9___closure__destroy___dyn_core_e4e32f5ae772ed90___ops__function__FnMut_____Output_______: (a: number, b: number) => void;
   readonly wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___web_sys_91ba62fe70348d71___features__gen_CloseEvent__CloseEvent_____: (a: number, b: number, c: any) => void;
   readonly wasm_bindgen_80478907236fa2b9___closure__destroy___dyn_core_e4e32f5ae772ed90___ops__function__FnMut__web_sys_91ba62fe70348d71___features__gen_CloseEvent__CloseEvent____Output_______: (a: number, b: number) => void;
   readonly wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___wasm_bindgen_80478907236fa2b9___JsValue_____: (a: number, b: number, c: any) => void;
   readonly wasm_bindgen_80478907236fa2b9___closure__destroy___dyn_core_e4e32f5ae772ed90___ops__function__FnMut__wasm_bindgen_80478907236fa2b9___JsValue____Output_______: (a: number, b: number) => void;
-  readonly wasm_bindgen_80478907236fa2b9___convert__closures_____invoke______: (a: number, b: number) => void;
-  readonly wasm_bindgen_80478907236fa2b9___closure__destroy___dyn_core_e4e32f5ae772ed90___ops__function__FnMut_____Output_______: (a: number, b: number) => void;
   readonly wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___wasm_bindgen_80478907236fa2b9___JsValue__wasm_bindgen_80478907236fa2b9___JsValue_____: (a: number, b: number, c: any, d: any) => void;
   readonly __wbindgen_malloc: (a: number, b: number) => number;
   readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;

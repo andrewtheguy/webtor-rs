@@ -25,9 +25,11 @@ use tracing::{debug, error, info, warn};
 const RELAYS_PER_ROLE: usize = 32;
 const MIN_RELAYS_PER_ROLE: usize = 10;
 const MICRODESCRIPTOR_CHUNK_SIZE: usize = 16;
+/// Bounds what one directory response off a Tor stream may buffer. The bridge
+/// serving it is untrusted, so this caps an endless stream and a decompression
+/// bomb; it does not bound directory data supplied by the embedding page.
 const MAX_DIRECTORY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const DIRECTORY_CACHE_VERSION: u32 = 1;
-const MAX_DIRECTORY_CACHE_BYTES: usize = MAX_DIRECTORY_RESPONSE_BYTES * 2 + 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct DirectoryCache {
@@ -38,13 +40,6 @@ struct DirectoryCache {
 
 impl DirectoryCache {
     fn decode(encoded: &str) -> Result<Self> {
-        if encoded.len() > MAX_DIRECTORY_CACHE_BYTES {
-            return Err(TorError::ConsensusFetch(format!(
-                "Directory cache exceeded {} bytes",
-                MAX_DIRECTORY_CACHE_BYTES
-            )));
-        }
-
         let cache: Self = serde_json::from_str(encoded).map_err(|error| {
             TorError::serialization(format!("Directory cache was invalid JSON: {}", error))
         })?;
@@ -54,14 +49,6 @@ impl DirectoryCache {
                 cache.version
             )));
         }
-        if cache.consensus.len() > MAX_DIRECTORY_RESPONSE_BYTES
-            || cache.microdescriptors.len() > MAX_DIRECTORY_RESPONSE_BYTES
-        {
-            return Err(TorError::ConsensusFetch(
-                "Directory cache contained an oversized document".to_string(),
-            ));
-        }
-
         Ok(cache)
     }
 
@@ -158,7 +145,7 @@ impl DirectoryManager {
         }
 
         info!("Updated RelayManager with {} relays", count);
-        let source = if from_cache { "cached" } else { "current" };
+        let source = if from_cache { "supplied" } else { "downloaded" };
         self.log(
             &format!(
                 "Loaded {} {} Tor relays ({} middle, {} HTTPS exit)",
@@ -424,14 +411,6 @@ fn process_directory_documents(
     consensus_body: &str,
     microdescriptors_body: &str,
 ) -> Result<ProcessedDirectory> {
-    if consensus_body.len() > MAX_DIRECTORY_RESPONSE_BYTES
-        || microdescriptors_body.len() > MAX_DIRECTORY_RESPONSE_BYTES
-    {
-        return Err(TorError::ConsensusFetch(
-            "Directory document exceeded the cache size limit".to_string(),
-        ));
-    }
-
     let (_, _, unvalidated) = MdConsensus::parse(consensus_body)
         .map_err(|error| TorError::serialization(format!("Failed to parse consensus: {}", error)))?;
     let consensus = unvalidated
