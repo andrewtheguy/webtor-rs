@@ -1,0 +1,11 @@
+{
+  "name": "webtor-rs-workspace",
+  "private": true,
+  "version": "0.5.11",
+  "scripts": {
+    "build": "wasm-pack build anonymous-signaling-wasm --release --target web --scope andrewtheguy"
+  },
+  "devDependencies": {
+    "wasm-pack": "^0.15.0"
+  }
+}

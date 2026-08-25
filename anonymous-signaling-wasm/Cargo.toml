@@ -2,8 +2,7 @@
 name = "anonymous-signaling-wasm"
 version = "0.1.4"
 edition.workspace = true
-license-file = "../../../LICENSE"
-repository.workspace = true
+license-file = "../LICENSE"
 description = "Tor-backed WebSocket transport for pTransfer Nostr signaling"
 
 [lib]

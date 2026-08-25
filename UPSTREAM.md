@@ -1,6 +1,6 @@
 # webtor-rs fork provenance
 
-This directory is a source-minimized fork of
+This repository is a source-minimized fork of
 [`privacy-ethereum/webtor-rs`](https://github.com/privacy-ethereum/webtor-rs)
 at commit `9be6e2f5e606c4c03e9639751c18d0d927a4c19d` (version 0.5.7).
 
@@ -17,11 +17,13 @@ options; it is not an automatic fallback. pTransfer adds:
 - non-extractable Web Crypto key generation/import in `subtle-tls`.
 
 The fork keeps only those two browser entry transports, one session circuit,
-raw Tor exit streams, the Tor Check GET, and TLS 1.3. Upstream's native runtime,
-general HTTP client, TLS 1.2, isolation and circuit-pool policies, cancellation,
-background-update, and alternate bridge paths are gone. The crates still
-compile for the host so `cargo check`, `cargo clippy`, and `cargo test` work
-there, but browser APIs only run in a browser.
+raw Tor exit streams, the Tor Check GET, and the browser TLS implementation.
+The pTransfer binding requires TLS 1.3, while `subtle-tls` also retains TLS 1.2
+for hosts that do not support TLS 1.3. Upstream's native runtime, general HTTP
+client, isolation and circuit-pool policies, cancellation, background-update,
+and alternate bridge paths are gone. The crates still compile for the host so
+`cargo check`, `cargo clippy`, and `cargo test` work there, but browser APIs only
+run in a browser.
 
 The vendored Arti tree contains only crates present in this workspace's resolved
 Cargo graph. Optional and development-only crates that the project does not
