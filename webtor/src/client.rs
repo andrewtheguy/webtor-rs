@@ -132,6 +132,36 @@ impl TorClient {
     }
 
     async fn establish_channel(&self) -> Result<()> {
+        let mut channel = self.open_bridge_channel().await?;
+
+        if !self.install_directory_seed().await {
+            self.log("Downloading current Tor directory data", LogType::Info);
+            // Snowflake balances one fingerprint over several bridge
+            // instances, and a wedged instance answers nothing. Reconnecting
+            // is what moves the client to another one, so one directory
+            // failure costs a new channel, not the bootstrap.
+            if let Err(error) = self
+                .directory_manager
+                .fetch_and_process_consensus(channel.clone())
+                .await
+            {
+                self.log(
+                    &format!("Tor directory download failed ({error}); reconnecting to the bridge"),
+                    LogType::Error,
+                );
+                channel.terminate();
+                channel = self.open_bridge_channel().await?;
+                self.directory_manager
+                    .fetch_and_process_consensus(channel)
+                    .await?;
+            }
+        }
+
+        *self.initialized.write().await = true;
+        Ok(())
+    }
+
+    async fn open_bridge_channel(&self) -> Result<Arc<tor_proto::channel::Channel>> {
         self.log("Establishing Snowflake bridge channel", LogType::Info);
         let rsa_identity = parse_snowflake_identity()?;
 
@@ -158,16 +188,7 @@ impl TorClient {
 
         *self.channel.write().await = Some(channel.clone());
         self.log("Snowflake bridge channel established", LogType::Success);
-
-        if !self.install_directory_seed().await {
-            self.log("Downloading current Tor directory data", LogType::Info);
-            self.directory_manager
-                .fetch_and_process_consensus(channel)
-                .await?;
-        }
-
-        *self.initialized.write().await = true;
-        Ok(())
+        Ok(channel)
     }
 
     /// Install the caller-supplied directory data, if any. Returns false when

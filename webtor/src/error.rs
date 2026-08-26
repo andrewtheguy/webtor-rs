@@ -12,6 +12,8 @@ pub enum TorError {
     RelaySelection(String),
     #[error("Consensus fetch failed: {0}")]
     ConsensusFetch(String),
+    #[error("Directory request returned HTTP {0}")]
+    DirectoryStatus(u16),
     #[error("HTTP request failed: {0}")]
     HttpRequest(String),
     #[error("TLS setup failed: {0}")]

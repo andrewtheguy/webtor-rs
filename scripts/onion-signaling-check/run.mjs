@@ -77,7 +77,9 @@ const origin = `http://127.0.0.1:${server.address().port}`;
 const { chromium } = await import(pathToFileURL(join(PLAYWRIGHT_ROOT, 'node_modules/playwright-core/index.mjs')).href);
 const browser = await chromium.launch({ executablePath: CHROME_PATH, headless: true });
 const page = await browser.newPage();
-page.on('console', (message) => console.log(`[page:${message.type()}] ${message.text()}`));
+const startedAt = Date.now();
+const elapsed = () => ((Date.now() - startedAt) / 1000).toFixed(1).padStart(6);
+page.on('console', (message) => console.log(`${elapsed()}s [page:${message.type()}] ${message.text()}`));
 page.on('pageerror', (error) => console.log(`[page:error] ${error.message}`));
 
 let exitCode = 1;
