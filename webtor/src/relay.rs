@@ -242,7 +242,7 @@ impl RelayManager {
 
     /// Select a single relay randomly from candidates
     pub fn select_relay(&self, criteria: &RelayCriteria) -> Result<Relay> {
-        use rand::seq::SliceRandom;
+        use rand::seq::IndexedRandom;
 
         let candidates = self.select_relays(criteria)?;
 
@@ -252,7 +252,7 @@ impl RelayManager {
 
         // Select a random relay from the top candidates to avoid deterministic paths
         // and ensure load balancing
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         candidates
             .choose(&mut rng)
             .cloned()

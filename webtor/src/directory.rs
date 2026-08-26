@@ -433,7 +433,7 @@ fn select_microdescriptor_digests(consensus_body: &str) -> Result<Vec<[u8; 32]>>
     let (_, _, unvalidated) = MdConsensus::parse(consensus_body)
         .map_err(|error| TorError::serialization(format!("Failed to parse consensus: {}", error)))?;
     let consensus = unvalidated
-        .check_valid_at(&system_time_now())
+        .if_valid_at(&system_time_now())
         .map_err(|error| {
             TorError::ConsensusFetch(format!(
                 "Consensus timeliness check failed: {}",
@@ -460,7 +460,7 @@ fn select_microdescriptor_digests(consensus_body: &str) -> Result<Vec<[u8; 32]>>
         .map(|router| *router.md_digest())
         .collect();
 
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     middle_digests.shuffle(&mut rng);
     middle_digests.truncate(RELAYS_PER_ROLE);
 
@@ -492,7 +492,7 @@ fn process_directory_documents(
     let (_, _, unvalidated) = MdConsensus::parse(consensus_body)
         .map_err(|error| TorError::serialization(format!("Failed to parse consensus: {}", error)))?;
     let consensus = unvalidated
-        .check_valid_at(&system_time_now())
+        .if_valid_at(&system_time_now())
         .map_err(|error| {
             TorError::ConsensusFetch(format!(
                 "Consensus timeliness check failed: {}",

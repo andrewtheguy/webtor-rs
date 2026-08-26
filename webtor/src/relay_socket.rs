@@ -8,7 +8,7 @@ use crate::onion_url::OnionUrl;
 use base64::Engine;
 use digest::Digest;
 use futures::io::{AsyncReadExt, AsyncWriteExt};
-use rand::RngCore;
+use rand::Rng;
 use tor_llcrypto::d::Sha1;
 use tor_proto::client::stream::{DataReader, DataStream, DataWriter};
 
@@ -56,7 +56,7 @@ pub async fn connect(
     max_message_bytes: usize,
 ) -> Result<(RelaySocketWriter, RelaySocketReader)> {
     let mut nonce = [0_u8; 16];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    rand::rng().fill_bytes(&mut nonce);
     let key = base64::engine::general_purpose::STANDARD.encode(nonce);
     let host = if url.port() == 80 {
         url.host().to_string()
@@ -152,7 +152,7 @@ impl RelaySocketWriter {
     async fn send_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<()> {
         // Clients must mask every frame (RFC 6455 §5.3).
         let mut mask = [0_u8; 4];
-        rand::thread_rng().fill_bytes(&mut mask);
+        rand::rng().fill_bytes(&mut mask);
         let mut frame = Vec::with_capacity(payload.len() + 14);
         frame.push(0x80 | opcode);
         let len = payload.len();
