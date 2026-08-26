@@ -6,4 +6,4 @@ run cargo clippy and cargo test after rust changes
 
 no cargo fmt
 
-always bump by patch version only for breaking changes, but only one bump per branch
+always bump only webtor-wasm by patch version for breaking changes, but only one bump per branch

@@ -3990,7 +3990,7 @@ dependencies = [
 
 [[package]]
 name = "webtor"
-version = "0.5.15"
+version = "0.0.1"
 dependencies = [
  "async-lock",
  "async-trait",
@@ -4031,7 +4031,7 @@ dependencies = [
 
 [[package]]
 name = "webtor-wasm"
-version = "0.0.1-alpha.7"
+version = "0.0.1-alpha.8"
 dependencies = [
  "console_error_panic_hook",
  "futures",
