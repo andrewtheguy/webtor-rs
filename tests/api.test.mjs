@@ -1,17 +1,17 @@
 // The half of the API that answers without touching the network: the URL
 // helpers and the option validation every call runs before it costs anything.
 //
-//   npm test
+//   bun run test
 //
-// Needs a build (`npm run build`) and a Chrome-family binary (CHROME_PATH).
+// Needs a build (`bun run build`) and a Chrome-family binary (CHROME_PATH).
 
 import assert from 'node:assert/strict';
-import { after, before, describe, it } from 'node:test';
+import { afterAll as after, beforeAll as before, describe, it } from 'bun:test';
 import { openHarness } from './support/browser.mjs';
 
 const ONION = '2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion';
 
-describe('webtor-wasm API', { timeout: 60_000 }, () => {
+describe('webtor-wasm API', () => {
   let harness;
 
   before(async () => {

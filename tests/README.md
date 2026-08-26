@@ -8,10 +8,11 @@ this directory.
 ## Running
 
 ```bash
-npm run build      # required first: the harness imports webtor-wasm/pkg/
-npm test           # tests/api.test.mjs   — no network, ~1s
-npm run seed       # a directory snapshot, ~40 MiB, valid three hours
-npm run test:live  # tests/live.test.mjs  — real onion services, ~1 minute
+bun install        # install dependencies from bun.lock
+bun run build      # required first: the harness imports webtor-wasm/pkg/
+bun run test       # tests/api.test.mjs   — no network, ~1s
+bun run seed       # a directory snapshot, ~40 MiB, valid three hours
+bun run test:live  # tests/live.test.mjs  — real onion services, ~1 minute
 ```
 
 `CHROME_PATH` points at a Chrome-family binary (default
@@ -37,7 +38,7 @@ Environment: `DIRECTORY_SEED` (default `tests/.directory-seed.json`), `BRIDGE`
 
 ## The directory snapshot
 
-`npm run seed` fetches the microdesc consensus and every microdescriptor in it
+`bun run seed` fetches the microdesc consensus and every microdescriptor in it
 from a directory authority and writes them in the shape `directorySeed`
 accepts. Without it the browser downloads the directory over a single Snowflake
 circuit — and it needs *every* HSDir microdescriptor, because a relay's
@@ -68,7 +69,7 @@ over the whole list.
 
 WASM objects cannot cross the CDP boundary, so `harness/index.html` keeps the
 client and its sockets in the page, keyed by id, and exposes methods that
-return plain JSON. `support/browser.mjs` gives the Node side a `call(method,
+return plain JSON. `support/browser.mjs` gives the Bun side a `call(method,
 ...args)` that runs one of them. The harness re-throws WASM rejections — which
 are plain strings — as `Error`s, which is what lets a test assert on the
 message.
