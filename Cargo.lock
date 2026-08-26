@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "anonymous-signaling-wasm"
-version = "0.1.5"
+version = "0.0.1-alpha.1"
 dependencies = [
  "async-tungstenite",
  "console_error_panic_hook",
