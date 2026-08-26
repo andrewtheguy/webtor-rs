@@ -9,7 +9,7 @@ use futures::{AsyncRead, AsyncWrite};
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use subtle_tls::{TlsConfig, TlsConnector, TlsStream, TlsVersion};
+use subtle_tls::TlsStream;
 
 type SnowflakeWsStack = SmuxStream<KcpStream<TurboStream<WebSocketStream>>>;
 
@@ -28,15 +28,9 @@ impl SnowflakeWsStream {
         let kcp = KcpStream::new(turbo, KcpConfig::default());
         let mut smux = SmuxStream::with_stream_id(kcp, 3);
         smux.initialize().await?;
-        let connector = TlsConnector::with_config(TlsConfig {
-            skip_verification: true,
-            alpn_protocols: Vec::new(),
-            // subtle-tls carries TLS 1.2 again, but nothing here negotiates
-            // it: every retained path requires TLS 1.3.
-            version: TlsVersion::Tls13,
-        });
-        let inner = connector
-            .connect(smux, "www.example.com")
+        // Tor authenticates the bridge through its CERTS cells, so the TLS
+        // layer only has to exist; the SNI is filler.
+        let inner = TlsStream::connect(smux, "www.example.com")
             .await
             .map_err(|error| TorError::tls(format!("Snowflake TLS failed: {error}")))?;
         Ok(Self { inner })
