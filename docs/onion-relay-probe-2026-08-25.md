@@ -43,7 +43,7 @@ for the 4243 back by id.
 
 Only `oxtr` and `gnostr2` are usable for signaling, and pTransfer's
 `ANONYMOUS_SIGNALING_RELAYS` is exactly those two. The WASM client reached
-both from a seeded bootstrap (`scripts/onion-signaling-check/run.mjs`: EOSE
+both from a seeded bootstrap (`tests/live.test.mjs`: EOSE
 in 5 s and 7 s). The first pool (`nerostr`, `oxtr`, `nostrwine`) was chosen
 on read results alone and left one writable relay, which is why a receiver
 whose `oxtr` rendezvous failed could not publish its claim anywhere.

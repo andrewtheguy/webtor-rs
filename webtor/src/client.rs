@@ -1,4 +1,4 @@
-//! Browser Tor client used by anonymous Nostr signaling.
+//! The browser Tor client.
 //!
 //! Bootstrapping means opening the Snowflake bridge channel and installing a
 //! directory. Every stream after that goes to an onion service on a circuit

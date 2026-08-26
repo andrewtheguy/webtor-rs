@@ -1,7 +1,10 @@
-//! A WebSocket client for Nostr relays over an onion stream: RFC 6455 with
-//! text frames, ping/pong and close, and nothing else. A general WebSocket
-//! stack brought an HTTP parser, a second SHA-1 and a third `rand` along for
-//! a handshake that is one request line and four headers.
+//! A WebSocket client over an onion stream: RFC 6455 with text and binary
+//! messages, ping/pong and close, and nothing else. A general WebSocket stack
+//! brought an HTTP parser, a second SHA-1 and a third `rand` along for a
+//! handshake that is one request line and four headers.
+//!
+//! `ws://` only. The onion circuit already authenticates the service and
+//! encrypts the exchange, so there is no `wss://` here and no TLS to run.
 
 use crate::error::{Result, TorError};
 use crate::onion_url::OnionUrl;
@@ -22,13 +25,13 @@ const OP_CLOSE: u8 = 0x8;
 const OP_PING: u8 = 0x9;
 const OP_PONG: u8 = 0xA;
 
-/// Sending half of a relay socket.
-pub struct RelaySocketWriter {
+/// Sending half of an onion WebSocket.
+pub struct WebSocketWriter {
     inner: DataWriter,
 }
 
-/// Receiving half of a relay socket.
-pub struct RelaySocketReader {
+/// Receiving half of an onion WebSocket.
+pub struct WebSocketReader {
     inner: DataReader,
     /// Bytes read past the end of the last frame.
     buffer: Vec<u8>,
@@ -37,8 +40,9 @@ pub struct RelaySocketReader {
 }
 
 /// One inbound WebSocket event the caller has to act on.
-pub enum RelayMessage {
+pub enum WebSocketMessage {
     Text(String),
+    Binary(Vec<u8>),
     /// Peer sent a ping; the payload has to go back in a pong.
     Ping(Vec<u8>),
     /// Peer sent a close frame; the connection is done.
@@ -54,7 +58,7 @@ pub async fn connect(
     mut stream: DataStream,
     url: &OnionUrl,
     max_message_bytes: usize,
-) -> Result<(RelaySocketWriter, RelaySocketReader)> {
+) -> Result<(WebSocketWriter, WebSocketReader)> {
     let mut nonce = [0_u8; 16];
     rand::rng().fill_bytes(&mut nonce);
     let key = base64::engine::general_purpose::STANDARD.encode(nonce);
@@ -92,7 +96,7 @@ pub async fn connect(
         if count == 0 {
             return Err(ws_error(
                 "WebSocket upgrade failed",
-                "relay closed the stream during the handshake",
+                "the service closed the stream during the handshake",
             ));
         }
         response.extend_from_slice(&chunk[..count]);
@@ -120,8 +124,8 @@ pub async fn connect(
 
     let (reader, writer) = stream.split();
     Ok((
-        RelaySocketWriter { inner: writer },
-        RelaySocketReader {
+        WebSocketWriter { inner: writer },
+        WebSocketReader {
             inner: reader,
             buffer: leftover,
             max_message_bytes,
@@ -135,9 +139,17 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-impl RelaySocketWriter {
+impl WebSocketWriter {
     pub async fn send_text(&mut self, text: &str) -> Result<()> {
         self.send_frame(OP_TEXT, text.as_bytes()).await
+    }
+
+    pub async fn send_binary(&mut self, payload: &[u8]) -> Result<()> {
+        self.send_frame(OP_BINARY, payload).await
+    }
+
+    pub async fn send_ping(&mut self, payload: &[u8]) -> Result<()> {
+        self.send_frame(OP_PING, payload).await
     }
 
     pub async fn send_pong(&mut self, payload: &[u8]) -> Result<()> {
@@ -183,31 +195,29 @@ impl RelaySocketWriter {
     }
 }
 
-impl RelaySocketReader {
+impl WebSocketReader {
     /// Read the next message. `None` means the stream ended without a close
     /// frame.
-    pub async fn next(&mut self) -> Result<Option<RelayMessage>> {
+    pub async fn next(&mut self) -> Result<Option<WebSocketMessage>> {
         let mut message: Vec<u8> = Vec::new();
-        let mut in_text = false;
+        // The opcode of the message being assembled, once a data frame has
+        // started; continuation frames carry no opcode of their own.
+        let mut assembling: Option<u8> = None;
         loop {
             let Some((fin, opcode, payload)) = self.read_frame().await? else {
                 return Ok(None);
             };
             match opcode {
-                OP_PING => return Ok(Some(RelayMessage::Ping(payload))),
+                // A control frame may arrive between the fragments of a data
+                // message, so answering one must not disturb the assembly.
+                OP_PING => return Ok(Some(WebSocketMessage::Ping(payload))),
                 OP_PONG => continue,
-                OP_CLOSE => return Ok(Some(RelayMessage::Close)),
-                OP_TEXT if !in_text => {
-                    in_text = true;
+                OP_CLOSE => return Ok(Some(WebSocketMessage::Close)),
+                OP_TEXT | OP_BINARY if assembling.is_none() => {
+                    assembling = Some(opcode);
                     message = payload;
                 }
-                OP_CONTINUATION if in_text => message.extend_from_slice(&payload),
-                OP_BINARY => {
-                    return Err(ws_error(
-                        "WebSocket receive failed",
-                        "relay sent a binary message",
-                    ))
-                }
+                OP_CONTINUATION if assembling.is_some() => message.extend_from_slice(&payload),
                 _ => {
                     return Err(ws_error(
                         "WebSocket receive failed",
@@ -222,9 +232,13 @@ impl RelaySocketReader {
                 ));
             }
             if fin {
-                let text = String::from_utf8(message)
-                    .map_err(|error| ws_error("WebSocket receive failed", error))?;
-                return Ok(Some(RelayMessage::Text(text)));
+                return Ok(Some(if assembling == Some(OP_BINARY) {
+                    WebSocketMessage::Binary(message)
+                } else {
+                    let text = String::from_utf8(message)
+                        .map_err(|error| ws_error("WebSocket receive failed", error))?;
+                    WebSocketMessage::Text(text)
+                }));
             }
         }
     }
@@ -281,7 +295,7 @@ impl RelaySocketReader {
             if !self.fill().await? {
                 return Err(ws_error(
                     "WebSocket receive failed",
-                    "relay closed the stream mid-frame",
+                    "the service closed the stream mid-frame",
                 ));
             }
         }

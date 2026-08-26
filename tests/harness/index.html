@@ -1,0 +1,189 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>webtor-wasm harness</title>
+<pre id="log"></pre>
+<script type="module">
+  // The page half of the test project. It holds the objects that cannot cross
+  // the CDP boundary — the client and its sockets live here, keyed by id — and
+  // exposes only plain JSON to the Node side.
+  import init, {
+    WebtorClient,
+    isOnionHost,
+    parseOnionUrl,
+  } from '/webtor-wasm/pkg/webtor_wasm.js';
+
+  const logElement = document.getElementById('log');
+  const state = { client: null, sockets: new Map(), nextSocket: 0 };
+
+  function show(line) {
+    logElement.textContent += `${line}\n`;
+  }
+
+  /**
+   * The WASM bindings reject with plain strings, not `Error`s, and a bare
+   * string loses its message on the way across CDP. Re-throwing as an `Error`
+   * is what lets a test assert on what went wrong.
+   */
+  async function rethrowing(work) {
+    try {
+      return await work();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      show(`error: ${message}`);
+      throw new Error(message);
+    }
+  }
+
+  function socket(id) {
+    const found = state.sockets.get(id);
+    if (!found) throw new Error(`No socket ${id}; it may already be closed`);
+    return found;
+  }
+
+  function client() {
+    if (!state.client) throw new Error('No client; call create first');
+    return state.client;
+  }
+
+  // Top-level await: the harness only appears once the module is usable, and
+  // the Node side waits for it, so no test can race the instantiation.
+  await init();
+
+  globalThis.harness = {
+    // --- no client needed -------------------------------------------------
+    isOnionHost: (host) => isOnionHost(host),
+    parseOnionUrl: (url) => rethrowing(async () => parseOnionUrl(url)),
+    createRejects: (options) =>
+      rethrowing(async () => {
+        const created = await WebtorClient.create(options);
+        await created.close();
+        return 'created';
+      }),
+
+    // --- client lifecycle -------------------------------------------------
+    /**
+     * Bootstrap a client. `seedUrl` is fetched in the page rather than passed
+     * in as an argument: a directory snapshot is tens of megabytes and does
+     * not want to travel through CDP.
+     */
+    create: (options, seedUrl) =>
+      rethrowing(async () => {
+        const started = performance.now();
+        const settings = { ...options };
+        if (seedUrl) {
+          const response = await fetch(seedUrl);
+          if (!response.ok) {
+            throw new Error(`Seed ${seedUrl} answered HTTP ${response.status}`);
+          }
+          settings.directorySeed = await response.text();
+        }
+        state.client = await WebtorClient.create(settings);
+        return { seconds: Number(((performance.now() - started) / 1000).toFixed(1)) };
+      }),
+
+    directoryCache: () =>
+      rethrowing(async () => {
+        const encoded = await client().directoryCache();
+        const parsed = JSON.parse(encoded);
+        return {
+          bytes: encoded.length,
+          version: parsed.version,
+          consensusBytes: parsed.consensus.length,
+          microdescriptorBytes: parsed.microdescriptors.length,
+        };
+      }),
+
+    close: () =>
+      rethrowing(async () => {
+        await client().close();
+        return 'closed';
+      }),
+
+    // --- HTTP -------------------------------------------------------------
+    fetch: (url, options) =>
+      rethrowing(async () => {
+        const started = performance.now();
+        const response = await client().fetch(url, options);
+        const bytes = response.bytes();
+        let text = null;
+        try {
+          text = response.text();
+        } catch {
+          // A body that is not UTF-8 is still a valid response; the test that
+          // cares reads `byteLength` instead.
+        }
+        return {
+          status: response.status,
+          ok: response.ok,
+          headers: response.headers,
+          byteLength: bytes.length,
+          text,
+          seconds: Number(((performance.now() - started) / 1000).toFixed(1)),
+        };
+      }),
+
+    // --- WebSocket --------------------------------------------------------
+    wsOpen: (url, options) =>
+      rethrowing(async () => {
+        const started = performance.now();
+        const opened = await client().connectWebSocket(url, options);
+        const id = state.nextSocket++;
+        state.sockets.set(id, opened);
+        return {
+          id,
+          seconds: Number(((performance.now() - started) / 1000).toFixed(1)),
+        };
+      }),
+
+    wsSend: (id, text) =>
+      rethrowing(async () => {
+        await socket(id).send(text);
+        return 'sent';
+      }),
+
+    wsSendBinary: (id, bytes) =>
+      rethrowing(async () => {
+        await socket(id).sendBinary(new Uint8Array(bytes));
+        return 'sent';
+      }),
+
+    /** One message, as `{type, text}` / `{type, bytes}`, or `null` on close. */
+    wsReceive: (id) =>
+      rethrowing(async () => {
+        const message = await socket(id).receive();
+        if (message == null) return null;
+        return message.type === 'binary'
+          ? { type: 'binary', bytes: Array.from(message.bytes) }
+          : { type: 'text', text: message.text };
+      }),
+
+    /**
+     * Read until a message satisfies `pattern` (a JSON-encoded array whose
+     * first element is matched against the message's), or `limit` messages
+     * have gone by. Returns everything read.
+     */
+    wsReceiveUntil: (id, kinds, limit) =>
+      rethrowing(async () => {
+        const seen = [];
+        for (let count = 0; count < limit; count++) {
+          const message = await socket(id).receive();
+          if (message == null) return { closed: true, seen };
+          const text = message.type === 'text' ? message.text : null;
+          seen.push(text ?? `<${message.bytes.length} bytes>`);
+          if (text && kinds.some((kind) => text.startsWith(`["${kind}"`))) {
+            return { closed: false, matched: text, seen };
+          }
+        }
+        return { closed: false, seen };
+      }),
+
+    wsClose: (id) =>
+      rethrowing(async () => {
+        await socket(id).close();
+        state.sockets.delete(id);
+        return 'closed';
+      }),
+  };
+
+  show('harness ready');
+</script>

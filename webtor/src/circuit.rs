@@ -1,4 +1,4 @@
-//! Circuit construction for one anonymous signaling session.
+//! Circuit construction for one client session.
 //!
 //! Every circuit starts at the Snowflake bridge and passes through one middle
 //! relay before its final hop: an HSDir, a rendezvous point or an

@@ -1,11 +1,16 @@
 {
   "name": "webtor-rs-workspace",
   "private": true,
-  "version": "0.5.13",
+  "version": "0.5.14",
+  "type": "module",
   "scripts": {
-    "build": "wasm-pack build anonymous-signaling-wasm --release --target web --scope andrewtheguy"
+    "build": "wasm-pack build webtor-wasm --release --target web --scope andrewtheguy",
+    "test": "node --test tests/api.test.mjs",
+    "test:live": "node --test tests/live.test.mjs",
+    "seed": "node tests/tools/fetch-directory.mjs"
   },
   "devDependencies": {
+    "playwright-core": "^1.50.0",
     "wasm-pack": "^0.15.0"
   }
 }

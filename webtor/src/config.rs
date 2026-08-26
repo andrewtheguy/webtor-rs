@@ -1,4 +1,4 @@
-//! Configuration for the browser Tor signaling client.
+//! Configuration for the browser Tor client.
 
 use std::fmt;
 use std::sync::Arc;
@@ -23,7 +23,7 @@ const DIRECT_SNOWFLAKE_WS_URL: &str = "wss://snowflake.torproject.net/";
 /// Browser transport used to reach the Snowflake bridge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BridgeType {
-    /// Current production path through a volunteer Snowflake WebRTC proxy.
+    /// Through a volunteer Snowflake WebRTC proxy, brokered over HTTPS.
     SnowflakeWebRtc {
         broker_url: String,
         stun_urls: Vec<String>,
@@ -32,7 +32,8 @@ pub enum BridgeType {
     SnowflakeWebSocket { url: String },
 }
 
-/// Options intentionally limited to the two browser transports retained by pTransfer.
+/// Client options. The bridge choice is the only transport decision: a
+/// browser cannot open a raw socket to a guard, so entry is always Snowflake.
 #[derive(Debug, Clone)]
 pub struct TorClientOptions {
     pub bridge: BridgeType,
