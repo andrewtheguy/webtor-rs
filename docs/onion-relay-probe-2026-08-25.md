@@ -20,6 +20,34 @@ WebSocket upgrade succeeded, two `EVENT`s arrived, then `EOSE`.
 | `ws://7imqzy3ui3gpn4fdsvefaqjrs4zqvytm33h5jmcmzbfc2hmm4qhy2iad.onion` | 5.5 s |
 | `ws://ollw6hjffdzgwonwlj2tfzza3uvzwxqfk6vgnvtdyqgptp2ojuqnt5id.onion` | 12.5 s |
 
+## Writes (same day, `--publish`)
+
+Serving a `REQ` is not the bar signaling needs: pTransfer writes a kind-4243
+rendezvous (sender) and kind-24243 handshakes (both sides) under a key the
+relay has never seen. Each relay that answered above, plus the three that had
+merely timed out, was sent one freshly signed event of each kind and asked
+for the 4243 back by id.
+
+| Relay | 4243 | 24243 | 4243 served back |
+|---|---|---|---|
+| `ws://oxtrdevav64z64yb7x6rjg4ntzqjhedm5b5zjqulugknhzr46ny2qbad.onion` | accepted | accepted | yes |
+| `ws://gnostr2jnapk72mnagq3cuykfon73temzp77hcbncn4silgt77boruid.onion` | accepted | accepted | yes |
+| `ws://7imqzy3ui3gpn4fdsvefaqjrs4zqvytm33h5jmcmzbfc2hmm4qhy2iad.onion` | accepted | accepted | **no** — acknowledged and dropped |
+| `ws://nerostrrgb5fhj6dnzhjbgmnkpy2berdlczh6tuh2jsqrjok3j4zoxid.onion` | `blocked: you must pay admission fee` | same | — |
+| `ws://nostrwinemdptvqukjttinajfeedhf46hfd5bz2aj2q5uwp7zros3nad.onion` | `restricted: sign up at https://nostr.wine` | same | — |
+| `ws://35vr3xigzjv2xyzfyif6o2gksmkioppy4rmwag7d4bqmwuccs2u4jaid.onion` | `You are not whitelisted!` | same | — |
+| `ws://ollw6hjffdzgwonwlj2tfzza3uvzwxqfk6vgnvtdyqgptp2ojuqnt5id.onion` | `You ran out of time!` (metered) | same | — |
+| `ws://2jsnlhfnelig5acq6iacydmzdbdmg7xwunm4xl6qwbvzacw4lwrjmlyd.onion` | host unreachable (0x04) | | |
+| `ws://ghaven2hi3qn2riitw7ymaztdpztrvmm337e2pgkacfh3rnscaoxjoad.onion` | general failure (0x01) | | |
+| `ws://gp5kiwqfw7t2fwb3rfts2aekoph4x7pj5pv65re2y6hzaujsxewanbqd.onion` | general failure (0x01) | | |
+
+Only `oxtr` and `gnostr2` are usable for signaling, and pTransfer's
+`ANONYMOUS_SIGNALING_RELAYS` is exactly those two. The WASM client reached
+both from a seeded bootstrap (`scripts/onion-signaling-check/run.mjs`: EOSE
+in 5 s and 7 s). The first pool (`nerostr`, `oxtr`, `nostrwine`) was chosen
+on read results alone and left one writable relay, which is why a receiver
+whose `oxtr` rendezvous failed could not publish its claim anywhere.
+
 ## Failed (19/25)
 
 | Relay | Failure |
