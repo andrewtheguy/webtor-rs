@@ -44,26 +44,43 @@ fn log_tor_progress(message: &str, log_type: LogType) {
     }
 }
 
-async fn verify_onion_client(client: &TorClient) -> Result<(), JsValue> {
-    log_tor_progress(
-        "Verifying the onion client against the Tor Project onion site...",
-        LogType::Info,
-    );
+async fn fetch_onion_check_url(client: &TorClient) -> Result<u16, String> {
     let response = webtor::with_timeout(
         ONION_CHECK_TIMEOUT,
         "Onion client verification",
         client.get(ONION_CHECK_URL),
     )
     .await
-    .map_err(|error| js_error("Onion client verification request failed", error))?;
+    .map_err(|error| format!("request failed: {error}"))?;
     if !response.is_success() {
-        return Err(JsValue::from_str(&format!(
-            "Onion client verification returned HTTP {}",
-            response.status
-        )));
+        return Err(format!("answered HTTP {}", response.status));
     }
-    log_tor_progress("Onion client verified.", LogType::Success);
-    Ok(())
+    Ok(response.status)
+}
+
+async fn verify_onion_client(client: &TorClient) -> Result<(), JsValue> {
+    log_tor_progress(
+        &format!("Verifying the onion client against {ONION_CHECK_URL} ..."),
+        LogType::Info,
+    );
+    match fetch_onion_check_url(client).await {
+        Ok(status) => {
+            log_tor_progress(
+                &format!("Onion client verified: {ONION_CHECK_URL} answered HTTP {status}."),
+                LogType::Success,
+            );
+            Ok(())
+        }
+        Err(error) => {
+            // The rejected promise is the caller's to render, and a page that
+            // only watches the log channel would otherwise see the bootstrap
+            // stop mid-way with no verdict on the check it just announced.
+            let message =
+                format!("Onion client verification against {ONION_CHECK_URL} failed: {error}");
+            log_tor_progress(&message, LogType::Error);
+            Err(JsValue::from_str(&message))
+        }
+    }
 }
 
 fn signaling_client_options(stun_urls: Vec<String>, websocket_bridge: bool) -> TorClientOptions {
