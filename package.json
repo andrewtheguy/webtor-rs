@@ -1,7 +1,7 @@
 {
   "name": "webtor-rs-workspace",
   "private": true,
-  "version": "0.5.15",
+  "version": "0.0.1",
   "type": "module",
   "packageManager": "bun@1.4.0",
   "scripts": {
