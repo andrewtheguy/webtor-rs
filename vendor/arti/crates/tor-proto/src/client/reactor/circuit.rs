@@ -1,20 +1,20 @@
 //! Module exposing types for representing circuits in the tunnel reactor.
 
 pub(crate) mod circhop;
-pub(super) mod create;
 pub(super) mod extender;
 
 use crate::channel::Channel;
-use crate::circuit::UniqId;
 use crate::circuit::cell_sender::CircuitCellSender;
-use crate::circuit::celltypes::{ClientCircChanMsg, CreateResponse};
-use crate::circuit::circhop::HopSettings;
+use crate::circuit::celltypes::CreateResponse;
+use crate::circuit::circhop::{HopSettings, ReactorStreamComponents};
+use crate::circuit::create::{Create2Wrap, CreateFastWrap, CreateHandshakeWrap};
+use crate::circuit::padding::CircPaddingDisposition;
+use crate::circuit::{CircuitRxReceiver, UniqId};
 use crate::client::circuit::handshake::{BoxedClientLayer, HandshakeRole};
 use crate::client::circuit::padding::{
     self, PaddingController, PaddingEventStream, QueuedCellPaddingInfo,
 };
-use crate::client::circuit::{CircuitRxReceiver, MutableState};
-use crate::client::circuit::{TimeoutEstimator, path};
+use crate::client::circuit::{ClientCircChanMsg, MutableState, path};
 use crate::client::reactor::MetaCellDisposition;
 use crate::congestion::CongestionSignals;
 use crate::congestion::sendme;
@@ -28,16 +28,12 @@ use crate::crypto::handshake::ntor::{NtorClient, NtorPublicKey};
 use crate::crypto::handshake::ntor_v3::{NtorV3Client, NtorV3PublicKey};
 use crate::crypto::handshake::{ClientHandshake, KeyGenerator};
 use crate::memquota::{CircuitAccount, SpecificAccount as _, StreamAccount};
-use crate::stream::StreamMpscReceiver;
 use crate::stream::cmdcheck::{AnyCmdChecker, StreamStatus};
-use crate::stream::flow_ctrl::state::StreamRateLimit;
-use crate::stream::flow_ctrl::xon_xoff::reader::DrainRateRequest;
-use crate::stream::queue::{StreamQueueSender, stream_queue};
+use crate::stream::msg_streamid;
 use crate::streammap;
 use crate::tunnel::TunnelScopedCircId;
-use crate::util::err::ExcessPadding;
 use crate::util::err::ReactorError;
-use crate::util::notify::NotifySender;
+use crate::util::timeout::TimeoutEstimator;
 use crate::{ClockSkew, Error, Result};
 
 use tor_async_utils::{SinkTrySend as _, SinkTrySendError as _};
@@ -51,12 +47,10 @@ use tor_cell::relaycell::{
 use tor_error::{Bug, internal};
 use tor_linkspec::RelayIds;
 use tor_llcrypto::pk;
-use tor_memquota::mq_queue::{ChannelSpec as _, MpscSpec};
+use web_time_compat::{Duration, Instant, SystemTime};
 
 use futures::SinkExt as _;
 use oneshot_fused_workaround as oneshot;
-use postage::watch;
-use safelog::sensitive as sv;
 use tor_rtcompat::{DynTimeProvider, SleepProvider as _};
 use tracing::{debug, instrument, trace, warn};
 
@@ -70,16 +64,13 @@ use std::borrow::Borrow;
 use std::pin::Pin;
 use std::result::Result as StdResult;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-use tor_rtcompat::Instant;
 
-use create::{Create2Wrap, CreateFastWrap, CreateHandshakeWrap};
 use extender::HandshakeAuxDataHandler;
 
 #[cfg(feature = "hs-service")]
 use {
-    crate::circuit::CircSyncView,
-    crate::client::stream::{InboundDataCmdChecker, IncomingStreamRequest},
+    crate::circuit::CircHopSyncView,
+    crate::stream::{InboundDataCmdChecker, IncomingStreamRequest},
     tor_cell::relaycell::msg::Begin,
 };
 
@@ -89,18 +80,10 @@ use {
     crate::tunnel::TunnelId,
 };
 
-pub(super) use circhop::{CircHop, CircHopList};
+#[cfg(not(feature = "flowctl-cc"))]
+use crate::stream::STREAM_READER_BUFFER;
 
-/// Initial value for outbound flow-control window on streams.
-pub(crate) const SEND_WINDOW_INIT: u16 = 500;
-/// Initial value for inbound flow-control window on streams.
-pub(crate) const RECV_WINDOW_INIT: u16 = 500;
-/// Size of the buffer used between the reactor and a `StreamReader`.
-///
-/// FIXME(eta): We pick 2× the receive window, which is very conservative (we arguably shouldn't
-///             get sent more than the receive window anyway!). We might do due to things that
-///             don't count towards the window though.
-pub(crate) const STREAM_READER_BUFFER: usize = (2 * RECV_WINDOW_INIT) as usize;
+pub(super) use circhop::{CircHop, CircHopList};
 
 /// A circuit "leg" from a tunnel.
 ///
@@ -132,8 +115,8 @@ pub(crate) struct Circuit {
     /// Mutable information about this circuit,
     /// shared with the reactor's `ConfluxSet`.
     mutable: Arc<MutableState>,
-    /// This circuit's identifier on the upstream channel.
-    channel_id: CircId,
+    /// This circuit's identifier.
+    circ_id: CircId,
     /// An identifier for logging about this reactor's circuit.
     unique_id: TunnelScopedCircId,
     /// A handler for conflux cells.
@@ -150,7 +133,7 @@ pub(crate) struct Circuit {
     // SelectAll, but we can't really do that, since we need the ability to move them
     // from one conflux set to another, and a SelectAll doesn't let you actually
     // remove one of its constituent streams.  This issue might get solved along
-    // with the the rest of the next reactor refactoring.
+    // with the rest of the next reactor refactoring.
     pub(super) padding_event_stream: PaddingEventStream,
     /// Current rules for blocking traffic, according to the padding controller.
     #[cfg(feature = "circ-padding")]
@@ -237,7 +220,7 @@ impl Circuit {
     pub(super) fn new(
         runtime: DynTimeProvider,
         channel: Arc<Channel>,
-        channel_id: CircId,
+        circ_id: CircId,
         unique_id: TunnelScopedCircId,
         input: CircuitRxReceiver,
         memquota: CircuitAccount,
@@ -257,7 +240,7 @@ impl Circuit {
             crypto_in: InboundClientCrypt::new(),
             hops: CircHopList::default(),
             unique_id,
-            channel_id,
+            circ_id,
             crypto_out,
             mutable,
             #[cfg(feature = "conflux")]
@@ -274,6 +257,11 @@ impl Circuit {
     /// Return the process-unique identifier of this circuit.
     pub(super) fn unique_id(&self) -> UniqId {
         self.unique_id.unique_id()
+    }
+
+    /// Return this circuit's identifier.
+    pub(super) fn circ_id(&self) -> CircId {
+        self.circ_id
     }
 
     /// Return the shared mutable state of this circuit.
@@ -448,7 +436,12 @@ impl Circuit {
             return Err(internal!("tried to send cell on unlinked circuit").into());
         }
 
-        trace!(circ_id = %self.unique_id, cell = ?msg, "sending relay cell");
+        trace!(
+            circ_uniq_id = %self.unique_id,
+            forward_circ_id = %self.circ_id,
+            cell = ?msg,
+            "sending relay cell"
+        );
 
         // Cloned, because we borrow mutably from self when we get the circhop.
         let runtime = self.runtime.clone();
@@ -521,14 +514,20 @@ impl Circuit {
         leg: UniqId,
         cell: ClientCircChanMsg,
     ) -> Result<Vec<CircuitCmd>> {
-        trace!(circ_id = %self.unique_id, cell = ?cell, "handling cell");
+        trace!(
+            circ_uniq_id = %self.unique_id,
+            forward_circ_id = %self.circ_id,
+            cell = ?cell,
+            "handling cell"
+        );
         use ClientCircChanMsg::*;
         match cell {
             Relay(r) => self.handle_relay_cell(handlers, leg, r),
             Destroy(d) => {
                 let reason = d.reason();
                 debug!(
-                    circ_id = %self.unique_id,
+                    circ_uniq_id = %self.unique_id,
+                    forward_circ_id = %self.circ_id,
                     "Received DESTROY cell. Reason: {} [{}]",
                     reason.human_str(),
                     reason
@@ -749,7 +748,9 @@ impl Circuit {
                 if #[cfg(feature = "hs-service")] {
                     return self.handle_incoming_stream_request(handlers, msg, streamid, hopnum, leg);
                 } else {
-                    return Err(internal!("incoming stream not rejected, but hs-service feature is disabled?!").into());
+                    return Err(
+                        Error::CircProto(format!("Cannot handle {} cells on this circuit", msg.cmd())).into(),
+                    );
                 }
             }
         }
@@ -846,12 +847,11 @@ impl Circuit {
         hop_num: HopNum,
         leg: UniqId,
     ) -> Result<Option<CircuitCmd>> {
-        use super::syncview::ClientCircSyncView;
         use tor_cell::relaycell::msg::EndReason;
         use tor_error::into_internal;
         use tor_log_ratelim::log_ratelim;
 
-        use crate::client::{circuit::CIRCUIT_BUFFER_SIZE, reactor::StreamReqInfo};
+        use crate::stream::incoming::StreamReqInfo;
 
         // We need to construct this early so that we don't double-borrow &mut self
 
@@ -861,10 +861,15 @@ impl Circuit {
             ));
         };
 
-        if hop_num != handler.hop_num {
+        // The handler's hop_num is only ever set to None for relays.
+        let expected_hop_num = handler
+            .hop_num
+            .ok_or_else(|| internal!("Handler HopNum is None in client impl?!"))?;
+
+        if hop_num != expected_hop_num {
             return Err(Error::CircProto(format!(
                 "Expecting incoming streams from {}, but received {} cell from unexpected hop {}",
-                handler.hop_num.display(),
+                expected_hop_num.display(),
                 msg.cmd(),
                 hop_num.display()
             )));
@@ -895,15 +900,15 @@ impl Circuit {
         let req = IncomingStreamRequest::Begin(begin);
 
         {
-            use crate::client::stream::IncomingStreamRequestDisposition::*;
+            use crate::stream::IncomingStreamRequestDisposition::*;
 
-            let ctx = crate::client::stream::IncomingStreamRequestContext { request: &req };
-            // IMPORTANT: ClientCircSyncView::n_open_streams() (called via disposition() below)
+            let ctx = crate::stream::IncomingStreamRequestContext { request: &req };
+            // IMPORTANT: super::syncview::CircHopSyncView::n_open_streams() (called via disposition() below)
             // accesses the stream map mutexes!
             //
             // This means it's very important not to call this function while any of the hop's
             // stream map mutex is held.
-            let view = CircSyncView::new_client(ClientCircSyncView::new(&self.hops));
+            let view = CircHopSyncView::new(hop.outbound());
 
             match handler.filter.as_mut().disposition(&ctx, &view)? {
                 Accept => {}
@@ -927,44 +932,19 @@ impl Circuit {
 
         let memquota = StreamAccount::new(&self.memquota)?;
 
-        let (sender, receiver) = stream_queue(
-            #[cfg(not(feature = "flowctl-cc"))]
-            STREAM_READER_BUFFER,
-            &memquota,
-            self.chan_sender.time_provider(),
-        )?;
-
-        let (msg_tx, msg_rx) = MpscSpec::new(CIRCUIT_BUFFER_SIZE).new_mq(
-            self.chan_sender.time_provider().clone(),
-            memquota.as_raw_account(),
-        )?;
-
-        let (rate_limit_tx, rate_limit_rx) = watch::channel_with(StreamRateLimit::MAX);
-
-        // A channel for the reactor to request a new drain rate from the reader.
-        // Typically this notification will be sent after an XOFF is sent so that the reader can
-        // send us a new drain rate when the stream data queue becomes empty.
-        let mut drain_rate_request_tx = NotifySender::new_typed();
-        let drain_rate_request_rx = drain_rate_request_tx.subscribe();
-
         let cmd_checker = InboundDataCmdChecker::new_connected();
-        hop.add_ent_with_id(
-            sender,
-            msg_rx,
-            rate_limit_tx,
-            drain_rate_request_tx,
+        let stream_components = hop.add_ent_with_id(
+            self.chan_sender.time_provider(),
             stream_id,
             cmd_checker,
+            &memquota,
         )?;
 
         let outcome = Pin::new(&mut handler.incoming_sender).try_send(StreamReqInfo {
             req,
             stream_id,
-            hop: (leg, hop_num).into(),
-            msg_tx,
-            receiver,
-            rate_limit_stream: rate_limit_rx,
-            drain_rate_request_stream: drain_rate_request_rx,
+            hop: Some((leg, hop_num).into()),
+            stream_components,
             memquota,
             relay_cell_format,
         });
@@ -1000,7 +980,8 @@ impl Circuit {
                 // IncomingStreamRequestHandler, we need to do it elsewhere, in
                 // a different way.
                 debug!(
-                    circ_id = %self.unique_id,
+                    circ_uniq_id = %self.unique_id,
+                    forward_circ_id = %self.circ_id,
                     "Incoming stream request receiver dropped",
                 );
                 // This will _cause_ the circuit to get closed.
@@ -1079,15 +1060,11 @@ impl Circuit {
         // function consumes the PendingClientCirc and only returns
         // a ClientCirc on success.
 
-        let (state, msg) = {
-            // done like this because holding the RNG across an await boundary makes the future
-            // non-Send
-            let mut rng = rand::rng();
-            H::client1(&mut rng, key, msg)?
-        };
+        let (state, msg) = H::client1(&mut rand::rng(), key, msg)?;
         let create_cell = wrap.to_chanmsg(msg);
         trace!(
-            circ_id = %self.unique_id,
+            circ_uniq_id = %self.unique_id,
+            forward_circ_id = %self.circ_id,
             create = %create_cell.cmd(),
             "Extending to hop 1",
         );
@@ -1106,7 +1083,11 @@ impl Circuit {
             .relay_crypt_protocol()
             .construct_client_layers(HandshakeRole::Initiator, keygen)?;
 
-        trace!(circ_id = %self.unique_id, "Handshake complete; circuit created.");
+        trace!(
+            circ_uniq_id = %self.unique_id,
+            forward_circ_id = %self.circ_id,
+            "Handshake complete; circuit created."
+        );
 
         let peer_id = self.channel.target().clone();
 
@@ -1221,7 +1202,7 @@ impl Circuit {
 
         let hop_num = (hop_num as u8).into();
 
-        let hop = CircHop::new(self.unique_id, hop_num, settings);
+        let hop = CircHop::new(self.unique_id, self.circ_id, hop_num, settings);
         self.hops.push(hop);
         self.crypto_in.add_layer(rev);
         self.crypto_out.add_layer(fwd);
@@ -1245,7 +1226,6 @@ impl Circuit {
     /// The error is propagated all the way up to [`Circuit::handle_cell`],
     /// and eventually ends up being returned from the reactor's `run_once` function,
     /// causing it to shut down.
-    #[allow(clippy::cognitive_complexity)]
     fn handle_meta_cell(
         &mut self,
         handlers: &mut CellHandlers,
@@ -1279,7 +1259,8 @@ impl Circuit {
                 .into_msg();
             let reason = truncated.reason();
             debug!(
-                circ_id = %self.unique_id,
+                circ_uniq_id = %self.unique_id,
+                forward_circ_id = %self.circ_id,
                 "Truncated from hop {}. Reason: {} [{}]",
                 hopnum.display(),
                 reason.human_str(),
@@ -1294,12 +1275,18 @@ impl Circuit {
                 if #[cfg(feature = "circ-padding")] {
                     return Ok(None);
                 } else {
+                    use crate::util::err::ExcessPadding;
                     return Err(Error::ExcessPadding(ExcessPadding::NoPaddingNegotiated, hopnum));
                 }
             }
         }
 
-        trace!(circ_id = %self.unique_id, cell = ?msg, "Received meta-cell");
+        trace!(
+            circ_uniq_id = %self.unique_id,
+            forward_circ_id = %self.circ_id,
+            cell = ?msg,
+            "Received meta-cell"
+        );
 
         #[cfg(feature = "conflux")]
         if matches!(
@@ -1315,7 +1302,8 @@ impl Circuit {
 
         if self.is_conflux_pending() {
             warn!(
-                circ_id = %self.unique_id,
+                circ_uniq_id = %self.unique_id,
+                forward_circ_id = %self.circ_id,
                 "received unexpected cell {msg:?} on unlinked conflux circuit",
             );
             return Err(Error::CircProto(
@@ -1336,7 +1324,8 @@ impl Circuit {
                 // Somebody was waiting for a message -- maybe this message
                 let ret = handler.handle_msg(msg, self);
                 trace!(
-                    circ_id = %self.unique_id,
+                    circ_uniq_id = %self.unique_id,
+                    forward_circ_id = %self.circ_id,
                     result = ?ret,
                     "meta handler completed",
                 );
@@ -1412,7 +1401,7 @@ impl Circuit {
         msg: AnyChanMsg,
         info: Option<QueuedCellPaddingInfo>,
     ) -> Result<()> {
-        let cell = AnyChanCell::new(Some(self.channel_id), msg);
+        let cell = AnyChanCell::new(Some(self.circ_id), msg);
         // Note: this future is always `Ready`, so await won't block.
         Pin::new(&mut self.chan_sender)
             .send_unbounded((cell, info))
@@ -1442,27 +1431,19 @@ impl Circuit {
         &mut self,
         hop_num: HopNum,
         message: AnyRelayMsg,
-        sender: StreamQueueSender,
-        rx: StreamMpscReceiver<AnyRelayMsg>,
-        rate_limit_notifier: watch::Sender<StreamRateLimit>,
-        drain_rate_requester: NotifySender<DrainRateRequest>,
+        time_prov: &DynTimeProvider,
         cmd_checker: AnyCmdChecker,
-    ) -> StdResult<Result<(SendRelayCell, StreamId)>, Bug> {
+        memquota: &StreamAccount,
+    ) -> Result<(SendRelayCell, StreamId, ReactorStreamComponents)> {
         let Some(hop) = self.hop_mut(hop_num) else {
             return Err(internal!(
                 "{}: Attempting to send a BEGIN cell to an unknown hop {hop_num:?}",
                 self.unique_id,
-            ));
+            )
+            .into());
         };
 
-        Ok(hop.begin_stream(
-            message,
-            sender,
-            rx,
-            rate_limit_notifier,
-            drain_rate_requester,
-            cmd_checker,
-        ))
+        hop.begin_stream(message, time_prov, cmd_checker, memquota)
     }
 
     /// Close the specified stream
@@ -1603,60 +1584,11 @@ impl Circuit {
     /// we do not keep track of which hop is actually doing the blocking.
     #[cfg(feature = "circ-padding")]
     fn padding_disposition(&self, send_padding: &padding::SendPadding) -> CircPaddingDisposition {
-        use CircPaddingDisposition::*;
-        use padding::Bypass::*;
-        use padding::Replace::*;
-
-        // If true, and we are trying to send Replaceable padding,
-        // we should let any data in the queue count as the queued padding instead,
-        // if it is queued for our target hop (or any subsequent hop).
-        //
-        // TODO circpad: In addition to letting currently-queued data count as padding,
-        // maybenot also permits us to send currently pending data from our streams
-        // (or from our next hop, if we're a relay).  We don't have that implemented yet.
-        //
-        // TODO circpad: This will usually be false, since we try not to queue data
-        // when there isn't space to write it.  If we someday add internal per-circuit
-        // Buffers to chan_sender, this test is more likely to trigger.
-        let have_queued_cell_for_hop = self
-            .chan_sender
-            .have_queued_cell_for_hop_or_later(send_padding.hop);
-
-        match &self.padding_block {
-            Some(blocking) if blocking.is_bypassable => {
-                match (
-                    send_padding.may_replace_with_data(),
-                    send_padding.may_bypass_block(),
-                ) {
-                    (NotReplaceable, DoNotBypass) => QueuePaddingNormally,
-                    (NotReplaceable, BypassBlocking) => QueuePaddingAndBypass,
-                    (Replaceable, DoNotBypass) => {
-                        if have_queued_cell_for_hop {
-                            TreatQueuedCellAsPadding
-                        } else {
-                            QueuePaddingNormally
-                        }
-                    }
-                    (Replaceable, BypassBlocking) => {
-                        if have_queued_cell_for_hop {
-                            TreatQueuedCellAsPadding
-                        } else {
-                            QueuePaddingAndBypass
-                        }
-                    }
-                }
-            }
-            Some(_) | None => match send_padding.may_replace_with_data() {
-                Replaceable => {
-                    if have_queued_cell_for_hop {
-                        TreatQueuedCellAsPadding
-                    } else {
-                        QueuePaddingNormally
-                    }
-                }
-                NotReplaceable => QueuePaddingNormally,
-            },
-        }
+        crate::circuit::padding::padding_disposition(
+            send_padding,
+            &self.chan_sender,
+            self.padding_block.as_ref(),
+        )
     }
 
     /// Handle a request from our padding subsystem to send a padding packet.
@@ -1725,38 +1657,8 @@ impl Circuit {
     }
 }
 
-/// A possible way to handle a request to send padding.
-#[derive(Copy, Clone, Debug)]
-enum CircPaddingDisposition {
-    /// Enqueue the padding normally.
-    QueuePaddingNormally,
-    /// Enqueue the padding, and allow one cell of data on our outbound queue
-    /// to bypass the current block.
-    QueuePaddingAndBypass,
-    /// Do not take any actual padding action:
-    /// existing data on our outbound queue will count as padding.
-    TreatQueuedCellAsPadding,
-}
-
-/// Return the stream ID of `msg`, if it has one.
-///
-/// Returns `Ok(None)` if `msg` is a meta cell.
-fn msg_streamid(msg: &UnparsedRelayMsg) -> Result<Option<StreamId>> {
-    let cmd = msg.cmd();
-    let streamid = msg.stream_id();
-    if !cmd.accepts_streamid_val(streamid) {
-        return Err(Error::CircProto(format!(
-            "Invalid stream ID {} for relay command {}",
-            sv(StreamId::get_or_zero(streamid)),
-            msg.cmd()
-        )));
-    }
-
-    Ok(streamid)
-}
-
 impl Drop for Circuit {
     fn drop(&mut self) {
-        let _ = self.channel.close_circuit(self.channel_id);
+        let _ = self.channel.close_circuit(self.circ_id);
     }
 }

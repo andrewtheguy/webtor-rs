@@ -20,39 +20,29 @@
 pub(crate) mod circuit;
 mod conflux;
 mod control;
-pub(super) mod syncview;
 
-use crate::circuit::UniqId;
-use crate::circuit::celltypes::ClientCircChanMsg;
-use crate::circuit::circhop::SendRelayCell;
+use crate::circuit::circhop::{ReactorStreamComponents, SendRelayCell};
+use crate::circuit::{CircuitRxReceiver, UniqId};
+use crate::client::circuit::ClientCircChanMsg;
 use crate::client::circuit::padding::{PaddingController, PaddingEvent, PaddingEventStream};
-use crate::client::circuit::{CircuitRxReceiver, TimeoutEstimator};
-#[cfg(feature = "hs-service")]
-use crate::client::stream::{IncomingStreamRequest, IncomingStreamRequestFilter};
 use crate::client::{HopLocation, TargetHop};
 use crate::crypto::cell::HopNum;
 use crate::crypto::handshake::ntor_v3::NtorV3PublicKey;
-use crate::memquota::{CircuitAccount, StreamAccount};
-use crate::stream::cmdcheck::AnyCmdChecker;
-use crate::stream::flow_ctrl::state::StreamRateLimit;
-use crate::stream::flow_ctrl::xon_xoff::reader::DrainRateRequest;
-use crate::stream::queue::StreamQueueReceiver;
-use crate::stream::{CloseStreamBehavior, StreamMpscSender};
+use crate::memquota::CircuitAccount;
+use crate::stream::CloseStreamBehavior;
 use crate::streammap;
 use crate::tunnel::{TunnelId, TunnelScopedCircId};
 use crate::util::err::ReactorError;
-use crate::util::notify::NotifyReceiver;
 use crate::util::skew::ClockSkew;
+use crate::util::timeout::TimeoutEstimator;
 use crate::{Error, Result};
 use circuit::Circuit;
 use conflux::ConfluxSet;
 use control::ControlHandler;
-use postage::watch;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::mem::size_of;
-use tor_cell::relaycell::flow_ctrl::XonKbpsEwma;
-use tor_cell::relaycell::msg::{AnyRelayMsg, Sendme};
+use tor_cell::relaycell::flow_ctrl::XonKBpsEwma;
+use tor_cell::relaycell::msg::Sendme;
 use tor_cell::relaycell::{AnyRelayMsgOuter, RelayCellFormat, StreamId, UnparsedRelayMsg};
 use tor_error::{Bug, bad_api_usage, debug_report, internal, into_bad_api_usage};
 use tor_rtcompat::{DynTimeProvider, SleepProvider};
@@ -71,16 +61,17 @@ use crate::channel::Channel;
 use crate::conflux::msghandler::RemoveLegReason;
 use crate::crypto::handshake::ntor::{NtorClient, NtorPublicKey};
 use circuit::CircuitCmd;
-use derive_deftly::Deftly;
 use derive_more::From;
 use smallvec::smallvec;
 use tor_cell::chancell::CircId;
 use tor_llcrypto::pk;
-use tor_memquota::derive_deftly_template_HasMemoryCost;
-use tor_memquota::mq_queue::{self, MpscSpec};
 use tracing::{debug, info, instrument, trace, warn};
 
 use super::circuit::{MutableState, TunnelMutableState};
+use crate::circuit::reactor::ReactorResultChannel;
+
+#[cfg(feature = "hs-service")]
+use crate::stream::incoming::IncomingStreamRequestHandler;
 
 #[cfg(feature = "conflux")]
 use {
@@ -89,9 +80,6 @@ use {
 };
 
 pub(super) use control::{CtrlCmd, CtrlMsg, FlowCtrlMsg};
-
-/// The type of a oneshot channel used to inform reactor of the result of an operation.
-pub(super) type ReactorResultChannel<T> = oneshot::Sender<Result<T>>;
 
 /// Contains a list of conflux handshake results.
 #[cfg(feature = "conflux")]
@@ -104,12 +92,6 @@ pub(super) type ConfluxHandshakeResult = Vec<StdResult<(), ConfluxHandshakeError
 /// to link in the tunnel.
 #[cfg(feature = "conflux")]
 pub(super) type ConfluxLinkResultChannel = ReactorResultChannel<ConfluxHandshakeResult>;
-
-pub(crate) use circuit::{RECV_WINDOW_INIT, STREAM_READER_BUFFER};
-
-/// MPSC queue containing stream requests
-#[cfg(feature = "hs-service")]
-type StreamReqSender = mq_queue::Sender<StreamReqInfo, MpscSpec>;
 
 /// A handshake type, to be used when creating circuit hops.
 #[derive(Clone, Debug)]
@@ -131,7 +113,7 @@ pub(crate) enum CircuitHandshake {
     },
 }
 
-// TODO: the RunOnceCmd/RunOnceCmdInner/CircuitCmd/CircuitAction enum
+// TODO: the RunOnceCmd/RunOnceCmdInner/CircuitCmd/CircuitEvent enum
 // proliferation is a bit bothersome, but unavoidable with the current design.
 //
 // We should consider getting rid of some of these enums (if possible),
@@ -199,20 +181,29 @@ enum RunOnceCmdInner {
     /// Uses the provided stream ID, and sends the provided message to that hop.
     BeginStream {
         /// The cell to send.
-        cell: Result<(SendRelayCell, StreamId)>,
+        cell: SendRelayCell,
+        /// The ID of the stream to return on the oneshot channel.
+        stream_id: StreamId,
         /// The location of the hop on the tunnel. We don't use this (and `Circuit`s shouldn't need
         /// to worry about legs anyways), but need it so that we can pass it back in `done` to the
         /// caller.
         hop: HopLocation,
         /// The circuit leg to begin the stream on.
         leg: UniqId,
+        /// Components that are needed to interact with the new stream.
+        stream_components: ReactorStreamComponents,
         /// Oneshot channel to notify on completion, with the allocated stream ID.
-        done: ReactorResultChannel<(StreamId, HopLocation, RelayCellFormat)>,
+        done: ReactorResultChannel<(
+            StreamId,
+            HopLocation,
+            RelayCellFormat,
+            ReactorStreamComponents,
+        )>,
     },
     /// Consider sending an XON message with the given `rate`.
     MaybeSendXon {
         /// The drain rate to advertise in the XON message.
-        rate: XonKbpsEwma,
+        rate: XonKBpsEwma,
         /// The ID of the stream to send the message on.
         stream_id: StreamId,
         /// The location of the hop on the tunnel.
@@ -285,13 +276,13 @@ enum RunOnceCmdInner {
         /// The out-of-order message.
         msg: OooRelayMsg,
     },
-    /// Take a padding-related action on a circuit leg.
+    /// Take a padding-related event on a circuit leg.
     #[cfg(feature = "circ-padding")]
     PaddingAction {
-        /// The leg to action on.
+        /// The leg to event on.
         leg: UniqId,
-        /// The action to take.
-        padding_action: PaddingEvent,
+        /// The event to take.
+        padding_event: PaddingEvent,
     },
     /// Perform a clean shutdown on this circuit.
     CleanShutdown,
@@ -340,7 +331,7 @@ impl RunOnceCmdInner {
 /// A command to execute at the end of [`Reactor::run_once`].
 #[derive(From, Debug)]
 #[allow(clippy::large_enum_variant)] // TODO #2003: should we resolve this?
-enum CircuitAction {
+enum CircuitEvent {
     /// Run a single `CircuitCmd` command.
     RunCmd {
         /// The unique identifier of the circuit leg to run the command on
@@ -359,11 +350,11 @@ enum CircuitAction {
     },
     /// Remove the specified circuit leg from the conflux set.
     ///
-    /// Returned whenever a single circuit leg needs to be be removed
+    /// Returned whenever a single circuit leg needs to be removed
     /// from the reactor's conflux set, without necessarily tearing down
     /// the whole set or shutting down the reactor.
     ///
-    /// Note: this action *can* cause the reactor to shut down
+    /// Note: this event *can* cause the reactor to shut down
     /// (and the conflux set to be closed).
     ///
     /// See the [`ConfluxSet::remove`] docs for more on the exact behavior of this command.
@@ -380,31 +371,40 @@ enum CircuitAction {
         /// handshake to indicate the reason the handshake failed.
         reason: RemoveLegReason,
     },
-    /// Take some action (blocking or unblocking a circuit, or sending padding)
+    /// Take some event (blocking or unblocking a circuit, or sending padding)
     /// based on the circuit padding backend code.
     PaddingAction {
-        /// The leg on which to take the padding action.
+        /// The leg on which to take the padding event .
         leg: UniqId,
-        /// The action to take.
-        padding_action: PaddingEvent,
+        /// The event to take.
+        padding_event: PaddingEvent,
+    },
+    /// Protocol violation. This leads for now to the close of the circuit reactor. The
+    /// error causing the violation is set in err.
+    ProtoViolation {
+        /// The error that causes this protocol violation.
+        err: crate::Error,
     },
 }
 
-impl CircuitAction {
-    /// Return the ordering with which we should handle this action
-    /// within a list of actions returned by a single call to next_circ_action().
+impl CircuitEvent {
+    /// Return the ordering with which we should handle this event
+    /// within a list of events returned by a single call to next_circ_event().
     ///
     /// NOTE: Please do not make this any more complicated:
     /// It is a consequence of a kludge that we need this sorting at all.
     /// Assuming that eventually, we switch away from the current
-    /// poll-oriented `next_circ_action` design,
+    /// poll-oriented `next_circ_event` design,
     /// we may be able to get rid of this entirely.
     fn order_within_batch(&self) -> u8 {
-        use CircuitAction as CA;
+        use CircuitEvent as CA;
         use PaddingEvent as PE;
-        const EARLY: u8 = 0;
-        const NORMAL: u8 = 1;
-        const LATE: u8 = 2;
+        // This immediate state MUST NOT be used for events emitting cells. At the moment, it is
+        // only used by the protocol violation event which leads to a shutdown of the reactor.
+        const IMMEDIATE: u8 = 0;
+        const EARLY: u8 = 1;
+        const NORMAL: u8 = 2;
+        const LATE: u8 = 3;
 
         // We use this ordering to move any "StartBlocking" to the _end_ of a batch and
         // "StopBlocking" to the start.
@@ -420,13 +420,14 @@ impl CircuitAction {
             CA::HandleCell { .. } => NORMAL,
             CA::RemoveLeg { .. } => NORMAL,
             #[cfg(feature = "circ-padding")]
-            CA::PaddingAction { padding_action, .. } => match padding_action {
+            CA::PaddingAction { padding_event, .. } => match padding_event {
                 PE::StopBlocking => EARLY,
                 PE::SendPadding(..) => NORMAL,
                 PE::StartBlocking(..) => LATE,
             },
             #[cfg(not(feature = "circ-padding"))]
             CA::PaddingAction { .. } => NORMAL,
+            CA::ProtoViolation { .. } => IMMEDIATE,
         }
     }
 }
@@ -458,7 +459,7 @@ pub(crate) trait MetaCellHandler: Send {
 }
 
 /// A possible successful outcome of giving a message to a [`MsgHandler`](super::msghandler::MsgHandler).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "send-control-msg", visibility::make(pub))]
 #[non_exhaustive]
 pub(crate) enum MetaCellDisposition {
@@ -625,63 +626,6 @@ struct CellHandlers {
     incoming_stream_req_handler: Option<IncomingStreamRequestHandler>,
 }
 
-/// Information about an incoming stream request.
-#[cfg(feature = "hs-service")]
-#[derive(Debug, Deftly)]
-#[derive_deftly(HasMemoryCost)]
-pub(crate) struct StreamReqInfo {
-    /// The [`IncomingStreamRequest`].
-    pub(crate) req: IncomingStreamRequest,
-    /// The ID of the stream being requested.
-    pub(crate) stream_id: StreamId,
-    /// The [`HopNum`].
-    //
-    // TODO: When we add support for exit relays, we need to turn this into an Option<HopNum>.
-    // (For outbound messages (towards relays), there is only one hop that can send them: the client.)
-    //
-    // TODO: For onion services, we might be able to enforce the HopNum earlier: we would never accept an
-    // incoming stream request from two separate hops.  (There is only one that's valid.)
-    pub(crate) hop: HopLocation,
-    /// The format which must be used with this stream to encode messages.
-    #[deftly(has_memory_cost(indirect_size = "0"))]
-    pub(crate) relay_cell_format: RelayCellFormat,
-    /// A channel for receiving messages from this stream.
-    #[deftly(has_memory_cost(indirect_size = "0"))] // estimate
-    pub(crate) receiver: StreamQueueReceiver,
-    /// A channel for sending messages to be sent on this stream.
-    #[deftly(has_memory_cost(indirect_size = "size_of::<AnyRelayMsg>()"))] // estimate
-    pub(crate) msg_tx: StreamMpscSender<AnyRelayMsg>,
-    /// A [`Stream`](futures::Stream) that provides updates to the rate limit for sending data.
-    // TODO(arti#2068): we should consider making this an `Option`
-    // the `watch::Sender` owns the indirect data
-    #[deftly(has_memory_cost(indirect_size = "0"))]
-    pub(crate) rate_limit_stream: watch::Receiver<StreamRateLimit>,
-    /// A [`Stream`](futures::Stream) that provides notifications when a new drain rate is
-    /// requested.
-    #[deftly(has_memory_cost(indirect_size = "0"))]
-    pub(crate) drain_rate_request_stream: NotifyReceiver<DrainRateRequest>,
-    /// The memory quota account to be used for this stream
-    #[deftly(has_memory_cost(indirect_size = "0"))] // estimate (it contains an Arc)
-    pub(crate) memquota: StreamAccount,
-}
-
-/// Data required for handling an incoming stream request.
-#[cfg(feature = "hs-service")]
-#[derive(educe::Educe)]
-#[educe(Debug)]
-struct IncomingStreamRequestHandler {
-    /// A sender for sharing information about an incoming stream request.
-    incoming_sender: StreamReqSender,
-    /// A [`AnyCmdChecker`] for validating incoming stream requests.
-    cmd_checker: AnyCmdChecker,
-    /// The hop to expect incoming stream requests from.
-    hop_num: HopNum,
-    /// An [`IncomingStreamRequestFilter`] for checking whether the user wants
-    /// this request, or wants to reject it immediately.
-    #[educe(Debug(ignore))]
-    filter: Box<dyn IncomingStreamRequestFilter>,
-}
-
 impl Reactor {
     /// Create a new circuit reactor.
     ///
@@ -693,7 +637,7 @@ impl Reactor {
     #[allow(clippy::type_complexity, clippy::too_many_arguments)] // TODO
     pub(super) fn new(
         channel: Arc<Channel>,
-        channel_id: CircId,
+        circ_id: CircId,
         unique_id: UniqId,
         input: CircuitRxReceiver,
         runtime: DynTimeProvider,
@@ -725,7 +669,7 @@ impl Reactor {
         let circuit_leg = Circuit::new(
             runtime.clone(),
             channel,
-            channel_id,
+            circ_id,
             unique_id,
             input,
             memquota,
@@ -818,7 +762,7 @@ impl Reactor {
         #[cfg(feature = "conflux")]
         self.try_dequeue_ooo_msgs().await?;
 
-        let mut actions = select_biased! {
+        let mut events = select_biased! {
             res = self.command.next() => {
                 let cmd = unwrap_or_shutdown!(self, res, "command channel drop")?;
                 return ControlHandler::new(self).handle_cmd(cmd);
@@ -833,26 +777,26 @@ impl Reactor {
             // circuit is ready for sending.
             ret = self.control.next() => {
                 let msg = unwrap_or_shutdown!(self, ret, "control drop")?;
-                smallvec![CircuitAction::HandleControl(msg)]
+                smallvec![CircuitEvent::HandleControl(msg)]
             },
-            res = self.circuits.next_circ_action(&self.runtime).fuse() => res?,
+            res = self.circuits.next_circ_event(&self.runtime).fuse() => res?,
         };
 
-        // Put the actions into the order that we need to execute them in.
+        // Put the events into the order that we need to execute them in.
         //
-        // (Yes, this _does_ have to be a stable sort.  Not all actions may be freely re-ordered
+        // (Yes, this _does_ have to be a stable sort.  Not all events may be freely re-ordered
         // with respect to one another.)
-        actions.sort_by_key(|a| a.order_within_batch());
+        events.sort_by_key(|a| a.order_within_batch());
 
-        for action in actions {
-            let cmd = match action {
-                CircuitAction::RunCmd { leg, cmd } => Some(RunOnceCmd::Single(
+        for event in events {
+            let cmd = match event {
+                CircuitEvent::RunCmd { leg, cmd } => Some(RunOnceCmd::Single(
                     RunOnceCmdInner::from_circuit_cmd(leg, cmd),
                 )),
-                CircuitAction::HandleControl(ctrl) => ControlHandler::new(self)
+                CircuitEvent::HandleControl(ctrl) => ControlHandler::new(self)
                     .handle_msg(ctrl)?
                     .map(RunOnceCmd::Single),
-                CircuitAction::HandleCell { leg, cell } => {
+                CircuitEvent::HandleCell { leg, cell } => {
                     let circ = self
                         .circuits
                         .leg_mut(leg)
@@ -875,22 +819,22 @@ impl Reactor {
                         Some(cmd)
                     }
                 }
-                CircuitAction::RemoveLeg { leg, reason } => {
+                CircuitEvent::RemoveLeg { leg, reason } => {
                     Some(RunOnceCmdInner::RemoveLeg { leg, reason }.into())
                 }
-                CircuitAction::PaddingAction {
-                    leg,
-                    padding_action,
-                } => {
+                CircuitEvent::PaddingAction { leg, padding_event } => {
                     cfg_if! {
                         if #[cfg(feature = "circ-padding")] {
-                            Some(RunOnceCmdInner::PaddingAction { leg, padding_action }.into())
+                            Some(RunOnceCmdInner::PaddingAction { leg, padding_event }.into())
                         } else {
-                            // If padding isn't enabled, we never generate a padding action,
+                            // If padding isn't enabled, we never generate a padding event,
                             // so we can be sure this case will never be called.
-                            void::unreachable(padding_action.0);
+                            void::unreachable(padding_event.0);
                         }
                     }
+                }
+                CircuitEvent::ProtoViolation { err } => {
+                    return Err(err.into());
                 }
             };
 
@@ -1005,33 +949,30 @@ impl Reactor {
             RunOnceCmdInner::BeginStream {
                 leg,
                 cell,
+                stream_id,
                 hop,
+                stream_components,
                 done,
             } => {
-                match cell {
-                    Ok((cell, stream_id)) => {
-                        let circ = self
-                            .circuits
-                            .leg_mut(leg)
-                            .ok_or_else(|| internal!("leg disappeared?!"))?;
-                        let cell_hop = cell.hop.expect("missing hop in client SendRelayCell?!");
-                        let relay_format = circ
-                            .hop_mut(cell_hop)
-                            // TODO: Is this the right error type here? Or should there be a "HopDisappeared"?
-                            .ok_or(Error::NoSuchHop)?
-                            .relay_cell_format();
+                let circ = self
+                    .circuits
+                    .leg_mut(leg)
+                    .ok_or_else(|| internal!("leg disappeared?!"))?;
+                let cell_hop = cell.hop.expect("missing hop in client SendRelayCell?!");
+                let relay_format = circ
+                    .hop_mut(cell_hop)
+                    // TODO: Is this the right error type here? Or should there be a "HopDisappeared"?
+                    .ok_or(Error::NoSuchHop)?
+                    .relay_cell_format();
 
-                        let outcome = self.circuits.send_relay_cell_on_leg(cell, Some(leg)).await;
-                        // don't care if receiver goes away.
-                        let _ = done.send(outcome.clone().map(|_| (stream_id, hop, relay_format)));
-                        outcome?;
-                    }
-                    Err(e) => {
-                        // don't care if receiver goes away.
-                        let _ = done.send(Err(e.clone()));
-                        return Err(e.into());
-                    }
-                }
+                let outcome = self.circuits.send_relay_cell_on_leg(cell, Some(leg)).await;
+                // don't care if receiver goes away.
+                let _ = done.send(
+                    outcome
+                        .clone()
+                        .map(|_| (stream_id, hop, relay_format, stream_components)),
+                );
+                outcome?;
             }
             RunOnceCmdInner::CloseStream {
                 hop,
@@ -1175,7 +1116,7 @@ impl Reactor {
                 return Err(ReactorError::Shutdown);
             }
             RunOnceCmdInner::RemoveLeg { leg, reason } => {
-                warn!(tunnel_id = %self.tunnel_id, reason = %reason, "removing circuit leg");
+                debug!(tunnel_id = %self.tunnel_id, reason = %reason, "removing circuit leg");
 
                 let circ = self.circuits.remove(leg)?;
                 let is_conflux_pending = circ.is_conflux_pending();
@@ -1245,15 +1186,10 @@ impl Reactor {
                 self.ooo_msgs.push(entry);
             }
             #[cfg(feature = "circ-padding")]
-            RunOnceCmdInner::PaddingAction {
-                leg,
-                padding_action,
-            } => {
+            RunOnceCmdInner::PaddingAction { leg, padding_event } => {
                 // TODO: If we someday move back to having a per-circuit reactor,
-                // this action would logically belong there, not on the tunnel reactor.
-                self.circuits
-                    .run_padding_action(leg, padding_action)
-                    .await?;
+                // this event would logically belong there, not on the tunnel reactor.
+                self.circuits.run_padding_event(leg, padding_event).await?;
             }
         }
 

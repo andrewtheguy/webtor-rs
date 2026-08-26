@@ -88,6 +88,7 @@ mod test {
     #![allow(clippy::unchecked_time_subtraction)]
     #![allow(clippy::useless_vec)]
     #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
     use super::*;
 
@@ -151,12 +152,6 @@ mod test {
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             self.poll_count += 1;
 
-            // TODO MSRV 1.87: Remove this allow.
-            #[allow(
-                clippy::comparison_chain,
-                reason = "This is more readable than a match, and the lint is
-                moved to clippy::pedantic in 1.87."
-            )]
             if self.poll_count == self.resolve_after {
                 Poll::Ready(self.resolve_after)
             } else if self.poll_count > self.resolve_after {

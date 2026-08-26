@@ -2,8 +2,7 @@
 
 use derive_deftly::Deftly;
 use std::num::NonZeroUsize;
-// Use web_time::Instant for WASM compatibility (re-exports std::time::Instant on non-WASM)
-use web_time::Instant;
+use web_time_compat::{Instant, InstantExt};
 
 /// An object to track whether a tunnel or circuit should still be considered active.
 ///
@@ -44,7 +43,7 @@ pub(crate) struct TunnelActivity {
 ///
 /// This is a separate type to keep it private.
 //
-// NOTE: Don't re-order these: we rely on the speicific behavior of
+// NOTE: Don't re-order these: we rely on the specific behavior of
 // derive(PartialOrd) in order to get the behavior we want.
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 enum Inner {
@@ -134,7 +133,7 @@ impl TunnelActivity {
             *n_open_streams = new_value;
         } else {
             self.inner = Inner::Disused {
-                since: Instant::now(),
+                since: Instant::get(),
             };
         }
     }
@@ -156,7 +155,7 @@ impl TunnelActivity {
     ///
     /// # A note about time
     ///
-    /// The returned Instant value is a direct result of an earlier call to `Instant::now()`.
+    /// The returned Instant value is a direct result of an earlier call to `Instant::get()`.
     /// It is not affected by any runtime mocking.
     pub(crate) fn disused_since(&self) -> Option<Instant> {
         match self.inner {
@@ -180,6 +179,7 @@ mod test {
     #![allow(clippy::unchecked_time_subtraction)]
     #![allow(clippy::useless_vec)]
     #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
 
     use std::time::Duration;
@@ -191,7 +191,7 @@ mod test {
     #[test]
     fn ordering() {
         use Inner::*;
-        let t1 = Instant::now();
+        let t1 = Instant::get();
         let t2 = t1 + Duration::new(60, 0);
         let t3 = t2 + Duration::new(120, 0);
         let sorted = vec![

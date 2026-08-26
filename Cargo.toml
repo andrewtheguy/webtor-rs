@@ -6,7 +6,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.5.12"
+version = "0.5.13"
 edition = "2021"
 authors = ["Webtor Contributors"]
 license = "MIT"
@@ -51,19 +51,20 @@ futures = "0.3"
 # Debug and trace strings are compiled out of release builds.
 tracing = { version = "0.1", features = ["release_max_level_info"] }
 
-# Tor-related dependencies (Arti 1.8.0)
-tor-rtcompat = { version = "0.37.0", default-features = false }
-tor-proto = { version = "0.37.0", default-features = false, features = ["hs-client", "send-control-msg"] }
-tor-netdoc = { version = "0.37.0", default-features = false, features = ["hs-client"] }
-tor-linkspec = { version = "0.37.0", features = ["decode", "verbatim"] }
-tor-cell = { version = "0.37.0", features = ["hs"] }
-tor-hscrypto = "0.37.0"
-tor-checkable = "0.37.0"
-tor-bytes = "0.37.0"
-tor-llcrypto = "0.37.0"
-tor-memquota = { version = "0.37.0", default-features = false }
-tor-protover = "0.37.0"
-tor-units = "0.37.0"
+# Tor-related dependencies (Arti 2.5.1)
+tor-rtcompat = { version = "0.45.0", default-features = false }
+tor-proto = { version = "0.45.0", default-features = false, features = ["hs-client", "send-control-msg"] }
+tor-netdoc = { version = "0.45.0", default-features = false, features = ["hs-client"] }
+tor-linkspec = { version = "0.45.0", features = ["decode", "verbatim"] }
+tor-cell = { version = "0.45.0", features = ["hs"] }
+tor-hscrypto = "0.45.0"
+tor-checkable = "0.45.0"
+tor-bytes = "0.45.0"
+tor-llcrypto = "0.45.0"
+tor-memquota = { version = "0.45.0", default-features = false }
+tor-protover = "0.45.0"
+tor-units = "0.45.0"
+safelog = "0.9.0"
 
 # Cryptography
 hex = "0.4"
@@ -76,13 +77,7 @@ gloo-timers = { version = "0.3", features = ["futures"] }
 kcp = "0.6"
 
 [patch.crates-io]
-tor-basic-utils = { path = "vendor/arti/crates/tor-basic-utils" }
 tor-proto = { path = "vendor/arti/crates/tor-proto" }
-tor-rtcompat = { path = "vendor/arti/crates/tor-rtcompat" }
-tor-memquota = { path = "vendor/arti/crates/tor-memquota" }
-tor-log-ratelim = { path = "vendor/arti/crates/tor-log-ratelim" }
-tor-linkspec = { path = "vendor/arti/crates/tor-linkspec" }
-tor-hscrypto = { path = "vendor/arti/crates/tor-hscrypto" }
 
 # Release profile optimized for WASM bundle size
 [profile.release]

@@ -7,7 +7,7 @@
 use super::{
     CongestionControlAlgorithm, CongestionSignals, CongestionWindow, State,
     params::{Algorithm, VegasParams},
-    rtt::RoundtripTimeEstimator,
+    rtt::{ClockStall, RoundtripTimeEstimator},
 };
 use crate::Result;
 
@@ -130,7 +130,7 @@ impl CongestionControlAlgorithm for Vegas {
     fn is_next_cell_sendme(&self) -> bool {
         // Matching inflight number to the SENDME increment, time to send a SENDME. Contrary to
         // C-tor, this is called after num_inflight is incremented.
-        self.num_inflight % self.cwnd.sendme_inc() == 0
+        self.num_inflight.is_multiple_of(self.cwnd.sendme_inc())
     }
 
     fn can_send(&self) -> bool {
@@ -156,7 +156,15 @@ impl CongestionControlAlgorithm for Vegas {
         state: &mut State,
         rtt: &mut RoundtripTimeEstimator,
         signals: CongestionSignals,
+        clock_stall: ClockStall,
     ) -> Result<()> {
+        // Do not update anything if we detected a clock stall or jump, as per [CLOCK_HEURISTICS].
+        if clock_stall == ClockStall::Detected {
+            // Update the inflight now that we have a SENDME and return early.
+            self.num_inflight = self.num_inflight.saturating_sub(self.cwnd.sendme_inc());
+            return Ok(());
+        }
+
         // Update the countdown until we need to update the congestion window.
         self.num_sendme_until_cwnd_update = self.num_sendme_until_cwnd_update.saturating_sub(1);
         // We just got a SENDME so decrement the amount of expected SENDMEs for a cwnd.
@@ -341,13 +349,12 @@ pub(crate) mod test {
     #![allow(clippy::unchecked_time_subtraction)]
     #![allow(clippy::useless_vec)]
     #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
 
-    use std::{
-        collections::VecDeque,
-        time::{Duration, Instant},
-    };
+    use std::collections::VecDeque;
     use tor_units::Percentage;
+    use web_time_compat::{Duration, Instant, InstantExt};
 
     use super::*;
     use crate::congestion::{
@@ -433,7 +440,7 @@ pub(crate) mod test {
             self.vegas.set_inflight(p.inflight_in);
             self.vegas.set_is_blocked_on_chan(p.or_conn_blocked_in);
 
-            let now = Instant::now();
+            let now = Instant::get();
             self.rtt
                 .expect_sendme(now + Duration::from_micros(p.sent_usec_in));
             let ret = self.rtt.update(
@@ -444,9 +451,10 @@ pub(crate) mod test {
             assert!(ret.is_ok());
 
             let signals = CongestionSignals::new(p.or_conn_blocked_in, 0);
-            let ret = self
-                .vegas
-                .sendme_received(&mut self.state, &mut self.rtt, signals);
+            let clock_stall = ClockStall::NotDetected;
+            let ret =
+                self.vegas
+                    .sendme_received(&mut self.state, &mut self.rtt, signals, clock_stall);
             assert!(ret.is_ok());
 
             assert_eq!(self.rtt.ewma_rtt_usec().unwrap(), p.ewma_rtt_usec_out);

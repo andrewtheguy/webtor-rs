@@ -11,6 +11,7 @@ use crate::handshake::{
 };
 use crate::record::RecordLayer;
 use futures::io::{AsyncRead, AsyncWrite};
+use std::borrow::Cow;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -735,8 +736,12 @@ impl<S> tor_rtcompat::CertifiedConn for TlsStream<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    fn peer_certificate(&self) -> io::Result<Option<Vec<u8>>> {
-        Ok(self.peer_certificate.clone())
+    fn peer_certificate(&self) -> io::Result<Option<Cow<'_, [u8]>>> {
+        Ok(self.peer_certificate.as_deref().map(Cow::Borrowed))
+    }
+
+    fn own_certificate(&self) -> io::Result<Option<Cow<'_, [u8]>>> {
+        Ok(None)
     }
 
     fn export_keying_material(

@@ -154,7 +154,7 @@ impl HsNtorClientState {
     /// INTRODUCE1 bodies that can be sent to an introduction point.
     pub fn new<R>(rng: &mut R, service_info: HsNtorServiceInfo) -> Self
     where
-        R: rand::RngCore + rand::CryptoRng,
+        R: rand::Rng + rand::CryptoRng,
     {
         let x = curve25519::StaticSecret::random_from_rng(rng);
         Self::new_no_keygen(service_info, x)
@@ -282,7 +282,7 @@ fn encrypt_and_mac(
     let mut ciphertext = plaintext.to_vec();
     // Encrypt the introduction data using 'enc_key'
     let zero_iv = Default::default();
-    let mut cipher = Aes256Ctr::new(enc_key.as_ref().into(), &zero_iv);
+    let mut cipher = Aes256Ctr::new((&**enc_key).into(), &zero_iv);
     cipher.apply_keystream(&mut ciphertext);
 
     // Now staple the other INTRODUCE1 data right before the ciphertext to
@@ -318,7 +318,7 @@ pub fn server_receive_intro<R>(
     msg: &[u8],
 ) -> Result<(HsNtorHkdfKeyGenerator, Vec<u8>, Vec<u8>)>
 where
-    R: rand::RngCore + rand::CryptoRng,
+    R: rand::Rng + rand::CryptoRng,
 {
     let y = curve25519::StaticSecret::random_from_rng(rng);
     server_receive_intro_no_keygen(&y, k_hss_ntor, auth_key, subcredential, intro_header, msg)
@@ -384,7 +384,7 @@ fn server_receive_intro_no_keygen(
 
     // Decrypt the ENCRYPTED_DATA from the intro cell
     let zero_iv = Default::default();
-    let mut cipher = Aes256Ctr::new(dec_key.as_ref().into(), &zero_iv);
+    let mut cipher = Aes256Ctr::new((&*dec_key).into(), &zero_iv);
     cipher.apply_keystream(ciphertext);
     let plaintext = ciphertext; // it's now decrypted
 
@@ -554,6 +554,7 @@ mod test {
     #![allow(clippy::unchecked_time_subtraction)]
     #![allow(clippy::useless_vec)]
     #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
     use super::*;
     use hex_literal::hex;

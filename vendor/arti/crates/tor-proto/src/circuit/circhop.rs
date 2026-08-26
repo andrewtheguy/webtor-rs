@@ -2,49 +2,65 @@
 
 // TODO(relay): don't import from the client module
 use crate::client::circuit::handshake::RelayCryptLayerProtocol;
-use crate::client::reactor::circuit::SEND_WINDOW_INIT;
 
 use crate::ccparams::CongestionControlParams;
 use crate::circuit::CircParameters;
 use crate::congestion::{CongestionControl, sendme};
+use crate::memquota::{SpecificAccount, StreamAccount};
 use crate::stream::CloseStreamBehavior;
-use crate::stream::StreamMpscReceiver;
+use crate::stream::SEND_WINDOW_INIT;
+use crate::stream::StreamMpscSender;
 use crate::stream::cmdcheck::{AnyCmdChecker, StreamStatus};
 use crate::stream::flow_ctrl::params::FlowCtrlParameters;
-use crate::stream::flow_ctrl::state::{StreamFlowCtrl, StreamRateLimit};
+use crate::stream::flow_ctrl::state::{FlowCtrlHooks, StreamFlowCtrl, StreamRateLimit};
 use crate::stream::flow_ctrl::xon_xoff::reader::DrainRateRequest;
-use crate::stream::queue::StreamQueueSender;
+use crate::stream::queue::{StreamQueueReceiver, stream_queue};
 use crate::streammap::{
     self, EndSentStreamEnt, OpenStreamEnt, ShouldSendEnd, StreamEntMut, StreamMap,
 };
-use crate::util::notify::NotifySender;
+use crate::util::notify::{NotifyReceiver, NotifySender};
 use crate::{Error, HopNum, Result};
 
+use derive_deftly::Deftly;
 use postage::watch;
 use safelog::sensitive as sv;
-use tracing::{trace, warn};
+use tracing::{debug, trace};
 
-use tor_cell::chancell::BoxedCellBody;
+use tor_cell::chancell::{BoxedCellBody, CircId};
 use tor_cell::relaycell::extend::{CcRequest, CircRequestExt};
-use tor_cell::relaycell::flow_ctrl::{Xoff, Xon, XonKbpsEwma};
+use tor_cell::relaycell::flow_ctrl::{Xoff, Xon, XonKBpsEwma};
 use tor_cell::relaycell::msg::AnyRelayMsg;
 use tor_cell::relaycell::{
     AnyRelayMsgOuter, RelayCellDecoder, RelayCellDecoderResult, RelayCellFormat, RelayCmd,
     StreamId, UnparsedRelayMsg,
 };
-use tor_error::{Bug, internal};
+use tor_error::{Bug, ErrorKind, HasKind, internal, into_internal};
+use tor_memquota::derive_deftly_template_HasMemoryCost;
+use tor_memquota::mq_queue::{ChannelSpec as _, MpscSpec};
 use tor_protover::named;
+use tor_rtcompat::DynTimeProvider;
 
 use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::result::Result as StdResult;
-use std::sync::{Arc, Mutex, MutexGuard};
-use tor_rtcompat::Instant;
+use std::sync::{Arc, Mutex};
+use web_time_compat::Instant;
 
 #[cfg(test)]
 use tor_cell::relaycell::msg::SendmeTag;
 
+#[cfg(feature = "relay")]
+use {
+    crate::ccparams::{Algorithm, AlgorithmDiscriminants},
+    crate::circuit::HandshakeSubprotocols,
+    crate::relay::{CircNetParameters, CongestionControlNetParams},
+};
+
 use cfg_if::cfg_if;
+
+/// The size of the stream's outbound RELAY message queue.
+// TODO(tuning): figure out if this is a good size for this buffer
+const CIRCUIT_BUFFER_SIZE: usize = 128;
 
 /// Type of negotiation that we'll be performing as we establish a hop.
 ///
@@ -127,11 +143,6 @@ impl HopSettings {
         };
         if hoptype == HopNegotiationType::None {
             ccontrol.use_fallback_alg();
-        } else if hoptype == HopNegotiationType::HsV3 {
-            // TODO #2037, TODO-CGO: We need a way to send congestion control extensions
-            // in this case too.  But since we aren't sending them, we
-            // should use the fallback algorithm.
-            ccontrol.use_fallback_alg();
         }
         let ccontrol = ccontrol; // drop mut
 
@@ -142,8 +153,14 @@ impl HopSettings {
             HopNegotiationType::HsV3 => {
                 // TODO-CGO: Support CGO when available.
                 cfg_if! {
-                    if #[cfg(feature = "hs-common")] {
-                        RelayCryptLayerProtocol::HsV3(RelayCellFormat::V0)
+                    if #[cfg(all(feature = "hs-common", feature = "flowctl-cc", feature = "counter-galois-onion"))] {
+                        if ccontrol.alg().compatible_with_cgo() && caps.supports_named_subver(named::RELAY_CRYPT_CGO) {
+                            RelayCryptLayerProtocol::Cgo
+                        } else {
+                            RelayCryptLayerProtocol::HsV3(RelayCellFormat::V0)
+                        }
+                    } else if #[cfg(feature = "hs-common")] {
+                            RelayCryptLayerProtocol::HsV3(RelayCellFormat::V0)
                     } else {
                         return Err(
                             tor_error::internal!("Unexpectedly tried to negotiate HsV3 without support!").into(),
@@ -176,6 +193,73 @@ impl HopSettings {
             relay_crypt_protocol,
             n_incoming_cells_permitted: params.n_incoming_cells_permitted,
             n_outgoing_cells_permitted: params.n_outgoing_cells_permitted,
+        })
+    }
+
+    /// Build a [`HopSettings`] from the parameters requested during a circuit handshake.
+    //
+    // We disable `unused` warnings at the root of tor-proto,
+    // but it's nice to have here so we re-enable it.
+    #[warn(unused)]
+    #[cfg(feature = "relay")]
+    pub(crate) fn from_handshake_params(
+        circ_net_params: CircNetParameters,
+        cc_algorithm: AlgorithmDiscriminants,
+        subprotos_requested: HandshakeSubprotocols,
+    ) -> StdResult<Self, HandshakeParamsError> {
+        // Unpack everything to make sure that we aren't missing anything
+        // (otherwise clippy would warn).
+        let CircNetParameters {
+            cc:
+                CongestionControlNetParams {
+                    fixed_window,
+                    vegas_exit,
+                    cwnd,
+                    rtt,
+                    flow_ctrl,
+                },
+        } = circ_net_params;
+
+        let HandshakeSubprotocols { relay_crypt_cgo } = subprotos_requested;
+
+        // TODO: We have similar logic in and around `HopSettings` that deals with determining the
+        // crypt protocol and cc algorithm to use. We might want to try to dedup some of this, or
+        // make it more self-contained. This is a bit tricky though since the code is used in
+        // different situations and the inputs are not the same.
+        let (cc_algorithm, relay_crypt_protocol) = match (cc_algorithm, relay_crypt_cgo) {
+            (AlgorithmDiscriminants::FixedWindow, false) => (
+                Algorithm::FixedWindow(fixed_window),
+                RelayCryptLayerProtocol::Tor1(RelayCellFormat::V0),
+            ),
+            (AlgorithmDiscriminants::FixedWindow, true) => {
+                return Err(HandshakeParamsError::IncompatibleParams(
+                    "requested CGO but not congestion control",
+                ));
+            }
+            (AlgorithmDiscriminants::Vegas, false) => (
+                Algorithm::Vegas(vegas_exit),
+                RelayCryptLayerProtocol::Tor1(RelayCellFormat::V0),
+            ),
+            (AlgorithmDiscriminants::Vegas, true) => {
+                (Algorithm::Vegas(vegas_exit), RelayCryptLayerProtocol::Cgo)
+            }
+        };
+
+        // TODO(arti#2442): The builder pattern here seems like a footgun.
+        let ccontrol = CongestionControlParams::builder()
+            .alg(cc_algorithm)
+            .fixed_window_params(fixed_window)
+            .cwnd_params(cwnd)
+            .rtt_params(rtt)
+            .build()
+            .map_err(into_internal!("Could not build `CongestionControlParams`"))?;
+
+        Ok(Self {
+            ccontrol,
+            flow_ctrl_params: flow_ctrl,
+            relay_crypt_protocol,
+            n_incoming_cells_permitted: None,
+            n_outgoing_cells_permitted: None,
         })
     }
 
@@ -221,6 +305,8 @@ impl HopSettings {
         // with this extension. For the current list, see
         // https://spec.torproject.org/tor-spec/create-created-cells.html#subproto-request)
         //
+        // TODO: Should this use `HandshakeSubprotocols` so that the above comment has some
+        // compile-time checks?
         #[allow(unused_mut)]
         let mut required_protocol_capabilities: Vec<tor_protover::NamedSubver> = Vec::new();
 
@@ -251,6 +337,27 @@ impl std::default::Default for CircParameters {
             flow_ctrl: FlowCtrlParameters::defaults_for_tests(),
             n_incoming_cells_permitted: None,
             n_outgoing_cells_permitted: None,
+        }
+    }
+}
+
+/// An error that can occur when building a [`HopSettings`] using parameters requested during a
+/// circuit handshake.
+#[derive(Clone, Debug, thiserror::Error)]
+pub(crate) enum HandshakeParamsError {
+    /// The provided parameters are incompatible with each other.
+    #[error("The provided handshake parameters are incompatible with each other: {0}")]
+    IncompatibleParams(&'static str),
+    /// An internal error.
+    #[error("Internal error")]
+    Internal(#[from] tor_error::Bug),
+}
+
+impl HasKind for HandshakeParamsError {
+    fn kind(&self) -> ErrorKind {
+        match self {
+            Self::IncompatibleParams(_) => ErrorKind::TorProtocolViolation,
+            Self::Internal(_) => ErrorKind::Internal,
         }
     }
 }
@@ -289,11 +396,6 @@ pub(crate) struct SendRelayCell {
 
 /// The inbound state of a hop.
 pub(crate) struct CircHopInbound {
-    /// Congestion control object.
-    ///
-    /// This object is also in charge of handling circuit level SENDME logic for this hop.
-    #[allow(dead_code)] // TODO(relay)
-    ccontrol: Arc<Mutex<CongestionControl>>,
     /// Decodes relay cells received from this hop.
     decoder: RelayCellDecoder,
     /// Remaining permitted incoming relay cells from this hop, plus 1.
@@ -344,22 +446,11 @@ pub(crate) struct CircHopOutbound {
 
 impl CircHopInbound {
     /// Create a new [`CircHopInbound`].
-    pub(crate) fn new(
-        ccontrol: Arc<Mutex<CongestionControl>>,
-        decoder: RelayCellDecoder,
-        settings: &HopSettings,
-    ) -> Self {
+    pub(crate) fn new(decoder: RelayCellDecoder, settings: &HopSettings) -> Self {
         Self {
-            ccontrol,
             decoder,
             n_incoming_cells_permitted: settings.n_incoming_cells_permitted.map(cvt),
         }
-    }
-
-    /// Return a mutable reference to our CongestionControl object.
-    #[allow(dead_code)] // TODO(relay)
-    pub(crate) fn ccontrol(&self) -> MutexGuard<'_, CongestionControl> {
-        self.ccontrol.lock().expect("poisoned lock")
     }
 
     /// Parse a RELAY or RELAY_EARLY cell body.
@@ -399,28 +490,51 @@ impl CircHopOutbound {
 
     /// Start a stream. Creates an entry in the stream map with the given channels, and sends the
     /// `message` to the provided hop.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin_stream(
         &mut self,
         hop: Option<HopNum>,
         message: AnyRelayMsg,
-        sender: StreamQueueSender,
-        rx: StreamMpscReceiver<AnyRelayMsg>,
-        rate_limit_updater: watch::Sender<StreamRateLimit>,
-        drain_rate_requester: NotifySender<DrainRateRequest>,
+        time_prov: &DynTimeProvider,
         cmd_checker: AnyCmdChecker,
-    ) -> Result<(SendRelayCell, StreamId)> {
-        let flow_ctrl = self.build_flow_ctrl(
-            Arc::clone(&self.flow_ctrl_params),
-            rate_limit_updater,
-            drain_rate_requester,
+        memquota: &StreamAccount,
+    ) -> Result<(SendRelayCell, StreamId, ReactorStreamComponents)> {
+        // TODO: This has a lot of duplicated code with `Self::add_ent_with_id()`.
+
+        // A channel for the reactor to inform the writer of a new rate limit.
+        let (rate_limit_tx, rate_limit_rx) = watch::channel_with(StreamRateLimit::MAX);
+
+        // A channel for the reactor to request a new drain rate from the reader.
+        // Typically this notification will be sent after an XOFF is sent so that the reader can
+        // send us a new drain rate when the stream data queue becomes empty.
+        let mut drain_rate_request_tx = NotifySender::new_typed();
+        let drain_rate_request_rx = drain_rate_request_tx.subscribe();
+
+        let flow_ctrl = self.build_flow_ctrl(rate_limit_tx, drain_rate_request_tx)?;
+
+        let stream_queue_max_len = flow_ctrl.inbound_queue_max_len();
+
+        // A queue for inbound RELAY messages.
+        let (sender, receiver) = stream_queue(stream_queue_max_len, memquota, time_prov)?;
+
+        // A queue for outbound RELAY messages.
+        let (msg_tx, msg_rx) = MpscSpec::new(CIRCUIT_BUFFER_SIZE)
+            .new_mq(time_prov.clone(), memquota.as_raw_account())?;
+
+        let r = self.map.lock().expect("lock poisoned").add_ent(
+            sender,
+            msg_rx,
+            flow_ctrl,
+            cmd_checker,
         )?;
-        let r =
-            self.map
-                .lock()
-                .expect("lock poisoned")
-                .add_ent(sender, rx, flow_ctrl, cmd_checker)?;
         let cell = AnyRelayMsgOuter::new(Some(r), message);
+
+        let stream_components = ReactorStreamComponents {
+            stream_inbound_rx: receiver,
+            stream_outbound_tx: msg_tx,
+            rate_limit_rx,
+            drain_rate_request_rx,
+        };
+
         Ok((
             SendRelayCell {
                 hop,
@@ -428,6 +542,7 @@ impl CircHopOutbound {
                 cell,
             },
             r,
+            stream_components,
         ))
     }
 
@@ -437,13 +552,15 @@ impl CircHopOutbound {
     /// If no END cell is specified, an END cell with the reason byte set to
     /// REASON_MISC will be sent.
     ///
-    // Note(relay): `circ_id` is an opaque displayable type
+    // Note(relay): `circ_uniq_id` is an opaque displayable type
     // because relays use a different circuit ID type
     // than clients. Eventually, we should probably make
     // them both use the same ID type, or have a nicer approach here
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn close_stream(
         &mut self,
-        circ_id: impl std::fmt::Display,
+        circ_uniq_id: impl std::fmt::Display,
+        circ_id: CircId,
         id: StreamId,
         hop: Option<HopNum>,
         message: CloseStreamBehavior,
@@ -456,6 +573,7 @@ impl CircHopOutbound {
             .expect("lock poisoned")
             .terminate(id, why, expiry)?;
         trace!(
+            circ_uniq_id = %circ_uniq_id,
             circ_id = %circ_id,
             stream_id = %id,
             should_send_end = ?should_send_end,
@@ -483,12 +601,17 @@ impl CircHopOutbound {
     /// If we should, then returns the XON message that should be sent.
     pub(crate) fn maybe_send_xon(
         &mut self,
-        rate: XonKbpsEwma,
+        rate: XonKBpsEwma,
         id: StreamId,
     ) -> Result<Option<Xon>> {
         // the call below will return an error if XON/XOFF aren't supported,
         // so we check for support here
-        if !self.ccontrol().uses_xon_xoff() {
+        if !self
+            .ccontrol()
+            .lock()
+            .expect("poisoned lock")
+            .uses_xon_xoff()
+        {
             return Ok(None);
         }
 
@@ -507,7 +630,12 @@ impl CircHopOutbound {
     pub(crate) fn maybe_send_xoff(&mut self, id: StreamId) -> Result<Option<Xoff>> {
         // the call below will return an error if XON/XOFF aren't supported,
         // so we check for support here
-        if !self.ccontrol().uses_xon_xoff() {
+        if !self
+            .ccontrol()
+            .lock()
+            .expect("poisoned lock")
+            .uses_xon_xoff()
+        {
             return Ok(None);
         }
 
@@ -531,7 +659,10 @@ impl CircHopOutbound {
     /// Delegate to CongestionControl, for testing purposes
     #[cfg(test)]
     pub(crate) fn send_window_and_expected_tags(&self) -> (u32, Vec<SendmeTag>) {
-        self.ccontrol().send_window_and_expected_tags()
+        self.ccontrol()
+            .lock()
+            .expect("poisoned lock")
+            .send_window_and_expected_tags()
     }
 
     /// Return the number of open streams on this hop.
@@ -542,9 +673,9 @@ impl CircHopOutbound {
         self.map.lock().expect("lock poisoned").n_open_streams()
     }
 
-    /// Return a mutable reference to our CongestionControl object.
-    pub(crate) fn ccontrol(&self) -> MutexGuard<'_, CongestionControl> {
-        self.ccontrol.lock().expect("poisoned lock")
+    /// Return a reference to our CongestionControl object.
+    pub(crate) fn ccontrol(&self) -> &Arc<Mutex<CongestionControl>> {
+        &self.ccontrol
     }
 
     /// We're about to send `msg`.
@@ -553,57 +684,80 @@ impl CircHopOutbound {
     //
     // TODO prop340: This should take a cell or similar, not a message.
     //
-    // Note(relay): `circ_id` is an opaque displayable type
+    // Note(relay): `circ_uniq_id` is an opaque displayable type
     // because relays use a different circuit ID type
     // than clients. Eventually, we should probably make
     // them both use the same ID type, or have a nicer approach here
     pub(crate) fn about_to_send(
         &mut self,
-        circ_id: impl std::fmt::Display,
+        circ_uniq_id: impl std::fmt::Display,
+        circ_id: CircId,
         stream_id: StreamId,
         msg: &AnyRelayMsg,
     ) -> Result<()> {
         let mut hop_map = self.map.lock().expect("lock poisoned");
         let Some(StreamEntMut::Open(ent)) = hop_map.get_mut(stream_id) else {
-            warn!(
+            // This can happen when we have outgoing data queued when we received an END.
+            // We shouldn't return an error here since it would close the circuit along with all
+            // other streams, and instead we just let the caller send this message anyways.
+            // Also the caller only calls `about_to_send()` for DATA cells,
+            // which means that other non-DATA cells don't hit this code path and are always sent,
+            // and so we should handle all cell types consistently.
+            // TODO: We should drop the message and not send it,
+            // but the caller of `about_to_send()` isn't designed to handle fallible sends
+            // so it would need some refactoring to handle this.
+            debug!(
+                circ_uniq_id = %circ_uniq_id,
                 circ_id = %circ_id,
                 stream_id = %stream_id,
                 "sending a relay cell for non-existent or non-open stream!",
             );
-            return Err(Error::CircProto(format!(
-                "tried to send a relay cell on non-open stream {}",
-                sv(stream_id),
-            )));
+            return Ok(());
         };
 
         ent.about_to_send(msg)
     }
 
     /// Add an entry to this map using the specified StreamId.
-    #[cfg(feature = "hs-service")]
+    #[cfg(any(feature = "hs-service", feature = "relay"))]
     pub(crate) fn add_ent_with_id(
         &self,
-        sink: StreamQueueSender,
-        rx: StreamMpscReceiver<AnyRelayMsg>,
-        rate_limit_updater: watch::Sender<StreamRateLimit>,
-        drain_rate_requester: NotifySender<DrainRateRequest>,
+        time_prov: &DynTimeProvider,
         stream_id: StreamId,
         cmd_checker: AnyCmdChecker,
-    ) -> Result<()> {
-        let mut hop_map = self.map.lock().expect("lock poisoned");
-        hop_map.add_ent_with_id(
-            sink,
-            rx,
-            self.build_flow_ctrl(
-                Arc::clone(&self.flow_ctrl_params),
-                rate_limit_updater,
-                drain_rate_requester,
-            )?,
-            stream_id,
-            cmd_checker,
-        )?;
+        memquota: &StreamAccount,
+    ) -> Result<ReactorStreamComponents> {
+        // TODO: This has a lot of duplicated code with `Self::begin_stream()`.
 
-        Ok(())
+        // A channel for the reactor to inform the writer of a new rate limit.
+        let (rate_limit_tx, rate_limit_rx) = watch::channel_with(StreamRateLimit::MAX);
+
+        // A channel for the reactor to request a new drain rate from the reader.
+        // Typically this notification will be sent after an XOFF is sent so that the reader can
+        // send us a new drain rate when the stream data queue becomes empty.
+        let mut drain_rate_request_tx = NotifySender::new_typed();
+        let drain_rate_request_rx = drain_rate_request_tx.subscribe();
+
+        let flow_ctrl = self.build_flow_ctrl(rate_limit_tx, drain_rate_request_tx)?;
+
+        let stream_queue_max_len = flow_ctrl.inbound_queue_max_len();
+
+        // A queue for inbound RELAY messages.
+        let (sender, receiver) = stream_queue(stream_queue_max_len, memquota, time_prov)?;
+
+        // A queue for outbound RELAY messages.
+        let (msg_tx, msg_rx) = MpscSpec::new(CIRCUIT_BUFFER_SIZE)
+            .new_mq(time_prov.clone(), memquota.as_raw_account())?;
+
+        let mut hop_map = self.map.lock().expect("lock poisoned");
+        hop_map.add_ent_with_id(sender, msg_rx, flow_ctrl, stream_id, cmd_checker)?;
+
+        Ok(ReactorStreamComponents {
+            stream_inbound_rx: receiver,
+            stream_outbound_tx: msg_tx,
+            rate_limit_rx,
+            drain_rate_request_rx,
+        })
     }
 
     /// Builds the reactor's flow control handler for a new stream.
@@ -611,11 +765,17 @@ impl CircHopOutbound {
     #[cfg_attr(feature = "flowctl-cc", expect(clippy::unnecessary_wraps))]
     fn build_flow_ctrl(
         &self,
-        params: Arc<FlowCtrlParameters>,
         rate_limit_updater: watch::Sender<StreamRateLimit>,
         drain_rate_requester: NotifySender<DrainRateRequest>,
     ) -> Result<StreamFlowCtrl> {
-        if self.ccontrol().uses_stream_sendme() {
+        let params = Arc::clone(&self.flow_ctrl_params);
+
+        if self
+            .ccontrol()
+            .lock()
+            .expect("poisoned lock")
+            .uses_stream_sendme()
+        {
             let window = sendme::StreamSendWindow::new(SEND_WINDOW_INIT);
             Ok(StreamFlowCtrl::new_window(window))
         } else {
@@ -659,9 +819,6 @@ impl CircHopOutbound {
 
         // We need to handle SENDME/XON/XOFF messages here, not in the stream's recv() method, or
         // else we'd never notice them if the stream isn't reading.
-        //
-        // TODO: this logic is the same as `HalfStream::handle_msg`; we should refactor this if
-        // possible
         match msg.cmd() {
             RelayCmd::SENDME => {
                 ent.put_for_incoming_sendme(msg)?;
@@ -757,7 +914,6 @@ impl CircHopOutbound {
             Some(StreamEntMut::EndSent(EndSentStreamEnt { expiry, .. })) if now >= *expiry => {
                 return Err(possible_proto_violation_err(streamid));
             }
-            #[cfg(feature = "hs-service")]
             Some(StreamEntMut::EndSent(_))
                 if matches!(
                     msg.cmd(),
@@ -780,7 +936,6 @@ impl CircHopOutbound {
                     }
                 }
             }
-            #[cfg(feature = "hs-service")]
             None if matches!(
                 msg.cmd(),
                 RelayCmd::BEGIN | RelayCmd::BEGIN_DIR | RelayCmd::RESOLVE
@@ -850,4 +1005,33 @@ fn cvt(limit: u32) -> NonZeroU32 {
         .saturating_add(1)
         .try_into()
         .expect("Adding one left it as zero?")
+}
+
+/// A collection of components that can be used to interact with the reactor's view of a Tor stream.
+//
+// TODO: We also have a `StreamComponents` type that is used and built outside of the reactor.
+// It's maybe confusing to have these similar type names, so a better name would be nice.
+//
+// TODO(arti#2068): The components we return should maybe depend on what type of flow control is
+// used, so in the future we might want to make some of these fields optional.
+#[derive(Debug, Deftly)]
+#[derive_deftly(HasMemoryCost)]
+pub(crate) struct ReactorStreamComponents {
+    /// An MPSC receiver for inbound messages that arrive on the stream.
+    #[deftly(has_memory_cost(indirect_size = "0"))] // estimate
+    pub(crate) stream_inbound_rx: StreamQueueReceiver,
+
+    /// An MPSC sender for outbound messages to be sent on the stream.
+    #[deftly(has_memory_cost(indirect_size = "size_of::<AnyRelayMsg>()"))] // estimate
+    pub(crate) stream_outbound_tx: StreamMpscSender<AnyRelayMsg>,
+
+    /// A mechanism to allow the stream's writer to receive rate limit updates from the reactor.
+    // The `watch::Sender` owns the indirect data.
+    #[deftly(has_memory_cost(indirect_size = "0"))]
+    pub(crate) rate_limit_rx: watch::Receiver<StreamRateLimit>,
+
+    /// A mechanism to allow the stream's reader to receive drain rate update requests from the
+    /// reactor.
+    #[deftly(has_memory_cost(indirect_size = "0"))]
+    pub(crate) drain_rate_request_rx: NotifyReceiver<DrainRateRequest>,
 }

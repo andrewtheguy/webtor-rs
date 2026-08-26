@@ -6,22 +6,8 @@
 use caret::caret_int;
 use derive_builder::Builder;
 
+use tor_config::{ConfigBuildError, impl_standard_builder};
 use tor_units::Percentage;
-
-/// Error returned when a congestion-control builder is missing a required field.
-#[derive(Clone, Debug, thiserror::Error)]
-#[error("Field was not provided: {field}")]
-pub struct ConfigBuildError {
-    field: String,
-}
-
-impl From<derive_builder::UninitializedFieldError> for ConfigBuildError {
-    fn from(error: derive_builder::UninitializedFieldError) -> Self {
-        Self {
-            field: error.field_name().to_owned(),
-        }
-    }
-}
 
 /// Fixed window parameters that are for the SENDME v0 world of fixed congestion window.
 #[non_exhaustive]
@@ -38,10 +24,17 @@ pub struct FixedWindowParams {
     #[getter(as_copy)]
     circ_window_max: u16,
 }
+impl_standard_builder! { FixedWindowParams: !Deserialize + !Default }
+
 impl FixedWindowParams {
-    /// Return a fresh fixed-window parameter builder.
-    pub fn builder() -> FixedWindowParamsBuilder {
-        FixedWindowParamsBuilder::default()
+    #[cfg(test)]
+    // These have been copied from C-tor.
+    pub(crate) fn defaults_for_tests() -> Self {
+        Self {
+            circ_window_start: 1000,
+            circ_window_min: 100,
+            circ_window_max: 1000,
+        }
     }
 }
 
@@ -104,17 +97,31 @@ pub struct VegasParams {
     #[getter(as_copy)]
     cwnd_full_per_cwnd: u32,
 }
+impl_standard_builder! { VegasParams: !Deserialize + !Default }
+
 impl VegasParams {
-    /// Return a fresh Vegas parameter builder.
-    pub fn builder() -> VegasParamsBuilder {
-        VegasParamsBuilder::default()
+    #[cfg(test)]
+    // These have been copied from spec (prop324).
+    pub(crate) fn defaults_for_tests() -> Self {
+        // The OUTBUF_CELLS size from prop324.
+        const OC: u32 = 62;
+        Self {
+            cell_in_queue_params: (3 * OC, 4 * OC, 5 * OC, 3 * OC, 600).into(),
+            ss_cwnd_max: 5000,
+            cwnd_full_gap: 4,
+            cwnd_full_min_pct: Percentage::new(25),
+            cwnd_full_per_cwnd: 1,
+        }
     }
 }
 
 /// The different congestion control algorithms. Each contain their parameters taken from the
 /// consensus.
 #[non_exhaustive]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, strum::EnumDiscriminants)]
+// No need for the discriminants to be public at the moment,
+// and we might want to rename it if it does become public.
+#[strum_discriminants(vis(pub(crate)))]
 pub enum Algorithm {
     /// Fixed window algorithm.
     FixedWindow(FixedWindowParams),
@@ -174,10 +181,18 @@ pub struct RoundTripEstimatorParams {
     /// the congestion window hits cwnd_min.
     rtt_reset_pct: Percentage<u32>,
 }
+impl_standard_builder! { RoundTripEstimatorParams: !Deserialize + !Default }
+
 impl RoundTripEstimatorParams {
-    /// Return a fresh round-trip estimator parameter builder.
-    pub fn builder() -> RoundTripEstimatorParamsBuilder {
-        RoundTripEstimatorParamsBuilder::default()
+    #[cfg(test)]
+    // These have been copied from spec (prop324).
+    pub(crate) fn defaults_for_tests() -> Self {
+        Self {
+            ewma_cwnd_pct: Percentage::new(50),
+            ewma_max: 10,
+            ewma_ss_max: 2,
+            rtt_reset_pct: Percentage::new(100),
+        }
     }
 }
 
@@ -209,12 +224,7 @@ pub struct CongestionWindowParams {
     #[getter(as_copy)]
     sendme_inc: u32,
 }
-impl CongestionWindowParams {
-    /// Return a fresh congestion-window parameter builder.
-    pub fn builder() -> CongestionWindowParamsBuilder {
-        CongestionWindowParamsBuilder::default()
-    }
-}
+impl_standard_builder! { CongestionWindowParams: !Deserialize + !Default}
 
 impl CongestionWindowParams {
     /// Set the `sendme_inc` value.
@@ -224,6 +234,20 @@ impl CongestionWindowParams {
     /// Typically the default when built should be from the network parameters from the consensus.
     pub(crate) fn set_sendme_inc(&mut self, inc: u8) {
         self.sendme_inc = u32::from(inc);
+    }
+
+    #[cfg(test)]
+    // These have been copied from spec (prop324).
+    pub(crate) fn defaults_for_tests() -> Self {
+        Self {
+            cwnd_init: 4 * 31,
+            cwnd_inc_pct_ss: Percentage::new(50),
+            cwnd_inc: 31,
+            cwnd_inc_rate: 1,
+            cwnd_min: 31,
+            cwnd_max: u32::MAX,
+            sendme_inc: 31,
+        }
     }
 }
 
@@ -247,12 +271,7 @@ pub struct CongestionControlParams {
     /// RTT calculation parameters.
     rtt_params: RoundTripEstimatorParams,
 }
-impl CongestionControlParams {
-    /// Return a fresh congestion-control parameter builder.
-    pub fn builder() -> CongestionControlParamsBuilder {
-        CongestionControlParamsBuilder::default()
-    }
-}
+impl_standard_builder! { CongestionControlParams: !Deserialize + !Default }
 
 impl CongestionControlParams {
     /// Return true iff congestion control is enabled that is the algorithm is anything other than
@@ -266,6 +285,12 @@ impl CongestionControlParams {
     /// Make these parameters to use the fallback algorithm. This can't be reversed.
     pub(crate) fn use_fallback_alg(&mut self) {
         self.alg = Algorithm::FixedWindow(self.fixed_window_params);
+    }
+
+    /// Override the `cc_sendme_inc` value in these parameters with the value provided
+    /// in `sendme_inc`.
+    pub fn override_sendme_inc(&mut self, sendme_inc: u8) {
+        self.cwnd_params.set_sendme_inc(sendme_inc);
     }
 }
 

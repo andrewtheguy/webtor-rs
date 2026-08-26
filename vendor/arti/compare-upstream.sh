@@ -85,8 +85,8 @@ locate_upstream() {
         echo "Could not locate the unpacked source for $crate@$version" >&2
         return 1
     fi
-    if [[ ! -f $upstream/Cargo.toml.orig ]]; then
-        echo "Missing pristine manifest: $upstream/Cargo.toml.orig" >&2
+    if [[ ! -f $upstream/Cargo.toml ]]; then
+        echo "Missing pristine manifest: $upstream/Cargo.toml" >&2
         return 1
     fi
 
@@ -115,7 +115,7 @@ compare_names() {
     local file rel
     local -a changes=()
 
-    if ! cmp -s "$upstream/Cargo.toml.orig" "$vendored/Cargo.toml"; then
+    if ! cmp -s "$upstream/Cargo.toml" "$vendored/Cargo.toml"; then
         manifest_status=1
         changes+=("M Cargo.toml")
     fi
@@ -163,7 +163,7 @@ compare_diff() {
     diff -u \
         --label "a/crates/$crate/Cargo.toml" \
         --label "b/crates/$crate/Cargo.toml" \
-        "$upstream/Cargo.toml.orig" "$vendored/Cargo.toml" || true
+        "$upstream/Cargo.toml" "$vendored/Cargo.toml" || true
 
     echo "### $crate source/content"
     diff -ruN \

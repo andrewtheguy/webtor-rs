@@ -86,9 +86,10 @@ impl<S: SleepProvider> PaddingController<S> {
     pub(crate) fn decrypted_data(&self, _hop: HopNum) {}
 
     /// Report that we have decrypted a padding cell from our queue.
-    pub(crate) fn decrypted_padding(&self, _hop: HopNum) -> Result<(), crate::Error> {
-        Err(crate::Error::CircProto(
-            "Received unexpected padding when circuit padding was not enabled.".into(),
+    pub(crate) fn decrypted_padding(&self, hop: HopNum) -> Result<(), crate::Error> {
+        Err(crate::Error::ExcessPadding(
+            ExcessPadding::NoPaddingNegotiated,
+            hop,
         ))
     }
 }

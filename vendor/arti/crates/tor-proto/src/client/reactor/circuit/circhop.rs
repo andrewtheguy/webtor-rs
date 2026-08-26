@@ -1,32 +1,31 @@
 //! Module exposing structures relating to the reactor's view of a circuit's hops.
 
 use super::{CircuitCmd, CloseStreamBehavior};
-use crate::circuit::circhop::{CircHopInbound, CircHopOutbound, HopSettings, SendRelayCell};
+use crate::circuit::circhop::{
+    CircHopInbound, CircHopOutbound, HopSettings, ReactorStreamComponents, SendRelayCell,
+};
 use crate::client::reactor::circuit::path::PathEntry;
 use crate::congestion::CongestionControl;
 use crate::crypto::cell::HopNum;
-use crate::stream::StreamMpscReceiver;
+use crate::memquota::StreamAccount;
 use crate::stream::cmdcheck::AnyCmdChecker;
-use crate::stream::flow_ctrl::state::StreamRateLimit;
-use crate::stream::flow_ctrl::xon_xoff::reader::DrainRateRequest;
-use crate::stream::queue::StreamQueueSender;
 use crate::streammap::{self, StreamEntMut, StreamMap};
 use crate::tunnel::TunnelScopedCircId;
-use crate::util::notify::NotifySender;
 use crate::util::tunnel_activity::TunnelActivity;
 use crate::{Error, Result};
 
 use futures::Stream;
 use futures::stream::FuturesUnordered;
-use postage::watch;
 use smallvec::SmallVec;
-use tor_cell::chancell::BoxedCellBody;
-use tor_cell::relaycell::flow_ctrl::{Xoff, Xon, XonKbpsEwma};
+use tor_cell::chancell::{BoxedCellBody, CircId};
+use tor_cell::relaycell::flow_ctrl::{Xoff, Xon, XonKBpsEwma};
 use tor_cell::relaycell::msg::AnyRelayMsg;
 use tor_cell::relaycell::{
     AnyRelayMsgOuter, RelayCellDecoder, RelayCellDecoderResult, RelayCellFormat, StreamId,
     UnparsedRelayMsg,
 };
+use tor_rtcompat::DynTimeProvider;
+use web_time_compat::Instant;
 
 use safelog::sensitive as sv;
 use tor_error::Bug;
@@ -35,7 +34,6 @@ use tracing::instrument;
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
-use tor_rtcompat::Instant;
 
 #[cfg(test)]
 use tor_cell::relaycell::msg::SendmeTag;
@@ -194,15 +192,6 @@ impl CircHopList {
         })
     }
 
-    /// Return the number of streams currently open on this circuit.
-    pub(crate) fn n_open_streams(&self) -> usize {
-        self.hops
-            .iter()
-            .map(|hop| hop.n_open_streams())
-            // No need to worry about overflow; max streams per hop is U16_MAX
-            .sum()
-    }
-
     /// Return the most active [`TunnelActivity`] for any hop on this `CircHopList`.
     pub(crate) fn tunnel_activity(&self) -> TunnelActivity {
         self.hops
@@ -222,6 +211,8 @@ impl CircHopList {
 pub(crate) struct CircHop {
     /// The unique ID of the circuit. Used for logging.
     unique_id: TunnelScopedCircId,
+    /// The Tor circuit identifier. Used for logging.
+    circ_id: CircId,
     /// Hop number in the path.
     hop_num: HopNum,
     /// The inbound state of the hop.
@@ -238,17 +229,14 @@ impl CircHop {
     /// Create a new hop.
     pub(crate) fn new(
         unique_id: TunnelScopedCircId,
+        circ_id: CircId,
         hop_num: HopNum,
         settings: &HopSettings,
     ) -> Self {
         let relay_format = settings.relay_crypt_protocol().relay_cell_format();
 
         let ccontrol = Arc::new(Mutex::new(CongestionControl::new(&settings.ccontrol)));
-        let inbound = CircHopInbound::new(
-            Arc::clone(&ccontrol),
-            RelayCellDecoder::new(relay_format),
-            settings,
-        );
+        let inbound = CircHopInbound::new(RelayCellDecoder::new(relay_format), settings);
 
         let outbound = CircHopOutbound::new(
             ccontrol,
@@ -259,6 +247,7 @@ impl CircHop {
 
         CircHop {
             unique_id,
+            circ_id,
             hop_num,
             inbound,
             outbound,
@@ -270,20 +259,16 @@ impl CircHop {
     pub(crate) fn begin_stream(
         &mut self,
         message: AnyRelayMsg,
-        sender: StreamQueueSender,
-        rx: StreamMpscReceiver<AnyRelayMsg>,
-        rate_limit_updater: watch::Sender<StreamRateLimit>,
-        drain_rate_requester: NotifySender<DrainRateRequest>,
+        time_prov: &DynTimeProvider,
         cmd_checker: AnyCmdChecker,
-    ) -> Result<(SendRelayCell, StreamId)> {
+        memquota: &StreamAccount,
+    ) -> Result<(SendRelayCell, StreamId, ReactorStreamComponents)> {
         self.outbound.begin_stream(
             Some(self.hop_num),
             message,
-            sender,
-            rx,
-            rate_limit_updater,
-            drain_rate_requester,
+            time_prov,
             cmd_checker,
+            memquota,
         )
     }
 
@@ -298,8 +283,15 @@ impl CircHop {
         why: streammap::TerminateReason,
         expiry: Instant,
     ) -> Result<Option<SendRelayCell>> {
-        self.outbound
-            .close_stream(self.unique_id, id, Some(self.hop_num), message, why, expiry)
+        self.outbound.close_stream(
+            self.unique_id,
+            self.circ_id,
+            id,
+            Some(self.hop_num),
+            message,
+            why,
+            expiry,
+        )
     }
 
     /// Check if we should send an XON message.
@@ -308,7 +300,7 @@ impl CircHop {
     #[instrument(level = "trace", skip_all)]
     pub(crate) fn maybe_send_xon(
         &mut self,
-        rate: XonKbpsEwma,
+        rate: XonKBpsEwma,
         id: StreamId,
     ) -> Result<Option<Xon>> {
         self.outbound.maybe_send_xon(rate, id)
@@ -335,17 +327,14 @@ impl CircHop {
         self.outbound.send_window_and_expected_tags()
     }
 
-    /// Return the number of open streams on this hop.
-    ///
-    /// WARNING: because this locks the stream map mutex,
-    /// it should never be called from a context where that mutex is already locked.
-    pub(crate) fn n_open_streams(&self) -> usize {
-        self.outbound.n_open_streams()
-    }
-
     /// Return a mutable reference to our CongestionControl object.
     pub(crate) fn ccontrol(&self) -> MutexGuard<'_, CongestionControl> {
-        self.outbound.ccontrol()
+        self.outbound.ccontrol().lock().expect("poisoned lock")
+    }
+
+    /// Return a reference to our CircHopOutbound object.
+    pub(crate) fn outbound(&self) -> &CircHopOutbound {
+        &self.outbound
     }
 
     /// We're about to send `msg`.
@@ -354,28 +343,21 @@ impl CircHop {
     //
     // TODO prop340: This should take a cell or similar, not a message.
     pub(crate) fn about_to_send(&mut self, stream_id: StreamId, msg: &AnyRelayMsg) -> Result<()> {
-        self.outbound.about_to_send(self.unique_id, stream_id, msg)
+        self.outbound
+            .about_to_send(self.unique_id, self.circ_id, stream_id, msg)
     }
 
     /// Add an entry to this map using the specified StreamId.
     #[cfg(feature = "hs-service")]
     pub(crate) fn add_ent_with_id(
         &self,
-        sink: StreamQueueSender,
-        rx: StreamMpscReceiver<AnyRelayMsg>,
-        rate_limit_updater: watch::Sender<StreamRateLimit>,
-        drain_rate_requester: NotifySender<DrainRateRequest>,
+        time_prov: &DynTimeProvider,
         stream_id: StreamId,
         cmd_checker: AnyCmdChecker,
-    ) -> Result<()> {
-        self.outbound.add_ent_with_id(
-            sink,
-            rx,
-            rate_limit_updater,
-            drain_rate_requester,
-            stream_id,
-            cmd_checker,
-        )
+        memquota: &StreamAccount,
+    ) -> Result<ReactorStreamComponents> {
+        self.outbound
+            .add_ent_with_id(time_prov, stream_id, cmd_checker, memquota)
     }
 
     /// Note that we received an END message (or other message indicating the end of

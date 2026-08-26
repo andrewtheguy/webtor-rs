@@ -11,7 +11,7 @@
 #![deny(clippy::cargo_common_metadata)]
 #![deny(clippy::cast_lossless)]
 #![deny(clippy::checked_conversions)]
-#![warn(clippy::cognitive_complexity)]
+#![allow(clippy::cognitive_complexity)] // See arti#2556
 #![deny(clippy::debug_assert_with_mut_call)]
 #![deny(clippy::exhaustive_enums)]
 #![deny(clippy::exhaustive_structs)]
@@ -42,11 +42,11 @@
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
 #![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
+#![allow(clippy::collapsible_if)] // See arti#2342
+#![deny(clippy::unused_async)]
+#![deny(clippy::string_slice)] // See arti#2571
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
-// TODO #2010: Remove this global allow, and either propagate it to the functions that need it,
-// or make those functions less complex.
-#![allow(clippy::cognitive_complexity)]
 // TODO #1645 (either remove this, or decide to have it everywhere)
 #![cfg_attr(
     not(all(feature = "full", feature = "experimental")),
@@ -62,21 +62,26 @@ pub(crate) mod conflux;
 mod congestion;
 mod crypto;
 pub mod memquota;
-mod stream;
+pub mod peer;
+pub mod stream;
 pub(crate) mod streammap;
 pub(crate) mod tunnel;
 mod util;
+
+#[cfg(feature = "relay")]
+pub mod relay;
+#[cfg(feature = "relay")]
+pub use relay::channel::{RelayChannelAuthMaterial, RelayChannelBuilder};
 
 pub use util::err::{Error, ResolveError};
 pub use util::skew::ClockSkew;
 
 pub use channel::params::ChannelPaddingInstructions;
-pub use client::{ClientTunnel, HopLocation, TargetHop};
+pub use client::{ClientTunnel, HopLocation, TargetHop, channel::ClientChannelBuilder};
 pub use congestion::params as ccparams;
 pub use crypto::cell::{HopNum, HopNumDisplay};
 pub use stream::flow_ctrl::params::{CellCount, FlowCtrlParameters};
 #[cfg(feature = "send-control-msg")]
-#[cfg_attr(docsrs, doc(cfg(feature = "send-control-msg")))]
 pub use {
     crate::client::Conversation,
     crate::client::msghandler::{MsgHandler, UserMsgHandler},
@@ -183,6 +188,7 @@ mod test {
     #![allow(clippy::unchecked_time_subtraction)]
     #![allow(clippy::useless_vec)]
     #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
 
     use cfg_if::cfg_if;

@@ -4,14 +4,11 @@
 //! request, or when received in particular circumstances.  They're used
 //! so that Rust's typesafety can help enforce protocol properties.
 
-use crate::{Error, Result};
 use derive_deftly::{Deftly, define_derive_deftly};
 use std::fmt::{self, Display};
-use tor_cell::chancell::{
-    ChanMsg,
-    msg::{self as chanmsg, AnyChanMsg},
-};
-use tor_memquota::derive_deftly_template_HasMemoryCost;
+use tor_cell::chancell::BoxedCellBody;
+use tor_cell::chancell::msg::{self as chanmsg};
+use tor_cell::restricted_msg;
 
 define_derive_deftly! {
     /// Derives a `TryFrom<AnyChanMsg>` implementation for enums
@@ -23,18 +20,39 @@ define_derive_deftly! {
     /// subset of the variants of [`AnyChanMsg`].
     RestrictedChanMsgSet:
 
-    impl TryFrom<AnyChanMsg> for $ttype {
-        type Error = crate::Error;
+    impl TryFrom<tor_cell::chancell::msg::AnyChanMsg> for $ttype {
+        type Error = $crate::Error;
 
-        fn try_from(m: AnyChanMsg) -> Result<$ttype> {
+        fn try_from(m: tor_cell::chancell::msg::AnyChanMsg) -> $crate::Result<$ttype> {
             match m {
-                $( AnyChanMsg::$vname(m) => Ok($ttype::$vname(m)), )
-                _ => Err(Error::ChanProto(format!(
+                $( tor_cell::chancell::msg::AnyChanMsg::$vname(m) => Ok($ttype::$vname(m)), )
+                _ => Err($crate::Error::ChanProto(format!(
                     "Got a {} {}",
-                    m.cmd(), ${tmeta(usage) as str},
+                    <tor_cell::chancell::msg::AnyChanMsg as tor_cell::chancell::ChanMsg>::cmd(&m),
+                    ${tmeta(usage) as str},
                 ))),
             }
         }
+    }
+
+    impl From<$ttype> for tor_cell::chancell::msg::AnyChanMsg {
+        fn from(m: $ttype) -> tor_cell::chancell::msg::AnyChanMsg {
+            match m {
+                $( $ttype::$vname(m) => m.into(), )
+            }
+        }
+    }
+}
+
+pub(crate) use derive_deftly_template_RestrictedChanMsgSet;
+
+restricted_msg! {
+    /// A subset of [`ChanMsg`] that can be used to create a circuit.
+    #[derive(Debug)]
+    #[allow(clippy::exhaustive_enums)]
+    pub(crate) enum CreateRequest : ChanMsg {
+        CreateFast,
+        Create2,
     }
 }
 
@@ -66,20 +84,23 @@ impl Display for CreateResponse {
     }
 }
 
-/// A subclass of ChanMsg that can correctly arrive on a live client
-/// circuit (one where a CREATED* has been received).
-#[derive(Debug, Deftly)]
-#[allow(unreachable_pub)] // Only `pub` with feature `testing`; otherwise, visible in crate
-#[derive_deftly(HasMemoryCost)]
-#[derive_deftly(RestrictedChanMsgSet)]
-#[deftly(usage = "on an open client circuit")]
-pub enum ClientCircChanMsg {
-    /// A relay cell telling us some kind of remote command from some
-    /// party on the circuit.
-    Relay(chanmsg::Relay),
-    /// A cell telling us to destroy the circuit.
-    Destroy(chanmsg::Destroy),
-    // Note: RelayEarly is not valid for clients!
+restricted_msg! {
+    /// A RELAY or RELAY_EARLY channel message.
+    #[derive(Debug)]
+    pub(crate) enum RelayMaybeEarlyChanMsg : ChanMsg {
+        Relay,
+        RelayEarly,
+    }
+}
+
+impl RelayMaybeEarlyChanMsg {
+    /// Consume this message and return a `BoxedCellBody` for encryption/decryption.
+    pub(crate) fn into_relay_body(self) -> BoxedCellBody {
+        match self {
+            Self::Relay(x) => x.into_relay_body(),
+            Self::RelayEarly(x) => x.into_relay_body(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -96,7 +117,9 @@ mod test {
     #![allow(clippy::unchecked_time_subtraction)]
     #![allow(clippy::useless_vec)]
     #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
+
     use super::*;
 
     #[test]
@@ -115,25 +138,4 @@ mod test {
         bad(msg::CreateFast::new(&b"for a lifetime or more"[..]).into());
         bad(msg::Versions::new([1, 2, 3]).unwrap().into());
     }
-
-    #[test]
-    fn client_circ_chan_msg() {
-        use tor_cell::chancell::msg::{self, AnyChanMsg};
-        fn good(m: AnyChanMsg) {
-            assert!(ClientCircChanMsg::try_from(m).is_ok());
-        }
-        fn bad(m: AnyChanMsg) {
-            assert!(ClientCircChanMsg::try_from(m).is_err());
-        }
-
-        good(msg::Destroy::new(2.into()).into());
-        bad(msg::CreatedFast::new(&b"guaranteed in this world"[..]).into());
-        bad(msg::Created2::new(&b"and the next"[..]).into());
-        good(msg::Relay::new(&b"guaranteed guaranteed"[..]).into());
-        bad(msg::AnyChanMsg::RelayEarly(
-            msg::Relay::new(&b"for the world and its mother"[..]).into(),
-        ));
-        bad(msg::Versions::new([1, 2, 3]).unwrap().into());
-    }
-
 }

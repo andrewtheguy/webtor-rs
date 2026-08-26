@@ -1,11 +1,11 @@
 //! Client channel code.
 //!
-//! This contains client specific channel code. In other words, everyting that a client needs to
+//! This contains client specific channel code. In other words, everything that a client needs to
 //! establish a channel according to the Tor protocol.
 
 pub(crate) mod handshake;
 
-pub use handshake::{ClientInitiatorHandshake, UnverifiedClientChannel, VerifiedClientChannel};
+pub use handshake::ClientInitiatorHandshake;
 
 use futures::{AsyncRead, AsyncWrite};
 

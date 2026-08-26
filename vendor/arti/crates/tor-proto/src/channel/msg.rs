@@ -1,6 +1,6 @@
 //! This contains restricted message sets namespaced by link protocol version.
 //!
-//! In other words, each protocl version define sets of possible messages depending on the channel
+//! In other words, each protocol version define sets of possible messages depending on the channel
 //! type as in client or relay and initiator or responder.
 //!
 //! This module also defines [`MessageFilter`] which can be used to filter messages based on
@@ -115,6 +115,8 @@ pub(super) mod linkv4 {
         pub(super) enum OpenChanMsgR2R : ChanMsg {
             // No Vpadding, only sent during handshake.
             // No Create/Created, it is obsolete (TAP).
+            CreateFast,
+            CreatedFast,
             Create2,
             Created2,
             Destroy,
@@ -291,6 +293,8 @@ pub(super) mod linkv5 {
         #[derive(Clone, Debug)]
         pub(super) enum OpenChanMsgR2R : ChanMsg {
             // No Create/Created, it is obsolete (TAP).
+            CreateFast,
+            CreatedFast,
             Create2,
             Created2,
             Destroy,
@@ -519,6 +523,16 @@ impl MessageFilter {
             channel_type,
             stage,
         }
+    }
+
+    /// Return the [`ChannelType`] of this filter.
+    pub(super) fn channel_type(&self) -> ChannelType {
+        self.channel_type
+    }
+
+    /// Return the [`ChannelType`] of this filter as a mutable.
+    pub(super) fn channel_type_mut(&mut self) -> &mut ChannelType {
+        &mut self.channel_type
     }
 
     /// Decode a cell from the given bytes for the right link version, channel type and message

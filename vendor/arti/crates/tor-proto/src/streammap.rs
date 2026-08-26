@@ -2,22 +2,16 @@
 
 mod halfstream;
 
-// TODO(relay): streammap is meant to be impl-agnostic
-// (it's used both by clients and relays), so ideally
-// it shouldn't need to import from client::
-use crate::client::reactor::circuit::RECV_WINDOW_INIT;
-
-use crate::congestion::sendme;
 use crate::stream::StreamMpscReceiver;
 use crate::stream::cmdcheck::AnyCmdChecker;
-use crate::stream::flow_ctrl::state::{FlowCtrlHooks, StreamFlowCtrl};
+use crate::stream::flow_ctrl::state::{FlowCtrlHooks, HalfStreamFlowCtrlHooks, StreamFlowCtrl};
 use crate::stream::queue::StreamQueueSender;
 use crate::util::stream_poll_set::{KeyAlreadyInsertedError, StreamPollSet};
 use crate::{Error, Result};
 use pin_project::pin_project;
 use tor_async_utils::peekable_stream::{PeekableStream, UnobtrusivePeekableStream};
 use tor_async_utils::stream_peek::StreamUnobtrusivePeeker;
-use tor_cell::relaycell::flow_ctrl::{Xoff, Xon, XonKbpsEwma};
+use tor_cell::relaycell::flow_ctrl::{Xoff, Xon, XonKBpsEwma};
 use tor_cell::relaycell::{RelayMsg, UnparsedRelayMsg};
 use tor_cell::relaycell::{StreamId, msg::AnyRelayMsg};
 
@@ -27,9 +21,9 @@ use std::num::NonZeroU16;
 use std::pin::Pin;
 use std::task::{Poll, Waker};
 use tor_error::{bad_api_usage, internal};
-use tor_rtcompat::Instant;
+use web_time_compat::Instant;
 
-use rand::Rng;
+use rand::RngExt;
 
 use tracing::debug;
 
@@ -103,7 +97,7 @@ impl OpenStreamEnt {
     ///
     /// If we should, then returns the XON message that should be sent.
     /// Returns an error if XON/XOFF messages aren't supported for this type of flow control.
-    pub(crate) fn maybe_send_xon(&mut self, rate: XonKbpsEwma) -> Result<Option<Xon>> {
+    pub(crate) fn maybe_send_xon(&mut self, rate: XonKBpsEwma) -> Result<Option<Xon>> {
         self.flow_ctrl
             .maybe_send_xon(rate, self.approx_stream_bytes_buffered())
     }
@@ -298,7 +292,7 @@ pub(crate) struct StreamMap {
     /// The next StreamId that we should use for a newly allocated
     /// circuit.
     next_stream_id: StreamId,
-    /// Next priority to use in `rxs`. We implement round-robin scheduling of
+    /// Next priority to use in `open_streams`. We implement round-robin scheduling of
     /// handling outgoing messages from streams by assigning a stream the next
     /// priority whenever an outgoing message is processed from that stream,
     /// putting it last in line.
@@ -375,7 +369,7 @@ impl StreamMap {
     }
 
     /// Add an entry to this map using the specified StreamId.
-    #[cfg(feature = "hs-service")]
+    #[cfg(any(feature = "hs-service", feature = "relay"))]
     pub(super) fn add_ent_with_id(
         &mut self,
         sink: StreamQueueSender,
@@ -464,13 +458,12 @@ impl StreamMap {
                         ..
                     },
             } = ent;
-            // FIXME(eta): we don't copy the receive window, instead just creating a new one,
-            //             so a malicious peer can send us slightly more data than they should
-            //             be able to; see arti#230.
-            let mut recv_window = sendme::StreamRecvWindow::new(RECV_WINDOW_INIT);
-            recv_window.decrement_n(dropped)?;
+
+            let mut flow_ctrl = flow_ctrl.half_stream();
+            flow_ctrl.handle_incoming_dropped(dropped)?;
+
             // TODO: would be nice to avoid new_ref.
-            let half_stream = HalfStream::new(flow_ctrl, recv_window, cmd_checker);
+            let half_stream = HalfStream::new(flow_ctrl, cmd_checker);
             let explicitly_dropped = why == TR::StreamTargetClosed;
 
             let prev = self.closed_streams.insert(
@@ -552,9 +545,6 @@ impl StreamMap {
             ClosedStreamEnt::EndSent(ent) => ent.expiry > now,
         });
     }
-
-    // TODO: Eventually if we want relay support, we'll need to support
-    // stream IDs chosen by somebody else. But for now, we don't need those.
 }
 
 /// A reason for terminating a stream.
@@ -566,7 +556,7 @@ pub(super) enum TerminateReason {
     /// corresponding senders were all dropped.
     StreamTargetClosed,
     /// Closing a stream because we were explicitly told to end it via
-    /// [`StreamTarget::close_pending`](crate::client::StreamTarget::close_pending).
+    /// [`StreamTarget::close_pending`](crate::stream::StreamTarget::close_pending).
     ExplicitEnd,
 }
 
@@ -592,11 +582,22 @@ mod test {
     #![allow(clippy::unchecked_time_subtraction)]
     #![allow(clippy::useless_vec)]
     #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
     use super::*;
-    use crate::client::circuit::test::fake_mpsc;
     use crate::stream::queue::fake_stream_queue;
+    use crate::stream::{StreamMpscReceiver, StreamMpscSender};
     use crate::{client::stream::OutboundDataCmdChecker, congestion::sendme::StreamSendWindow};
+    use std::fmt::Debug;
+    use tor_memquota::HasMemoryCost;
+    use web_time_compat::InstantExt;
+
+    /// Make an MPSC queue, of the type we use in Channels, but a fake one for testing
+    fn fake_mpsc<T: HasMemoryCost + Debug + Send>(
+        buffer: usize,
+    ) -> (StreamMpscSender<T>, StreamMpscReceiver<T>) {
+        crate::fake_mpsc(buffer)
+    }
 
     #[test]
     fn test_wrapping_next_stream_id() {
@@ -608,7 +609,6 @@ mod test {
     }
 
     #[test]
-    #[allow(clippy::cognitive_complexity)]
     fn streammap_basics() -> Result<()> {
         let mut map = StreamMap::new();
         let mut next_id = map.next_stream_id;
@@ -618,10 +618,7 @@ mod test {
 
         // Try add_ent
         for n in 1..=128 {
-            let (sink, _) = fake_stream_queue(
-                #[cfg(not(feature = "flowctl-cc"))]
-                128,
-            );
+            let (sink, _) = fake_stream_queue(128);
             let (_, rx) = fake_mpsc(2);
             let id = map.add_ent(
                 sink,
@@ -657,7 +654,7 @@ mod test {
 
         // Test terminate
         use TerminateReason as TR;
-        let expiry = Instant::now(); // dummy value, unused outside of the reactor
+        let expiry = Instant::get(); // dummy value, unused outside of the reactor
         assert!(map.terminate(nonesuch_id, TR::ExplicitEnd, expiry).is_err());
         assert_eq!(map.n_open_streams(), 127);
         assert_eq!(

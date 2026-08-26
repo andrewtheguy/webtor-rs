@@ -348,10 +348,11 @@ mod test {
     #![allow(clippy::unchecked_time_subtraction)]
     #![allow(clippy::useless_vec)]
     #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
 
     use super::*;
-    use rand::{RngCore, seq::IndexedRandom as _};
+    use rand::{Rng, seq::IndexedRandom as _};
     use tor_basic_utils::{RngExt as _, test_rng::testing_rng};
     use tor_bytes::SecretBuf;
     use tor_cell::relaycell::RelayCellFormat;

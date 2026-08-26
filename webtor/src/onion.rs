@@ -23,7 +23,7 @@ use crate::time::system_time_now;
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 use digest::Digest;
 use futures::channel::oneshot;
-use rand9::seq::SliceRandom;
+use rand::seq::SliceRandom;
 use std::collections::HashSet;
 use std::ops::Range;
 use std::str::FromStr;
@@ -232,7 +232,7 @@ pub(crate) fn select_hsdirs(
             selected.push(relay.clone());
         }
     }
-    selected.shuffle(&mut rand9::rng());
+    selected.shuffle(&mut rand::rng());
     selected
 }
 
@@ -385,7 +385,7 @@ impl OnionConnector {
                 "The onion service descriptor lists no introduction points".to_string(),
             ));
         }
-        intro_points.shuffle(&mut rand9::rng());
+        intro_points.shuffle(&mut rand::rng());
         self.log(
             &format!(
                 "Onion service descriptor loaded with {} introduction points",
@@ -445,11 +445,11 @@ impl OnionConnector {
                 let text = fetch_directory_document(&Arc::new(tunnel), &path).await?;
                 let now = system_time_now();
                 let descriptor =
-                    HsDesc::parse_decrypt_validate(&text, blind_id, now, subcredential, None)
+                    HsDesc::parse_decrypt_validate(&text, blind_id, subcredential, None)
                         .map_err(|error| {
                             TorError::Onion(format!("Descriptor was rejected: {error}"))
                         })?;
-                descriptor.check_valid_at(&now).map_err(|error| {
+                descriptor.if_valid_at(&now).map_err(|error| {
                     TorError::Onion(format!("Descriptor is not currently valid: {error}"))
                 })
             };
@@ -549,7 +549,7 @@ impl OnionConnector {
         info!("Using {} as the rendezvous point", rendezvous_relay.nickname);
         let (tunnel, _) = self.circuit_manager.build_tunnel_to(&target).await?;
 
-        let cookie: RendCookie = rand9::random();
+        let cookie: RendCookie = rand::random();
         let (established_sender, established) = oneshot::channel();
         let (rendezvous2_sender, rendezvous2) = oneshot::channel();
         tunnel
@@ -621,7 +621,7 @@ impl OnionConnector {
             intro_point.ipt_sid_key().clone(),
             subcredential,
         );
-        let handshake = hs_ntor::HsNtorClientState::new(&mut rand9::rng(), service_info);
+        let handshake = hs_ntor::HsNtorClientState::new(&mut rand::rng(), service_info);
         let encrypted = handshake
             .client_send_intro(&header, &payload)
             .map_err(|error| TorError::Onion(format!("hs-ntor handshake failed: {error}")))?;

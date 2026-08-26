@@ -27,7 +27,7 @@
 //! circuit's upstream channel.  These cells are either RELAY cells or
 //! DESTROY cells.  DESTROY cells are handled immediately.
 //! RELAY cells are either for a particular stream, in which case they
-//! get forwarded to a RawCellStream object, or for no particular stream,
+//! get forwarded to a StreamReceiver object, or for no particular stream,
 //! in which case they are considered "meta" cells (like EXTENDED2)
 //! that should only get accepted if something is waiting for them.
 //!
@@ -47,8 +47,8 @@ pub(crate) mod padding;
 pub(super) mod path;
 
 use crate::channel::Channel;
-use crate::circuit::celltypes::*;
 use crate::circuit::circhop::{HopNegotiationType, HopSettings};
+use crate::circuit::{CircuitRxReceiver, celltypes::*};
 #[cfg(feature = "circ-padding-manual")]
 use crate::client::CircuitPadder;
 use crate::client::circuit::padding::{PaddingController, PaddingEventStream};
@@ -58,13 +58,18 @@ use crate::crypto::handshake::ntor_v3::NtorV3PublicKey;
 use crate::memquota::CircuitAccount;
 use crate::util::skew::ClockSkew;
 use crate::{Error, Result};
+use derive_deftly::Deftly;
 use educe::Educe;
 use path::HopDetail;
-use tor_cell::chancell::CircId;
+use tor_cell::chancell::{
+    CircId,
+    msg::{self as chanmsg},
+};
 use tor_error::{bad_api_usage, internal, into_internal};
 use tor_linkspec::{CircTarget, LinkSpecType, OwnedChanTarget, RelayIdType};
 use tor_protover::named;
 use tor_rtcompat::DynTimeProvider;
+use web_time_compat::Instant;
 
 use crate::circuit::UniqId;
 
@@ -76,29 +81,34 @@ use oneshot_fused_workaround as oneshot;
 use futures::FutureExt as _;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tor_memquota::mq_queue::{self, MpscSpec};
+use tor_memquota::derive_deftly_template_HasMemoryCost;
 
 use crate::crypto::handshake::ntor::NtorPublicKey;
-
-#[cfg(test)]
-use crate::stream::{StreamMpscReceiver, StreamMpscSender};
 
 pub use crate::crypto::binding::CircuitBinding;
 pub use path::{Path, PathEntry};
 
-/// The size of the buffer for communication between `ClientCirc` and its reactor.
-pub const CIRCUIT_BUFFER_SIZE: usize = 128;
-
-pub(crate) use crate::client::reactor::syncview::ClientCircSyncView;
-
 // TODO: export this from the top-level instead (it's not client-specific).
 pub use crate::circuit::CircParameters;
 
-/// MPSC queue for inbound data on its way from channel to circuit, sender
-pub(crate) type CircuitRxSender = mq_queue::Sender<ClientCircChanMsg, MpscSpec>;
-/// MPSC queue for inbound data on its way from channel to circuit, receiver
-pub(crate) type CircuitRxReceiver = mq_queue::Receiver<ClientCircChanMsg, MpscSpec>;
+// TODO(relay): reexport this from somewhere else (it's not client-specific)
+pub use crate::util::timeout::TimeoutEstimator;
+
+/// A subclass of ChanMsg that can correctly arrive on a live client
+/// circuit (one where a CREATED* has been received).
+#[derive(Debug, Deftly)]
+#[allow(unreachable_pub)] // Only `pub` with feature `testing`; otherwise, visible in crate
+#[derive_deftly(HasMemoryCost)]
+#[derive_deftly(RestrictedChanMsgSet)]
+#[deftly(usage = "on an open client circuit")]
+pub(super) enum ClientCircChanMsg {
+    /// A relay cell telling us some kind of remote command from some
+    /// party on the circuit.
+    Relay(chanmsg::Relay),
+    /// A cell telling us to destroy the circuit.
+    Destroy(chanmsg::Destroy),
+    // Note: RelayEarly is not valid for clients!
+}
 
 #[derive(Debug)]
 /// A circuit that we have constructed over the Tor network.
@@ -222,6 +232,19 @@ impl TunnelMutableState {
     fn all_paths(&self) -> Vec<Arc<Path>> {
         let lock = self.0.lock().expect("lock poisoned");
         lock.values().map(|mutable| mutable.path()).collect()
+    }
+
+    /// Return a representation of the Paths for all the circuits in this tunnel,
+    /// as a map from each circuits' UniqId to its path.
+    ///
+    /// This is only exposed for the RPC subsystem, where it is documented that the
+    /// format of `UniqId` is not stable.
+    #[cfg(feature = "rpc")]
+    pub(super) fn tagged_paths(&self) -> HashMap<UniqId, Arc<Path>> {
+        let lock = self.0.lock().expect("lock poisoned");
+        lock.iter()
+            .map(|(id, mutable)| (*id, mutable.path()))
+            .collect()
     }
 
     /// Return a list of [`Path`] objects describing the only circuit in this tunnel.
@@ -413,12 +436,12 @@ impl ClientCirc {
     pub fn last_hop_info(&self) -> Result<Option<OwnedChanTarget>> {
         let all_paths = self.all_paths();
         let path = all_paths.first().ok_or_else(|| {
-            tor_error::bad_api_usage!("Called last_hop_info an an un-constructed tunnel")
+            tor_error::bad_api_usage!("Called last_hop_info on an un-constructed tunnel")
         })?;
         Ok(path
             .hops()
             .last()
-            .expect("Called last_hop an an un-constructed circuit")
+            .expect("Called last_hop on an un-constructed circuit")
             .as_chan_target()
             .map(OwnedChanTarget::from_chan_target))
     }
@@ -473,8 +496,8 @@ impl ClientCirc {
     ///
     /// NOTE that the Instant returned by this method is not affected by
     /// any runtime mocking; it is the output of an ordinary call to
-    /// `Instant::now()`.
-    pub async fn disused_since(&self) -> Result<Option<tor_rtcompat::Instant>> {
+    /// `Instant::get()`.
+    pub async fn disused_since(&self) -> Result<Option<Instant>> {
         let (tx, rx) = oneshot::channel();
         self.command
             .unbounded_send(CtrlCmd::GetTunnelActivity { sender: tx })
@@ -647,12 +670,20 @@ impl ClientCirc {
     /// circuits by a single "virtual" encryption hop that represents their
     /// shared cryptographic context.
     ///
+    /// Protocol settings, capabilities, and parameters
+    /// are based on the `params` and `capabilities` arguments.
+    /// The `capabilities` argument should contains a set of capabilities that both
+    /// parties have agreed to use.  Only explicitly negotiable capabilities[^2] need
+    /// to be listed.
+    ///
     /// Once a circuit has been extended in this way, it is an error to try to
     /// extend it in any other way.
     ///
     /// [^1]: Technically, the handshake is only _mostly_ out of band: the
     ///     client sends their half of the handshake in an ` message, and the
     ///     service's response is inline in its `RENDEZVOUS2` message.
+    /// [^2]: That is to say, if a capability is always-on, then there is no need to list
+    ///     it.
     //
     // TODO hs: let's try to enforce the "you can't extend a circuit again once
     // it has been extended this way" property.  We could do that with internal
@@ -770,7 +801,7 @@ impl PendingClientTunnel {
     /// Does not send a CREATE* cell on its own.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        id: CircId,
+        circ_id: CircId,
         channel: Arc<Channel>,
         createdreceiver: oneshot::Receiver<CreateResponse>,
         input: CircuitRxReceiver,
@@ -784,7 +815,7 @@ impl PendingClientTunnel {
         let time_provider = channel.time_provider().clone();
         let (reactor, control_tx, command_tx, reactor_closed_rx, mutable) = Reactor::new(
             channel,
-            id,
+            circ_id,
             unique_id,
             input,
             runtime,
@@ -801,7 +832,7 @@ impl PendingClientTunnel {
             command: command_tx,
             reactor_closed_rx: reactor_closed_rx.shared(),
             #[cfg(test)]
-            circid: id,
+            circid: circ_id,
             memquota,
             time_provider,
             is_multi_path: false,
@@ -826,9 +857,10 @@ impl PendingClientTunnel {
     /// so we don't need to know whom we're connecting to: we're just
     /// connecting to whichever relay the channel is for.
     pub async fn create_firsthop_fast(self, params: CircParameters) -> Result<ClientTunnel> {
-        // We no nothing about this relay, so we assume it supports no protocol capabilities at all.
+        // We know nothing about this relay, so we assume it supports no protocol capabilities at all.
         //
         // TODO: If we had a consensus, we could assume it supported all required-relay-protocols.
+        // TODO prop364: When we implement CreateOneHop, we will want a Protocols argument here.
         let protocols = tor_protover::Protocols::new();
         let settings =
             HopSettings::from_params_and_caps(HopNegotiationType::None, &params, &protocols)?;
@@ -964,16 +996,6 @@ impl PendingClientTunnel {
     }
 }
 
-/// An object used by circuits to compute various timeouts.
-///
-// This is implemented for the timeout `Estimator` from tor-circmgr.
-pub trait TimeoutEstimator: Send + Sync {
-    /// The estimated circuit build timeout for a circuit of the specified length.
-    ///
-    // Used by the circuit reactor for deciding when to expire half-streams.
-    fn circuit_build_timeout(&self, length: usize) -> Duration;
-}
-
 #[cfg(test)]
 pub(crate) mod test {
     // @@ begin test lint list maintained by maint/add_warning @@
@@ -988,14 +1010,16 @@ pub(crate) mod test {
     #![allow(clippy::unchecked_time_subtraction)]
     #![allow(clippy::useless_vec)]
     #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
 
     use super::*;
     use crate::channel::test::{CodecResult, new_reactor};
+    use crate::circuit::CircuitRxSender;
+    use crate::circuit::reactor::test::rmsg_to_ccmsg;
+    use crate::circuit::test::fake_mpsc;
     use crate::client::circuit::padding::new_padding;
     use crate::client::stream::DataStream;
-    #[cfg(feature = "hs-service")]
-    use crate::client::stream::IncomingStreamRequestFilter;
     use crate::congestion::params::CongestionControlParams;
     use crate::congestion::test_utils::params::build_cc_vegas_params;
     use crate::crypto::cell::RelayCellBody;
@@ -1022,7 +1046,6 @@ pub(crate) mod test {
     };
     use tor_cell::relaycell::{RelayMsg, UnparsedRelayMsg};
     use tor_linkspec::OwnedCircTarget;
-    use tor_memquota::HasMemoryCost;
     use tor_rtcompat::Runtime;
     use tor_rtcompat::SpawnExt;
     use tracing::trace;
@@ -1040,6 +1063,9 @@ pub(crate) mod test {
         tor_cell::relaycell::msg::ConfluxLink,
         tor_rtmock::MockRuntime,
     };
+
+    #[cfg(feature = "hs-service")]
+    use crate::circuit::reactor::test::AllowAllStreamsFilter;
 
     impl PendingClientTunnel {
         /// Testing only: Extract the circuit ID for this pending circuit.
@@ -1070,16 +1096,6 @@ pub(crate) mod test {
         }
     }
 
-    fn rmsg_to_ccmsg(id: Option<StreamId>, msg: relaymsg::AnyRelayMsg) -> ClientCircChanMsg {
-        // TODO #1947: test other formats.
-        let rfmt = RelayCellFormat::V0;
-        let body: BoxedCellBody = AnyRelayMsgOuter::new(id, msg)
-            .encode(rfmt, &mut testing_rng())
-            .unwrap();
-        let chanmsg = chanmsg::Relay::from(body);
-        ClientCircChanMsg::Relay(chanmsg)
-    }
-
     // Example relay IDs and keys
     const EXAMPLE_SK: [u8; 32] =
         hex!("7789d92a89711a7e2874c61ea495452cfd48627b3ca2ea9546aafa5bf7b55803");
@@ -1087,14 +1103,6 @@ pub(crate) mod test {
         hex!("395cb26b83b3cd4b91dba9913e562ae87d21ecdd56843da7ca939a6a69001253");
     const EXAMPLE_ED_ID: [u8; 32] = [6; 32];
     const EXAMPLE_RSA_ID: [u8; 20] = [10; 20];
-
-    /// Make an MPSC queue, of the type we use in Channels, but a fake one for testing
-    #[cfg(test)]
-    pub(crate) fn fake_mpsc<T: HasMemoryCost + Debug + Send>(
-        buffer: usize,
-    ) -> (StreamMpscSender<T>, StreamMpscReceiver<T>) {
-        crate::fake_mpsc(buffer)
-    }
 
     /// return an example OwnedCircTarget that can get used for an ntor handshake.
     fn example_target() -> OwnedCircTarget {
@@ -1528,7 +1536,9 @@ pub(crate) mod test {
             };
 
             let extended2 = relaymsg::Extended2::new(reply).into();
-            sink.send(rmsg_to_ccmsg(None, extended2)).await.unwrap();
+            sink.send(rmsg_to_ccmsg(None, extended2, false))
+                .await
+                .unwrap();
             (sink, rx) // gotta keep the sink and receiver alive, or the reactor will exit.
         };
 
@@ -1589,7 +1599,7 @@ pub(crate) mod test {
     async fn bad_extend_test_impl<R: Runtime>(
         rt: &R,
         reply_hop: HopNum,
-        bad_reply: ClientCircChanMsg,
+        bad_reply: AnyChanMsg,
     ) -> Error {
         let (chan, mut rx, _sink) = working_fake_channel(rt);
         let hops = std::iter::repeat_with(|| {
@@ -1653,7 +1663,7 @@ pub(crate) mod test {
     fn bad_extend_wronghop() {
         tor_rtcompat::test_with_all_runtimes!(|rt| async move {
             let extended2 = relaymsg::Extended2::new(vec![]).into();
-            let cc = rmsg_to_ccmsg(None, extended2);
+            let cc = rmsg_to_ccmsg(None, extended2, false);
 
             let error = bad_extend_test_impl(&rt, 1.into(), cc).await;
             // This case shows up as a CircDestroy, since a message sent
@@ -1672,7 +1682,7 @@ pub(crate) mod test {
     fn bad_extend_wrongtype() {
         tor_rtcompat::test_with_all_runtimes!(|rt| async move {
             let extended = relaymsg::Extended::new(vec![7; 200]).into();
-            let cc = rmsg_to_ccmsg(None, extended);
+            let cc = rmsg_to_ccmsg(None, extended, false);
 
             let error = bad_extend_test_impl(&rt, 2.into(), cc).await;
             match error {
@@ -1689,7 +1699,7 @@ pub(crate) mod test {
     #[test]
     fn bad_extend_destroy() {
         tor_rtcompat::test_with_all_runtimes!(|rt| async move {
-            let cc = ClientCircChanMsg::Destroy(chanmsg::Destroy::new(4.into()));
+            let cc = AnyChanMsg::Destroy(chanmsg::Destroy::new(4.into()));
             let error = bad_extend_test_impl(&rt, 2.into(), cc).await;
             match error {
                 Error::CircuitClosed => {}
@@ -1703,7 +1713,7 @@ pub(crate) mod test {
     fn bad_extend_crypto() {
         tor_rtcompat::test_with_all_runtimes!(|rt| async move {
             let extended2 = relaymsg::Extended2::new(vec![99; 256]).into();
-            let cc = rmsg_to_ccmsg(None, extended2);
+            let cc = rmsg_to_ccmsg(None, extended2, false);
             let error = bad_extend_test_impl(&rt, 2.into(), cc).await;
             assert_matches!(error, Error::BadCircHandshakeAuth);
         });
@@ -1748,7 +1758,9 @@ pub(crate) mod test {
 
                 // Reply with a Connected cell to indicate success.
                 let connected = relaymsg::Connected::new_empty().into();
-                sink.send(rmsg_to_ccmsg(streamid, connected)).await.unwrap();
+                sink.send(rmsg_to_ccmsg(streamid, connected, false))
+                    .await
+                    .unwrap();
 
                 // Now read a DATA cell...
                 let (id, chmsg) = rx.next().await.unwrap().into_circid_and_msg();
@@ -1772,11 +1784,15 @@ pub(crate) mod test {
                 let data = relaymsg::Data::new(b"HTTP/1.0 404 Not found\r\n")
                     .unwrap()
                     .into();
-                sink.send(rmsg_to_ccmsg(streamid, data)).await.unwrap();
+                sink.send(rmsg_to_ccmsg(streamid, data, false))
+                    .await
+                    .unwrap();
 
                 // Send an END cell to say that the conversation is over.
                 let end = relaymsg::End::new_with_reason(relaymsg::EndReason::DONE).into();
-                sink.send(rmsg_to_ccmsg(streamid, end)).await.unwrap();
+                sink.send(rmsg_to_ccmsg(streamid, end, false))
+                    .await
+                    .unwrap();
 
                 (rx, sink) // gotta keep these alive, or the reactor will exit.
             };
@@ -1825,7 +1841,9 @@ pub(crate) mod test {
                 // Reply with a CONNECTED.
                 let connected =
                     relaymsg::Connected::new_with_addr("10.0.0.1".parse().unwrap(), 1234).into();
-                sink.send(rmsg_to_ccmsg(streamid, connected)).await.unwrap();
+                sink.send(rmsg_to_ccmsg(streamid, connected, false))
+                    .await
+                    .unwrap();
 
                 // Expect an END.
                 let (_, msg) = rx.next().await.unwrap().into_circid_and_msg();
@@ -1892,7 +1910,9 @@ pub(crate) mod test {
                 // Reply with a CONNECTED.
                 let connected =
                     relaymsg::Connected::new_with_addr("10.0.0.1".parse().unwrap(), 1234).into();
-                sink.send(rmsg_to_ccmsg(streamid, connected)).await.unwrap();
+                sink.send(rmsg_to_ccmsg(streamid, connected, false))
+                    .await
+                    .unwrap();
 
                 (rx, streamid, sink) // keep these alive or the reactor will exit.
             };
@@ -1910,7 +1930,7 @@ pub(crate) mod test {
             // Write some more data on the half-stream.
             // The half-stream hasn't expired yet, so it will simply be ignored.
             let data = relaymsg::Data::new(b"hello").unwrap();
-            sink.send(rmsg_to_ccmsg(streamid, AnyRelayMsg::Data(data)))
+            sink.send(rmsg_to_ccmsg(streamid, AnyRelayMsg::Data(data), false))
                 .await
                 .unwrap();
             rt.progress_until_stalled().await;
@@ -1928,7 +1948,7 @@ pub(crate) mod test {
             // Sending this cell is a protocol violation now
             // that the half-stream expired.
             let data = relaymsg::Data::new(b"hello").unwrap();
-            sink.send(rmsg_to_ccmsg(streamid, AnyRelayMsg::Data(data)))
+            sink.send(rmsg_to_ccmsg(streamid, AnyRelayMsg::Data(data), false))
                 .await
                 .unwrap();
             rt.progress_until_stalled().await;
@@ -1989,7 +2009,9 @@ pub(crate) mod test {
             assert_matches!(rmsg, AnyRelayMsg::Begin(_));
             // Reply with a connected cell...
             let connected = relaymsg::Connected::new_empty().into();
-            sink.send(rmsg_to_ccmsg(streamid, connected)).await.unwrap();
+            sink.send(rmsg_to_ccmsg(streamid, connected, false))
+                .await
+                .unwrap();
             // Now read bytes from the stream until we have them all.
             let mut bytes_received = 0_usize;
             let mut cells_received = 0_usize;
@@ -2069,11 +2091,15 @@ pub(crate) mod test {
                 let c_sendme =
                     relaymsg::Sendme::new_tag(hex!("6400000000000000000000000000000000000000"))
                         .into();
-                sink.send(rmsg_to_ccmsg(None, c_sendme)).await.unwrap();
+                sink.send(rmsg_to_ccmsg(None, c_sendme, false))
+                    .await
+                    .unwrap();
 
                 // Make and send a stream-level sendme.
                 let s_sendme = relaymsg::Sendme::new_empty().into();
-                sink.send(rmsg_to_ccmsg(streamid, s_sendme)).await.unwrap();
+                sink.send(rmsg_to_ccmsg(streamid, s_sendme, false))
+                    .await
+                    .unwrap();
 
                 sink
             };
@@ -2114,7 +2140,9 @@ pub(crate) mod test {
                 let c_sendme =
                     relaymsg::Sendme::new_tag(hex!("FFFF0000000000000000000000000000000000FF"))
                         .into();
-                sink.send(rmsg_to_ccmsg(None, c_sendme)).await.unwrap();
+                sink.send(rmsg_to_ccmsg(None, c_sendme, false))
+                    .await
+                    .unwrap();
                 sink
             };
 
@@ -2151,7 +2179,7 @@ pub(crate) mod test {
 
             // Run clients in a single task, doing our own round-robin
             // scheduling of writes to the reactor. Conversely, if we were to
-            // put each client in its own task, we would be at the the mercy of
+            // put each client in its own task, we would be at the mercy of
             // how fairly the runtime schedules the client tasks, which is outside
             // the scope of this test.
             rt.spawn({
@@ -2212,7 +2240,9 @@ pub(crate) mod test {
                                 1234,
                             )
                             .into();
-                            sink.send(rmsg_to_ccmsg(streamid, connected)).await.unwrap();
+                            sink.send(rmsg_to_ccmsg(streamid, connected, false))
+                                .await
+                                .unwrap();
                         }
                         RelayCmd::DATA => {
                             let data_msg = relaymsg::Data::try_from(rmsg).unwrap();
@@ -2263,19 +2293,6 @@ pub(crate) mod test {
 
         p.extend_by_ed25519_id = false;
         assert!(!p.extend_by_ed25519_id);
-    }
-
-    #[cfg(feature = "hs-service")]
-    struct AllowAllStreamsFilter;
-    #[cfg(feature = "hs-service")]
-    impl IncomingStreamRequestFilter for AllowAllStreamsFilter {
-        fn disposition(
-            &mut self,
-            _ctx: &crate::client::stream::IncomingStreamRequestContext<'_>,
-            _circ: &crate::circuit::CircSyncView<'_>,
-        ) -> Result<crate::client::stream::IncomingStreamRequestDisposition> {
-            Ok(crate::client::stream::IncomingStreamRequestDisposition::Accept)
-        }
     }
 
     #[traced_test]
@@ -2359,9 +2376,7 @@ pub(crate) mod test {
                 let begin_msg = chanmsg::Relay::from(body);
 
                 // Pretend to be a client at the other end of the circuit sending a begin cell
-                send.send(ClientCircChanMsg::Relay(begin_msg))
-                    .await
-                    .unwrap();
+                send.send(AnyChanMsg::Relay(begin_msg)).await.unwrap();
 
                 // Wait until the service is ready to accept data
                 // TODO: we shouldn't need to wait! This is needed because the service will reject
@@ -2377,7 +2392,7 @@ pub(crate) mod test {
                         .unwrap();
                 let data_msg = chanmsg::Relay::from(body);
 
-                send.send(ClientCircChanMsg::Relay(data_msg)).await.unwrap();
+                send.send(AnyChanMsg::Relay(data_msg)).await.unwrap();
                 send
             };
 
@@ -2456,7 +2471,7 @@ pub(crate) mod test {
                 // Pretend to be a client at the other end of the circuit sending 2 identical begin
                 // cells (the first one will be rejected by the test service).
                 for _ in 0..STREAM_COUNT {
-                    send.send(ClientCircChanMsg::Relay(begin_msg.clone()))
+                    send.send(AnyChanMsg::Relay(begin_msg.clone()))
                         .await
                         .unwrap();
 
@@ -2472,7 +2487,7 @@ pub(crate) mod test {
                         .unwrap();
                 let data_msg = chanmsg::Relay::from(body);
 
-                send.send(ClientCircChanMsg::Relay(data_msg)).await.unwrap();
+                send.send(AnyChanMsg::Relay(data_msg)).await.unwrap();
                 send
             };
 
@@ -2525,9 +2540,7 @@ pub(crate) mod test {
                 let begin_msg = chanmsg::Relay::from(body);
 
                 // Pretend to be a client at the other end of the circuit sending a begin cell
-                send.send(ClientCircChanMsg::Relay(begin_msg))
-                    .await
-                    .unwrap();
+                send.send(AnyChanMsg::Relay(begin_msg)).await.unwrap();
 
                 send
             };
@@ -2564,7 +2577,7 @@ pub(crate) mod test {
                 assert!(
                     err_src
                         .to_string()
-                        .contains("one more more conflux circuits are invalid")
+                        .contains("one more conflux circuits are invalid")
                 );
             }
         });
@@ -2735,7 +2748,7 @@ pub(crate) mod test {
             let payload = V1LinkPayload::new(nonce, V1DesiredUx::NO_OPINION);
             // Send a LINKED cell
             let linked = relaymsg::ConfluxLinked::new(payload).into();
-            sink.send(rmsg_to_ccmsg(None, linked)).await.unwrap();
+            sink.send(rmsg_to_ccmsg(None, linked, false)).await.unwrap();
 
             rt.advance_until_stalled().await;
             assert!(tunnel.is_closed());
@@ -2762,7 +2775,7 @@ pub(crate) mod test {
             let linked = relaymsg::ConfluxLinked::new(link.payload().clone()).into();
             circ1
                 .circ_tx
-                .send(rmsg_to_ccmsg(None, linked))
+                .send(rmsg_to_ccmsg(None, linked, false))
                 .await
                 .unwrap();
 
@@ -2797,22 +2810,27 @@ pub(crate) mod test {
                     rmsg_to_ccmsg(
                         None,
                         relaymsg::ConfluxLinked::new(bad_link_payload.clone()).into(),
+                        false,
                     ),
                     "Received CONFLUX_LINKED cell with mismatched nonce",
                 ),
                 (
-                    rmsg_to_ccmsg(None, relaymsg::ConfluxLink::new(bad_link_payload).into()),
+                    rmsg_to_ccmsg(
+                        None,
+                        relaymsg::ConfluxLink::new(bad_link_payload).into(),
+                        false,
+                    ),
                     "Unexpected CONFLUX_LINK cell from hop #3 on client circuit",
                 ),
                 (
-                    rmsg_to_ccmsg(None, relaymsg::ConfluxSwitch::new(0).into()),
+                    rmsg_to_ccmsg(None, relaymsg::ConfluxSwitch::new(0).into(), false),
                     "Received CONFLUX_SWITCH on unlinked circuit?!",
                 ),
                 // TODO: this currently causes the reactor to shut down immediately,
                 // without sending a response on the handshake channel
                 /*
                 (
-                    rmsg_to_ccmsg(None, extended2),
+                    rmsg_to_ccmsg(None, extended2, false),
                     "Received CONFLUX_LINKED cell with mismatched nonce",
                 ),
                 */
@@ -2860,12 +2878,14 @@ pub(crate) mod test {
                 rmsg_to_ccmsg(
                     None,
                     relaymsg::ConfluxLinked::new(link_payload.clone()).into(),
+                    false,
                 ),
                 rmsg_to_ccmsg(
                     None,
                     relaymsg::ConfluxLink::new(link_payload.clone()).into(),
+                    false,
                 ),
-                rmsg_to_ccmsg(None, relaymsg::ConfluxSwitch::new(0).into()),
+                rmsg_to_ccmsg(None, relaymsg::ConfluxSwitch::new(0).into(), false),
             ];
 
             for bad_cell in bad_cells {
@@ -2902,7 +2922,7 @@ pub(crate) mod test {
             let linked = relaymsg::ConfluxLinked::new(link.payload().clone()).into();
             circ1
                 .circ_tx
-                .send(rmsg_to_ccmsg(None, linked))
+                .send(rmsg_to_ccmsg(None, linked, false))
                 .await
                 .unwrap();
 
@@ -2910,13 +2930,13 @@ pub(crate) mod test {
             let linked = relaymsg::ConfluxLinked::new(link.payload().clone()).into();
             circ2
                 .circ_tx
-                .send(rmsg_to_ccmsg(None, linked))
+                .send(rmsg_to_ccmsg(None, linked, false))
                 .await
                 .unwrap();
             let linked = relaymsg::ConfluxLinked::new(link.payload().clone()).into();
             circ2
                 .circ_tx
-                .send(rmsg_to_ccmsg(None, linked))
+                .send(rmsg_to_ccmsg(None, linked, false))
                 .await
                 .unwrap();
 
@@ -2958,7 +2978,7 @@ pub(crate) mod test {
                 for circ in [&mut circ1, &mut circ2] {
                     let linked = relaymsg::ConfluxLinked::new(link.payload().clone()).into();
                     circ.circ_tx
-                        .send(rmsg_to_ccmsg(None, linked))
+                        .send(rmsg_to_ccmsg(None, linked, false))
                         .await
                         .unwrap();
                 }
@@ -2968,7 +2988,7 @@ pub(crate) mod test {
 
                 // Now send a bad SWITCH cell on the first leg.
                 // This will cause the tunnel reactor to shut down.
-                let msg = rmsg_to_ccmsg(None, bad_cell.clone().into());
+                let msg = rmsg_to_ccmsg(None, bad_cell.clone().into(), false);
                 circ1.circ_tx.send(msg).await.unwrap();
 
                 // The tunnel should be shutting down
@@ -2997,7 +3017,7 @@ pub(crate) mod test {
             for circ in [&mut circ1, &mut circ2] {
                 let linked = relaymsg::ConfluxLinked::new(link.payload().clone()).into();
                 circ.circ_tx
-                    .send(rmsg_to_ccmsg(None, linked))
+                    .send(rmsg_to_ccmsg(None, linked, false))
                     .await
                     .unwrap();
             }
@@ -3007,7 +3027,7 @@ pub(crate) mod test {
 
             // Send a valid SWITCH cell on the first leg.
             let switch1 = relaymsg::ConfluxSwitch::new(10);
-            let msg = rmsg_to_ccmsg(None, switch1.into());
+            let msg = rmsg_to_ccmsg(None, switch1.into(), false);
             circ1.circ_tx.send(msg).await.unwrap();
 
             // The tunnel should not be shutting down
@@ -3016,7 +3036,7 @@ pub(crate) mod test {
 
             // Send another valid SWITCH cell on the same leg.
             let switch2 = relaymsg::ConfluxSwitch::new(12);
-            let msg = rmsg_to_ccmsg(None, switch2.into());
+            let msg = rmsg_to_ccmsg(None, switch2.into(), false);
             circ1.circ_tx.send(msg).await.unwrap();
 
             // The tunnel should now be shutting down
@@ -3239,7 +3259,7 @@ pub(crate) mod test {
 
         // Reply with a LINKED cell...
         let linked = relaymsg::ConfluxLinked::new(link.payload().clone()).into();
-        sink.send(rmsg_to_ccmsg(None, linked)).await.unwrap();
+        sink.send(rmsg_to_ccmsg(None, linked, false)).await.unwrap();
 
         // Wait for the client to respond with LINKED_ACK...
         let (_id, chmsg) = rx.next().await.unwrap().into_circid_and_msg();
@@ -3349,7 +3369,7 @@ pub(crate) mod test {
                         };
 
                         circ.circ_tx
-                            .send(rmsg_to_ccmsg(streamid, cell))
+                            .send(rmsg_to_ccmsg(streamid, cell, false))
                             .await
                             .unwrap();
 
@@ -3388,7 +3408,7 @@ pub(crate) mod test {
                     // Reply with a connected cell...
                     let connected = relaymsg::Connected::new_empty().into();
                     circ.circ_tx
-                        .send(rmsg_to_ccmsg(streamid, connected))
+                        .send(rmsg_to_ccmsg(streamid, connected, false))
                         .await
                         .unwrap();
                     // Tell the other leg we received a BEGIN cell
@@ -3426,7 +3446,7 @@ pub(crate) mod test {
                         .data_recvd
                         .extend_from_slice(dat.as_ref());
 
-                    let is_next_cell_sendme = data_cells_received % 31 == 0;
+                    let is_next_cell_sendme = data_cells_received.is_multiple_of(31);
                     if is_next_cell_sendme {
                         if tags.is_empty() {
                             // Important: we need to make sure all the SENDMEs
@@ -3461,7 +3481,7 @@ pub(crate) mod test {
                         let sendme = relaymsg::Sendme::from(tag).into();
 
                         circ.circ_tx
-                            .send(rmsg_to_ccmsg(None, sendme))
+                            .send(rmsg_to_ccmsg(None, sendme, false))
                             .await
                             .unwrap();
                     }
@@ -3476,7 +3496,7 @@ pub(crate) mod test {
         if is_sending_leg && !end_recvd {
             let end = relaymsg::End::new_with_reason(relaymsg::EndReason::DONE).into();
             circ.circ_tx
-                .send(rmsg_to_ccmsg(streamid, end))
+                .send(rmsg_to_ccmsg(streamid, end, false))
                 .await
                 .unwrap();
             stream_state.lock().unwrap().end_sent = true;
@@ -4011,7 +4031,7 @@ pub(crate) mod test {
             for circ in [&mut circ1, &mut circ2] {
                 let linked = relaymsg::ConfluxLinked::new(link.payload().clone()).into();
                 circ.circ_tx
-                    .send(rmsg_to_ccmsg(None, linked))
+                    .send(rmsg_to_ccmsg(None, linked, false))
                     .await
                     .unwrap();
             }
@@ -4037,5 +4057,25 @@ pub(crate) mod test {
                 "{err_src}"
             );
         });
+    }
+
+    #[test]
+    fn client_circ_chan_msg() {
+        use tor_cell::chancell::msg::{self, AnyChanMsg};
+        fn good(m: AnyChanMsg) {
+            assert!(ClientCircChanMsg::try_from(m).is_ok());
+        }
+        fn bad(m: AnyChanMsg) {
+            assert!(ClientCircChanMsg::try_from(m).is_err());
+        }
+
+        good(msg::Destroy::new(2.into()).into());
+        bad(msg::CreatedFast::new(&b"guaranteed in this world"[..]).into());
+        bad(msg::Created2::new(&b"and the next"[..]).into());
+        good(msg::Relay::new(&b"guaranteed guaranteed"[..]).into());
+        bad(msg::AnyChanMsg::RelayEarly(
+            msg::Relay::new(&b"for the world and its mother"[..]).into(),
+        ));
+        bad(msg::Versions::new([1, 2, 3]).unwrap().into());
     }
 }

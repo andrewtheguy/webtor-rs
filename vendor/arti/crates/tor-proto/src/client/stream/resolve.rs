@@ -1,7 +1,7 @@
 //! Declare a type for streams that do hostname lookups
 
-use crate::client::stream::StreamReceiver;
 use crate::memquota::StreamAccount;
+use crate::stream::StreamReceiver;
 use crate::stream::cmdcheck::{AnyCmdChecker, CmdChecker, StreamStatus};
 use crate::{Error, Result};
 
@@ -13,7 +13,7 @@ use tor_cell::restricted_msg;
 /// A ResolveStream represents a pending DNS request made with a RESOLVE
 /// cell.
 pub struct ResolveStream {
-    /// The underlying RawCellStream.
+    /// The underlying StreamReceiver.
     s: StreamReceiver,
 
     /// The memory quota account that should be used for this "stream"'s data
@@ -31,7 +31,7 @@ restricted_msg! {
 }
 
 impl ResolveStream {
-    /// Wrap a RawCellStream into a ResolveStream.
+    /// Wrap a StreamReceiver into a ResolveStream.
     ///
     /// Call only after sending a RESOLVE cell.
     pub(crate) fn new(s: StreamReceiver, memquota: StreamAccount) -> Self {
@@ -104,7 +104,7 @@ impl CmdChecker for ResolveCmdChecker {
 }
 
 impl ResolveCmdChecker {
-    /// Return a new boxed `DataCmdChecker` in a state suitable for a newly
+    /// Return a new boxed `ResolveCmdChecker` in a state suitable for a newly
     /// constructed connection.
     pub(crate) fn new_any() -> AnyCmdChecker {
         Box::<Self>::default()

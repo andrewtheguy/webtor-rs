@@ -17,14 +17,17 @@ use crate::snowflake_webrtc::{SnowflakeWebRtcConfig, SnowflakeWebRtcStream};
 use crate::snowflake_ws::SnowflakeWsStream;
 use crate::time::system_time_now;
 use crate::wasm_runtime::WasmRuntime;
+use safelog::MaybeSensitive;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use async_lock::{Mutex, RwLock};
 use tor_linkspec::OwnedChanTargetBuilder;
 use tor_llcrypto::pk::rsa::RsaIdentity;
 use tor_memquota::MemoryQuotaTracker;
-use tor_proto::channel::ChannelBuilder;
+use tor_proto::client::channel::ClientChannelBuilder;
 use tor_proto::client::stream::DataStream;
 use tor_proto::memquota::{ChannelAccount, SpecificAccount};
+use tor_proto::peer::PeerAddr;
 use tracing::{debug, error, info};
 
 pub struct TorClient {
@@ -231,13 +234,14 @@ impl TorClient {
             .map_err(|error| {
                 TorError::Network(format!("Failed to read bridge certificate: {error}"))
             })?
-            .ok_or_else(|| TorError::Network("Bridge supplied no certificate".to_string()))?;
+            .ok_or_else(|| TorError::Network("Bridge supplied no certificate".to_string()))?
+            .into_owned();
 
         let quota = MemoryQuotaTracker::new_noop();
         let account = ChannelAccount::new(&quota).map_err(|error| {
             TorError::Internal(format!("Failed to create channel quota account: {error}"))
         })?;
-        let handshake = ChannelBuilder::new().launch_client(stream, WasmRuntime::new(), account);
+        let handshake = ClientChannelBuilder::new().launch(stream, WasmRuntime::new(), account);
         let unverified = handshake.connect(system_time_now).await.map_err(|error| {
             TorError::Network(format!("Tor channel handshake failed: {error}"))
         })?;
@@ -247,12 +251,19 @@ impl TorClient {
         let peer = peer
             .build()
             .map_err(|error| TorError::Internal(format!("Invalid bridge target: {error}")))?;
+        // The browser transport hides the relay behind a Snowflake proxy, so we
+        // have no address for it. An unspecified address makes the NETINFO cell
+        // carry 0.0.0.0, which is what Tor clients send when they cannot tell.
+        let peer_addr = MaybeSensitive::sensitive(PeerAddr::Direct(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            0,
+        )));
         let (channel, reactor) = unverified
-            .check(&peer, &peer_certificate, Some(system_time_now()))
+            .verify(&peer, &peer_certificate, Some(system_time_now()))
             .map_err(|error| {
                 TorError::Network(format!("Bridge authentication failed: {error}"))
             })?
-            .finish()
+            .finish(peer_addr)
             .await
             .map_err(|error| {
                 TorError::Network(format!("Tor channel handshake failed: {error}"))

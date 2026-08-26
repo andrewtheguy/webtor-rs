@@ -159,7 +159,7 @@ where
 
     /// Return true iff the SENDME tag should be recorded.
     pub(crate) fn should_record_tag(&self) -> bool {
-        self.window % P::increment() == 0
+        self.window.is_multiple_of(P::increment())
     }
 
     /// Remove one item from this window (since we've sent a cell).
@@ -281,6 +281,7 @@ mod test {
     #![allow(clippy::unchecked_time_subtraction)]
     #![allow(clippy::useless_vec)]
     #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
     use super::*;
     use tor_basic_utils::test_rng::testing_rng;

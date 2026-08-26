@@ -14,7 +14,7 @@
 //! To launch a channel:
 //!
 //!  * Create a TLS connection as an object that implements AsyncRead +
-//!    AsyncWrite + StreamOps, and pass it to a [ChannelBuilder].  This will
+//!    AsyncWrite + StreamOps, and pass it to a channel builder. This will
 //!    yield an [crate::client::channel::handshake::ClientInitiatorHandshake] that represents
 //!    the state of the handshake.
 //!  * Call [crate::client::channel::handshake::ClientInitiatorHandshake::connect] on the result
@@ -50,8 +50,8 @@
 /// The size of the channel buffer for communication between `Channel` and its reactor.
 pub const CHANNEL_BUFFER_SIZE: usize = 128;
 
-mod circmap;
-mod handler;
+pub(crate) mod circmap;
+pub(crate) mod handler;
 pub(crate) mod handshake;
 pub mod kist;
 mod msg;
@@ -60,43 +60,47 @@ pub mod params;
 mod reactor;
 mod unique_id;
 
+#[cfg(test)]
+pub(crate) mod test_utils;
+
 pub use crate::channel::params::*;
 pub(crate) use crate::channel::reactor::Reactor;
 use crate::channel::reactor::{BoxedChannelSink, BoxedChannelStream};
 pub use crate::channel::unique_id::UniqId;
-use crate::client::channel::ClientChannelBuilder;
+use crate::client::circuit::PendingClientTunnel;
 use crate::client::circuit::padding::{PaddingController, QueuedCellPaddingInfo};
-use crate::client::circuit::{PendingClientTunnel, TimeoutEstimator};
 use crate::memquota::{ChannelAccount, CircuitAccount, SpecificAccount as _};
+use crate::peer::PeerInfo;
 use crate::util::err::ChannelClosed;
 use crate::util::oneshot_broadcast;
+use crate::util::timeout::TimeoutEstimator;
 use crate::util::ts::AtomicOptTimestamp;
 use crate::{ClockSkew, client};
 use crate::{Error, Result};
 use cfg_if::cfg_if;
 use reactor::BoxedChannelStreamOps;
-use safelog::sensitive as sv;
+use safelog::{MaybeSensitive, sensitive as sv};
 use std::future::{Future, IntoFuture};
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 use tor_cell::chancell::ChanMsg;
-use tor_cell::chancell::msg::AnyChanMsg;
-use tor_cell::chancell::{AnyChanCell, CircId, msg::PaddingNegotiate};
-use tor_cell::restricted_msg;
+use tor_cell::chancell::{AnyChanCell, CircId, msg::Netinfo, msg::PaddingNegotiate};
 use tor_error::internal;
 use tor_linkspec::{HasRelayIds, OwnedChanTarget};
 use tor_memquota::mq_queue::{self, ChannelSpec as _, MpscSpec};
-use tor_rtcompat::{CoarseTimeProvider, DynTimeProvider, SleepProvider, StreamOps};
-
-// Type alias for opened_at timestamp - use web_time on WASM since coarsetime doesn't support it
-#[cfg(not(target_arch = "wasm32"))]
-type OpenedAtInstant = coarsetime::Instant;
-#[cfg(target_arch = "wasm32")]
-type OpenedAtInstant = web_time::Instant;
+use tor_rtcompat::{CoarseTimeProvider, DynTimeProvider, SleepProvider};
 
 #[cfg(feature = "circ-padding")]
 use tor_async_utils::counting_streams::{self, CountingSink, CountingStream};
+
+#[cfg(feature = "relay")]
+use {
+    crate::channel::reactor::CreateRequestHandlerAndData, crate::circuit::CircuitRxReceiver,
+    crate::relay::channel::create_handler::CreateRequestHandler,
+    tor_llcrypto::pk::ed25519::Ed25519Identity, tor_llcrypto::pk::rsa::RsaIdentity,
+};
 
 /// Imports that are re-exported pub if feature `testing` is enabled
 ///
@@ -127,34 +131,12 @@ use tracing::{instrument, trace};
 
 // reexport
 pub use super::client::channel::handshake::ClientInitiatorHandshake;
+#[cfg(feature = "relay")]
+pub use super::relay::channel::handshake::RelayInitiatorHandshake;
+pub(crate) use crate::channel::handler::{ClogDigest, SlogDigest};
 use crate::channel::unique_id::CircUniqIdContext;
 
 use kist::KistParams;
-
-restricted_msg! {
-    /// A channel message that we allow to be sent from a server to a client on
-    /// an open channel.
-    ///
-    /// (An Open channel here is one on which we have received a NETINFO cell.)
-    ///
-    /// Note that an unexpected message type will _not_ be ignored: instead, it
-    /// will cause the channel to shut down.
-    #[derive(Clone, Debug)]
-    pub(crate) enum OpenChanMsgS2C : ChanMsg {
-        Padding,
-        Vpadding,
-        // Not Create*, since we are not a relay.
-        // Not Created, since we never send CREATE.
-        CreatedFast,
-        Created2,
-        Relay,
-        // Not RelayEarly, since we are a client.
-        Destroy,
-        // Not PaddingNegotiate, since we are not a relay.
-        // Not Versions, Certs, AuthChallenge, Authenticate: they are for handshakes.
-        // Not Authorize: it is reserved, but unused.
-    }
-}
 
 /// This indicate what type of channel it is. It allows us to decide for the correct channel cell
 /// state machines and authentication process (if any).
@@ -182,6 +164,15 @@ pub enum ChannelType {
     },
 }
 
+impl ChannelType {
+    /// Set that this channel type is now authenticated. This only applies to RelayResponder.
+    pub(crate) fn set_authenticated(&mut self) {
+        if let Self::RelayResponder { authenticated } = self {
+            *authenticated = true;
+        }
+    }
+}
+
 /// A channel cell frame used for sending and receiving cells on a channel. The handler takes care
 /// of the cell codec transition depending in which state the channel is.
 ///
@@ -207,6 +198,59 @@ where
     framed
 }
 
+/// Canonical state between this channel and its peer. This is inferred from the [`Netinfo`]
+/// received during the channel handshake.
+///
+/// A connection is "canonical" if the TCP connection's peer IP address matches an address
+/// that the relay itself claims in its [`Netinfo`] cell.
+#[derive(Debug)]
+pub(crate) struct Canonicity {
+    /// The peer has proven this connection is canonical for its address: at least one NETINFO "my
+    /// address" matches the observed TCP peer address.
+    pub(crate) peer_is_canonical: bool,
+    /// We appear canonical from the peer's perspective: its NETINFO "other address" matches our
+    /// advertised relay address.
+    pub(crate) canonical_to_peer: bool,
+}
+
+impl Canonicity {
+    /// Using a [`Netinfo`], build the canonicity object with the given addresses.
+    ///
+    /// The `my_addrs` are the advertised address of this relay or empty if a client/bridge as they
+    /// do not advertise or expose a reachable address.
+    ///
+    /// The `peer_addr` is the IP address we believe the peer has. In other words, it is either the
+    /// IP we used to connect to or the address we see in the accept() phase of the connection.
+    ///
+    /// It can be None if we used a non-IP address to connect to the peer (PT).
+    pub(crate) fn from_netinfo(
+        netinfo: &Netinfo,
+        my_addrs: &[IpAddr],
+        peer_addr: Option<IpAddr>,
+    ) -> Self {
+        Self {
+            // The "other addr" (our address as seen by the peer) matches the one we advertised.
+            canonical_to_peer: netinfo
+                .their_addr()
+                .is_some_and(|a: &IpAddr| my_addrs.contains(a)),
+            // The "my addresses" (the peer addresses that it claims to have) matches the one we
+            // see on the connection or that we attempted to connect to.
+            peer_is_canonical: peer_addr
+                .map(|a| netinfo.my_addrs().contains(&a))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Construct a fully canonical object.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn new_canonical() -> Self {
+        Self {
+            peer_is_canonical: true,
+            canonical_to_peer: true,
+        }
+    }
+}
+
 /// An open client channel, ready to send and receive Tor cells.
 ///
 /// A channel is a direct connection to a Tor relay, implemented using TLS.
@@ -220,7 +264,7 @@ where
 ///
 /// # Channel life cycle
 ///
-/// Channels can be created directly here through the [`ChannelBuilder`] API.
+/// Channels can be created directly here through a channel builder (client or relay) API.
 /// For a higher-level API (with better support for TLS, pluggable transports,
 /// and channel reuse) see the `tor-chanmgr` crate.
 ///
@@ -236,11 +280,7 @@ where
 /// Note that in cases 1-3, the [`Channel`] object itself will still exist: it
 /// will just be unusable for most purposes.  Most operations on it will fail
 /// with an error.
-#[derive(Debug)]
 pub struct Channel {
-    /// The channel type.
-    #[expect(unused)] // TODO: Remove once used.
-    channel_type: ChannelType,
     /// A channel used to send control messages to the Reactor.
     control: mpsc::UnboundedSender<CtrlMsg>,
     /// A channel used to send cells to the Reactor.
@@ -257,18 +297,21 @@ pub struct Channel {
 
     /// A unique identifier for this channel.
     unique_id: UniqId,
-    /// Validated identity and address information for this peer.
+    /// Target identity and address information for this peer.
     peer_id: OwnedChanTarget,
+    /// Validated information for this peer.
+    peer: MaybeSensitive<Arc<PeerInfo>>,
     /// The declared clock skew on this channel, at the time when this channel was
     /// created.
     clock_skew: ClockSkew,
     /// The time when this channel was successfully completed
-    opened_at: OpenedAtInstant,
+    opened_at: coarsetime::Instant,
     /// Mutable state used by the `Channel.
     mutable: Mutex<MutableDetails>,
-
     /// Information shared with the reactor
     details: Arc<ChannelDetails>,
+    /// Canonicity of this channel.
+    canonicity: Canonicity,
 }
 
 /// This is information shared between the reactor and the frontend (`Channel` object).
@@ -487,68 +530,6 @@ impl Sink<ChanCellQueueEntry> for ChannelSender {
     }
 }
 
-/// Structure for building and launching a Tor channel.
-//
-// TODO(relay): Remove this as we now have ClientChannelBuilder and soon RelayChannelBuilder.
-#[derive(Default)]
-pub struct ChannelBuilder {
-    /// If present, a description of the address we're trying to connect to,
-    /// and the way in which we are trying to connect to it.
-    ///
-    /// TODO: at some point, check this against the addresses in the netinfo
-    /// cell too.
-    target: Option<tor_linkspec::ChannelMethod>,
-}
-
-impl ChannelBuilder {
-    /// Construct a new ChannelBuilder.
-    pub fn new() -> Self {
-        ChannelBuilder::default()
-    }
-
-    /// Set the declared target method of this channel to correspond to a direct
-    /// connection to a given socket address.
-    #[deprecated(note = "use set_declared_method instead", since = "0.7.1")]
-    pub fn set_declared_addr(&mut self, target: std::net::SocketAddr) {
-        self.set_declared_method(tor_linkspec::ChannelMethod::Direct(vec![target]));
-    }
-
-    /// Set the declared target method of this channel.
-    ///
-    /// Note that nothing enforces the correctness of this method: it
-    /// doesn't have to match the real method used to create the TLS
-    /// stream.
-    pub fn set_declared_method(&mut self, target: tor_linkspec::ChannelMethod) {
-        self.target = Some(target);
-    }
-
-    /// Launch a new client handshake over a TLS stream.
-    ///
-    /// After calling this function, you'll need to call `connect()` on
-    /// the result to start the handshake.  If that succeeds, you'll have
-    /// authentication info from the relay: call `check()` on the result
-    /// to check that.  Finally, to finish the handshake, call `finish()`
-    /// on the result of _that_.
-    pub fn launch_client<T, S>(
-        self,
-        tls: T,
-        sleep_prov: S,
-        memquota: ChannelAccount,
-    ) -> ClientInitiatorHandshake<T, S>
-    where
-        T: AsyncRead + AsyncWrite + StreamOps + Send + Unpin + 'static,
-        S: CoarseTimeProvider + SleepProvider,
-    {
-        // TODO(relay): We could just make the target be taken as a parameter instead of using a
-        // setter that is also replicated on the client builder? Food for thought on refactor here.
-        let mut builder = ClientChannelBuilder::new();
-        if let Some(target) = self.target {
-            builder.set_declared_method(target);
-        }
-        builder.launch(tls, sleep_prov, memquota)
-    }
-}
-
 impl Channel {
     /// Construct a channel and reactor.
     ///
@@ -559,24 +540,32 @@ impl Channel {
     /// Quick note on the allow clippy. This is has one call site so for now, it is fine that we
     /// bust the mighty 7 arguments.
     #[allow(clippy::too_many_arguments)] // TODO consider if we want a builder
-    fn new<S>(
-        channel_type: ChannelType,
+    fn new<R>(
+        channel_mode: ChannelMode,
         link_protocol: u16,
         sink: BoxedChannelSink,
         stream: BoxedChannelStream,
         streamops: BoxedChannelStreamOps,
         unique_id: UniqId,
         peer_id: OwnedChanTarget,
+        peer: MaybeSensitive<PeerInfo>,
         clock_skew: ClockSkew,
-        sleep_prov: S,
+        runtime: R,
         memquota: ChannelAccount,
-    ) -> Result<(Arc<Self>, reactor::Reactor<S>)>
+        canonicity: Canonicity,
+    ) -> Result<(Arc<Self>, reactor::Reactor<R>)>
     where
-        S: CoarseTimeProvider + SleepProvider,
+        R: CoarseTimeProvider + SleepProvider,
     {
         use circmap::{CircIdRange, CircMap};
-        let circmap = CircMap::new(CircIdRange::High);
-        let dyn_time = DynTimeProvider::new(sleep_prov.clone());
+        let circid_range = match channel_mode {
+            // client channels always originate here
+            ChannelMode::Client => CircIdRange::High,
+            #[cfg(feature = "relay")]
+            ChannelMode::Relay { circ_id_range, .. } => circ_id_range,
+        };
+        let circmap = CircMap::new(circid_range);
+        let dyn_time = DynTimeProvider::new(runtime.clone());
 
         let (control_tx, control_rx) = mpsc::unbounded();
         let (cell_tx, cell_rx) = mq_queue::MpscSpec::new(CHANNEL_BUFFER_SIZE)
@@ -601,24 +590,25 @@ impl Channel {
         // so it might allocate a bit more than necessary to account for multiple hops.
         // We should tune it when we deploy padding in production.
         let (padding_ctrl, padding_event_stream) =
-            client::circuit::padding::new_padding(DynTimeProvider::new(sleep_prov.clone()));
+            client::circuit::padding::new_padding(DynTimeProvider::new(runtime.clone()));
 
         let channel = Arc::new(Channel {
-            channel_type,
             control: control_tx,
             cell_tx,
             reactor_closed_rx,
             padding_ctrl: padding_ctrl.clone(),
             unique_id,
             peer_id,
+            peer: peer.map(Arc::new),
             clock_skew,
-            opened_at: OpenedAtInstant::now(),
+            opened_at: coarsetime::Instant::now(),
             mutable: Mutex::new(mutable),
             details: Arc::clone(&details),
+            canonicity,
         });
 
         // We start disabled; the channel manager will `reconfigure` us soon after creation.
-        let padding_timer = Box::pin(padding::Timer::new_disabled(sleep_prov.clone(), None)?);
+        let padding_timer = Box::pin(padding::Timer::new_disabled(runtime.clone(), None)?);
 
         cfg_if! {
             if #[cfg(feature = "circ-padding")] {
@@ -627,8 +617,28 @@ impl Channel {
             }
         }
 
+        #[cfg(feature = "relay")]
+        let create_request_handler: Option<_> = match channel_mode {
+            ChannelMode::Relay {
+                create_request_handler,
+                our_ed25519_id,
+                our_rsa_id,
+                ..
+            } => Some(CreateRequestHandlerAndData {
+                handler: create_request_handler,
+                channel: Arc::downgrade(&channel),
+                our_ed25519_id,
+                our_rsa_id,
+            }),
+            ChannelMode::Client => None,
+        };
+        // clippy wants us to consume `channel_mode` (`needless_pass_by_value`)
+        #[cfg(not(feature = "relay"))]
+        #[expect(clippy::drop_non_drop)]
+        drop(channel_mode);
+
         let reactor = Reactor {
-            runtime: sleep_prov,
+            runtime,
             control: control_rx,
             cells: cell_rx,
             reactor_closed_tx,
@@ -640,6 +650,8 @@ impl Channel {
             link_protocol,
             unique_id,
             details,
+            #[cfg(feature = "relay")]
+            create_request_handler,
             padding_timer,
             padding_ctrl,
             padding_event_stream,
@@ -795,6 +807,16 @@ impl Channel {
         self.reactor_closed_rx.is_ready()
     }
 
+    /// Return true iff this channel is considered canonical by us.
+    pub fn is_canonical(&self) -> bool {
+        self.canonicity.peer_is_canonical
+    }
+
+    /// Return true if we think the peer considers this channel as canonical.
+    pub fn is_canonical_to_peer(&self) -> bool {
+        self.canonicity.canonical_to_peer
+    }
+
     /// If the channel is not in use, return the amount of time
     /// it has had with no circuits.
     ///
@@ -814,6 +836,12 @@ impl Channel {
             unique_id: self.unique_id,
             padding_ctrl: self.padding_ctrl.clone(),
         }
+    }
+
+    /// Return the [`PeerInfo`] of this channel.
+    #[cfg(feature = "relay")]
+    pub(crate) fn peer_info(&self) -> &Arc<PeerInfo> {
+        &self.peer
     }
 
     /// Return a newly allocated PendingClientTunnel object with
@@ -838,21 +866,23 @@ impl Channel {
         // TODO: blocking is risky, but so is unbounded.
         let (sender, receiver) =
             MpscSpec::new(128).new_mq(time_prov.clone(), memquota.as_raw_account())?;
+        let (sender, receiver) = crate::circuit::circ_sender::channel(sender, receiver);
         let (createdsender, createdreceiver) = oneshot::channel::<CreateResponse>();
 
         let (tx, rx) = oneshot::channel();
+
         self.send_control(CtrlMsg::AllocateCircuit {
             created_sender: createdsender,
             sender,
             tx,
         })?;
-        let (id, circ_unique_id, padding_ctrl, padding_stream) =
+        let (circ_id, circ_unique_id, padding_ctrl, padding_stream) =
             rx.await.map_err(|_| ChannelClosed)??;
 
-        trace!("{}: Allocated CircId {}", circ_unique_id, id);
+        trace!("{}: Allocated CircId {}", circ_unique_id, circ_id);
 
         Ok(PendingClientTunnel::new(
-            id,
+            circ_id,
             self.clone(),
             createdreceiver,
             receiver,
@@ -863,6 +893,55 @@ impl Channel {
             padding_stream,
             timeouts,
         ))
+    }
+
+    /// Return a newly allocated outbound relay circuit with.
+    ///
+    /// A circuit ID is allocated, but no messages are sent, and no cryptography is done.
+    ///
+    // TODO(relay): this duplicates much of new_tunnel above, but I expect
+    // the implementations to diverge once we introduce a new CtrlMsg for
+    // allocating relay circuits.
+    #[cfg(feature = "relay")]
+    pub(crate) async fn new_outbound_circ(
+        self: &Arc<Self>,
+        memquota: CircuitAccount,
+    ) -> Result<(CircId, CircuitRxReceiver, oneshot::Receiver<CreateResponse>)> {
+        if self.is_closing() {
+            return Err(ChannelClosed.into());
+        }
+
+        let time_prov = self.time_provider().clone();
+
+        // TODO: blocking is risky, but so is unbounded.
+        let (sender, receiver) =
+            MpscSpec::new(128).new_mq(time_prov.clone(), memquota.as_raw_account())?;
+        let (sender, receiver) = crate::circuit::circ_sender::channel(sender, receiver);
+        let (createdsender, createdreceiver) = oneshot::channel::<CreateResponse>();
+
+        let (tx, rx) = oneshot::channel();
+
+        self.send_control(CtrlMsg::AllocateCircuit {
+            created_sender: createdsender,
+            sender,
+            tx,
+        })?;
+
+        // TODO(relay): I don't think we need circuit-level padding on this side of the circuit.
+        // This just drops the padding controller and corresponding event stream,
+        // but maybe it would be better to just not set it up in the first place?
+        // This suggests we might need a different control command for allocating
+        // the outbound relay circuits...
+        let (id, circ_unique_id, _padding_ctrl, _padding_stream) =
+            rx.await.map_err(|_| ChannelClosed)??;
+
+        let channel_account = self.details.memquota.as_raw_account();
+        // Link the memquota circuit account with the outbound channel account:
+        memquota.as_raw_account().add_parent(channel_account)?;
+
+        trace!("{}: Allocated CircId {}", circ_unique_id, id);
+
+        Ok((id, receiver, createdreceiver))
     }
 
     /// Shut down this channel immediately, along with all circuits that
@@ -947,7 +1026,7 @@ impl Channel {
     #[cfg(feature = "testing")]
     pub fn new_fake(
         rt: impl SleepProvider + CoarseTimeProvider,
-        channel_type: ChannelType,
+        _channel_type: ChannelType,
     ) -> (Channel, mpsc::UnboundedReceiver<CtrlMsg>) {
         let (control, control_recv) = mpsc::unbounded();
         let details = fake_channel_details();
@@ -964,17 +1043,18 @@ impl Channel {
         let (padding_ctrl, _) = client::circuit::padding::new_padding(DynTimeProvider::new(rt));
 
         let channel = Channel {
-            channel_type,
             control,
             cell_tx: fake_mpsc().0,
             reactor_closed_rx: rx,
             padding_ctrl,
             unique_id,
             peer_id,
+            peer: MaybeSensitive::not_sensitive(Arc::new(PeerInfo::EMPTY)),
             clock_skew: ClockSkew::None,
-            opened_at: OpenedAtInstant::now(),
+            opened_at: coarsetime::Instant::now(),
             mutable: Default::default(),
             details,
+            canonicity: Canonicity::new_canonical(),
         };
         (channel, control_recv)
     }
@@ -1043,6 +1123,50 @@ pub enum ClosedUnexpectedly {
     ReactorError(Error),
 }
 
+/// Whether the channel is operating in "client" or "relay" mode,
+/// and some mode-specific parameters.
+pub(crate) enum ChannelMode {
+    /// An incoming channel,
+    /// or an outgoing channel made by a non-bridge relay.
+    #[cfg(feature = "relay")]
+    Relay {
+        /// A handler for CREATE2/CREATE_FAST messages.
+        create_request_handler: Arc<CreateRequestHandler>,
+        /// Our Ed25519 identity.
+        our_ed25519_id: Ed25519Identity,
+        /// Our RSA identity.
+        our_rsa_id: RsaIdentity,
+        /// The range of circuit IDs that we allocate for new circuits.
+        circ_id_range: circmap::CircIdRange,
+    },
+    /// An outgoing channel made by a client or bridge relay.
+    Client,
+}
+
+impl ChannelMode {
+    /// Returns an error if the mode doesn't agree with the channel type.
+    pub(crate) fn check_agrees_with_type(
+        &self,
+        channel_type: ChannelType,
+    ) -> StdResult<(), tor_error::Bug> {
+        use ChannelType::*;
+        use circmap::CircIdRange::*;
+
+        match (channel_type, self) {
+            (ClientInitiator, Self::Client) => {}
+            #[cfg(feature = "relay")]
+            #[rustfmt::skip]
+            (RelayInitiator, Self::Relay { circ_id_range: High, .. }) => {}
+            #[cfg(feature = "relay")]
+            #[rustfmt::skip]
+            (RelayResponder { .. }, Self::Relay { circ_id_range: Low, .. }) => {}
+            _ => return Err(internal!("`ChannelMode` doesn't agree with `ChannelType`")),
+        }
+
+        Ok(())
+    }
+}
+
 /// Make some fake channel details (for testing only!)
 #[cfg(any(test, feature = "testing"))]
 fn fake_channel_details() -> Arc<ChannelDetails> {
@@ -1069,17 +1193,15 @@ pub(crate) mod test {
     // reactor code; there are just a few more cases to examine here.
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use crate::channel::handler::test::MsgBuf;
     pub(crate) use crate::channel::reactor::test::{CodecResult, new_reactor};
-    use crate::util::fake_mq;
     use tor_cell::chancell::msg::HandshakeType;
     use tor_cell::chancell::{AnyChanCell, msg};
-    use tor_rtcompat::{PreferredRuntime, test_with_one_runtime};
+    use tor_rtcompat::test_with_one_runtime;
 
     /// Make a new fake reactor-less channel.  For testing only, obviously.
     pub(crate) fn fake_channel(
         rt: impl SleepProvider + CoarseTimeProvider,
-        channel_type: ChannelType,
+        _channel_type: ChannelType,
     ) -> Channel {
         let unique_id = UniqId::new();
         let peer_id = OwnedChanTarget::builder()
@@ -1091,17 +1213,18 @@ pub(crate) mod test {
         let (_tx, rx) = oneshot_broadcast::channel();
         let (padding_ctrl, _) = client::circuit::padding::new_padding(DynTimeProvider::new(rt));
         Channel {
-            channel_type,
             control: mpsc::unbounded().0,
             cell_tx: fake_mpsc().0,
             reactor_closed_rx: rx,
             padding_ctrl,
             unique_id,
             peer_id,
+            peer: MaybeSensitive::not_sensitive(Arc::new(PeerInfo::EMPTY)),
             clock_skew: ClockSkew::None,
-            opened_at: OpenedAtInstant::now(),
+            opened_at: coarsetime::Instant::now(),
             mutable: Default::default(),
             details: fake_channel_details(),
+            canonicity: Canonicity::new_canonical(),
         }
     }
 
@@ -1136,17 +1259,6 @@ pub(crate) mod test {
             // let got = output.next().await.unwrap();
             // assert!(matches!(got.msg(), ChanMsg::Create2(_)));
         });
-    }
-
-    #[test]
-    fn chanbuilder() {
-        let rt = PreferredRuntime::create().unwrap();
-        let mut builder = ChannelBuilder::default();
-        builder.set_declared_method(tor_linkspec::ChannelMethod::Direct(vec![
-            "127.0.0.1:9001".parse().unwrap(),
-        ]));
-        let tls = MsgBuf::new(&b""[..]);
-        let _outbound = builder.launch_client(tls, rt, fake_mq());
     }
 
     #[test]

@@ -47,14 +47,12 @@ certificate bytes. The crates still compile for the host so `cargo check`,
 `cargo clippy`, and `cargo test` work there, but browser APIs only run in a
 browser.
 
-Most Arti dependencies come directly from crates.io. The vendored Arti tree is
-limited to seven crates that carry browser-specific behavior: the reduced
-runtime and memory-quota layers, the protocol implementation and its logging
-adapter, the WebAssembly filesystem-error fix, and the onion-service crypto and
-link-spec crates with their native configuration and key-storage dependencies
-removed. Retained local manifests use versioned dependencies, so their
-unmodified Arti dependencies continue to resolve from crates.io instead of
-requiring sibling source copies.
+Arti dependencies come directly from crates.io. The vendored Arti tree is
+limited to `tor-proto`, kept as the unmodified crates.io package apart from one
+divergence: its channel and channel-reactor generic bound is relaxed from the
+full `tor_rtcompat::Runtime` trait to `CoarseTimeProvider + SleepProvider`,
+which is all a browser client driving an already-connected stream can supply.
+`vendor/arti/README.md` records the baseline and the upgrade procedure.
 
 The upstream code is MIT-licensed. Vendored Arti crates retain their own
 `MIT OR Apache-2.0` licensing metadata.

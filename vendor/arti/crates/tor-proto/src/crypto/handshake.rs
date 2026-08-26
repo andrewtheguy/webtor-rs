@@ -20,8 +20,9 @@ use std::borrow::Borrow;
 
 use crate::Result;
 //use zeroize::Zeroizing;
-use rand_core::{CryptoRng, RngCore};
+use rand_core::{CryptoRng, Rng};
 use tor_bytes::SecretBuf;
+use tor_error::{ErrorKind, HasKind};
 
 /// A ClientHandshake is used to generate a client onionskin and
 /// handle a relay onionskin.
@@ -41,7 +42,7 @@ pub(crate) trait ClientHandshake {
     ///
     /// On success, return a state object that will be used to
     /// complete the handshake, along with the message to send.
-    fn client1<R: RngCore + CryptoRng, M: Borrow<Self::ClientAuxData>>(
+    fn client1<R: Rng + CryptoRng, M: Borrow<Self::ClientAuxData>>(
         rng: &mut R,
         key: &Self::KeyType,
         client_aux_data: &M,
@@ -101,7 +102,7 @@ pub(crate) trait ServerHandshake {
     /// On success, return a key generator and a server handshake message
     /// to send in reply.
     #[allow(dead_code)] // TODO #1383 ????
-    fn server<R: RngCore + CryptoRng, REPLY: AuxDataReply<Self>, T: AsRef<[u8]>>(
+    fn server<R: Rng + CryptoRng, REPLY: AuxDataReply<Self>, T: AsRef<[u8]>>(
         rng: &mut R,
         reply_fn: &mut REPLY,
         key: &[Self::KeyType],
@@ -169,7 +170,7 @@ impl KeyGenerator for ShakeKeyGenerator {
 /// An error produced by a Relay's attempt to handle a client's onion handshake.
 #[derive(Clone, Debug, thiserror::Error)]
 pub(crate) enum RelayHandshakeError {
-    /// An error in parsing  a handshake message.
+    /// An error in parsing a handshake message.
     #[error("Problem decoding onion handshake")]
     Fmt(#[from] tor_bytes::Error),
     /// The client asked for a key we didn't have.
@@ -181,6 +182,17 @@ pub(crate) enum RelayHandshakeError {
     /// An internal error.
     #[error("Internal error")]
     Internal(#[from] tor_error::Bug),
+}
+
+impl HasKind for RelayHandshakeError {
+    fn kind(&self) -> ErrorKind {
+        match self {
+            Self::Fmt(_) => ErrorKind::RemoteProtocolViolation,
+            Self::MissingKey => ErrorKind::RemoteProtocolViolation,
+            Self::BadClientHandshake => ErrorKind::RemoteProtocolViolation,
+            Self::Internal(_) => ErrorKind::Internal,
+        }
+    }
 }
 
 /// Type alias for results from a relay's attempt to handle a client's onion

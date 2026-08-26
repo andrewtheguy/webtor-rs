@@ -7,7 +7,8 @@ use derive_more::Display;
 
 /// The unique identifier of a tunnel.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Display)]
-#[display("{}", _0)]
+#[display("Tunnel {}", _0)]
+#[cfg_attr(feature = "relay", visibility::make(pub))]
 #[allow(unreachable_pub)] // TODO(#1447): use in ChanMgr's ChannelProvider impl
 pub(crate) struct TunnelId(u64);
 
@@ -32,22 +33,25 @@ impl TunnelId {
 /// process-unique, but in the logs it's often useful to display the
 /// owning tunnel's ID alongside the circuit identifier.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Display)]
-#[display("Circ {}.{}", tunnel_id, circ_id.display_chan_circ())]
+#[display("{} ({})", circ_uniq_id, tunnel_id)]
 pub(crate) struct TunnelScopedCircId {
     /// The identifier of the owning tunnel
     tunnel_id: TunnelId,
     /// The process-unique identifier of the circuit
-    circ_id: UniqId,
+    circ_uniq_id: UniqId,
 }
 
 impl TunnelScopedCircId {
     /// Create a new [`TunnelScopedCircId`] from the specified identifiers.
-    pub(crate) fn new(tunnel_id: TunnelId, circ_id: UniqId) -> Self {
-        Self { tunnel_id, circ_id }
+    pub(crate) fn new(tunnel_id: TunnelId, circ_uniq_id: UniqId) -> Self {
+        Self {
+            tunnel_id,
+            circ_uniq_id,
+        }
     }
 
     /// Return the [`UniqId`].
     pub(crate) fn unique_id(&self) -> UniqId {
-        self.circ_id
+        self.circ_uniq_id
     }
 }

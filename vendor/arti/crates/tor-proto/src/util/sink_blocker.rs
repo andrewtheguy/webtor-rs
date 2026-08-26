@@ -35,7 +35,7 @@ pub(crate) struct SinkBlocker<S, P = BooleanPolicy> {
     /// Invariant: Whenever we try to send with a blocking Policy,
     /// we store the context's waker in self.waker.
     /// If later the policy becomes non-blocking,
-    /// we we alert the `Waker`.
+    /// we alert the `Waker`.
     policy: P,
     /// A waker that we should alert when `policy` transitions from
     /// a blocking to a non-blocking state.
@@ -196,6 +196,7 @@ mod test {
     #![allow(clippy::unchecked_time_subtraction)]
     #![allow(clippy::useless_vec)]
     #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
 
     use std::sync::{

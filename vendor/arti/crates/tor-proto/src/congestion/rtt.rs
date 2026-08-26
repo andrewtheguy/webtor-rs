@@ -3,8 +3,7 @@
 use std::cmp::{max, min};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-use tor_rtcompat::Instant;
+use web_time_compat::{Duration, Instant};
 
 use super::params::RoundTripEstimatorParams;
 use super::{CongestionWindow, State};
@@ -186,7 +185,7 @@ impl RoundtripTimeEstimator {
         now: Instant,
         state: &State,
         cwnd: &CongestionWindow,
-    ) -> Result<(), Error> {
+    ) -> Result<ClockStall, Error> {
         let data_sent_at = self
             .sendme_expected_from
             .pop_front()
@@ -194,7 +193,7 @@ impl RoundtripTimeEstimator {
         let raw_rtt = now.saturating_duration_since(data_sent_at);
 
         if self.is_clock_stalled(raw_rtt, state.in_slow_start()) {
-            return Ok(());
+            return Ok(ClockStall::Detected);
         }
 
         self.max_rtt = self.max_rtt.max(Some(raw_rtt));
@@ -233,7 +232,7 @@ impl RoundtripTimeEstimator {
 
         let Some(min_rtt) = self.min_rtt else {
             self.min_rtt = self.ewma_rtt;
-            return Ok(());
+            return Ok(ClockStall::NotDetected);
         };
 
         if cwnd.get() == cwnd.min() && !state.in_slow_start() {
@@ -250,8 +249,17 @@ impl RoundtripTimeEstimator {
             self.min_rtt = self.ewma_rtt;
         }
 
-        Ok(())
+        Ok(ClockStall::NotDetected)
     }
+}
+
+/// Whether a clock stall or jump was detected.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ClockStall {
+    /// Clock stall or jump was detected.
+    Detected,
+    /// No clock stall or jump detected.
+    NotDetected,
 }
 
 #[cfg(test)]
@@ -268,9 +276,10 @@ mod test {
     #![allow(clippy::unchecked_time_subtraction)]
     #![allow(clippy::useless_vec)]
     #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
 
-    use std::time::{Duration, Instant};
+    use web_time_compat::{Duration, Instant, InstantExt};
 
     use crate::congestion::test_utils::{new_cwnd, new_rtt_estimator};
 
@@ -334,7 +343,7 @@ mod test {
     #[test]
     fn test_vectors() {
         let mut rtt = new_rtt_estimator();
-        let now = Instant::now();
+        let now = Instant::get();
         // from C-tor src/test/test_congestion_control.c
         let vectors = [
             [100000, 200000, 124, 1, 100000, 100000, 100000],

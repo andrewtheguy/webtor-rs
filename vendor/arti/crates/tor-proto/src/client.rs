@@ -4,58 +4,49 @@ pub mod channel;
 pub mod circuit;
 pub mod stream;
 
+#[cfg(feature = "rpc")]
+pub mod rpc;
+
 #[cfg(feature = "send-control-msg")]
 pub(crate) mod msghandler;
 pub(crate) mod reactor;
 
 use derive_deftly::Deftly;
-use futures::SinkExt as _;
 use oneshot_fused_workaround as oneshot;
 use std::net::IpAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 use tracing::instrument;
 
 use crate::circuit::UniqId;
+use crate::circuit::circhop::ReactorStreamComponents;
 #[cfg(feature = "circ-padding-manual")]
-#[cfg_attr(docsrs, doc(cfg(feature = "circ-padding-manual")))]
 pub use crate::client::circuit::padding::{
     CircuitPadder, CircuitPadderConfig, CircuitPadderConfigError,
 };
 use crate::client::stream::{
     DataStream, OutboundDataCmdChecker, ResolveCmdChecker, ResolveStream, StreamParameters,
-    StreamReceiver,
 };
 use crate::congestion::sendme::StreamRecvWindow;
 use crate::crypto::cell::HopNum;
 use crate::memquota::{SpecificAccount as _, StreamAccount};
-use crate::stream::StreamMpscSender;
+use crate::stream::STREAM_READER_BUFFER;
 use crate::stream::cmdcheck::AnyCmdChecker;
-use crate::stream::flow_ctrl::state::StreamRateLimit;
 use crate::stream::flow_ctrl::xon_xoff::reader::XonXoffReaderCtrl;
-use crate::stream::queue::stream_queue;
-use crate::util::notify::NotifySender;
+use crate::stream::{RECV_WINDOW_INIT, StreamComponents, StreamReceiver, StreamTarget, Tunnel};
 use crate::{Error, ResolveError, Result};
-use circuit::{CIRCUIT_BUFFER_SIZE, ClientCirc, Path};
-use reactor::{
-    CtrlCmd, CtrlMsg, FlowCtrlMsg, MetaCellHandler, RECV_WINDOW_INIT, STREAM_READER_BUFFER,
-};
+use circuit::{ClientCirc, Path};
+use reactor::{CtrlCmd, CtrlMsg, FlowCtrlMsg, MetaCellHandler};
 
-use postage::watch;
-use tor_async_utils::SinkCloseChannel as _;
-use tor_cell::relaycell::flow_ctrl::XonKbpsEwma;
+use tor_cell::relaycell::StreamId;
+use tor_cell::relaycell::flow_ctrl::XonKBpsEwma;
 use tor_cell::relaycell::msg::{AnyRelayMsg, Begin, Resolve, Resolved, ResolvedVal};
-use tor_cell::relaycell::{RelayCellFormat, StreamId};
 use tor_error::bad_api_usage;
 use tor_linkspec::OwnedChanTarget;
 use tor_memquota::derive_deftly_template_HasMemoryCost;
 use tor_memquota::mq_queue::{ChannelSpec as _, MpscSpec};
 
 #[cfg(feature = "hs-service")]
-use {
-    crate::client::reactor::StreamReqInfo,
-    crate::client::stream::{IncomingCmdChecker, IncomingStream},
-};
+use crate::stream::{IncomingCmdChecker, IncomingStream, StreamReqInfo};
 
 #[cfg(feature = "send-control-msg")]
 use msghandler::{MsgHandler, UserMsgHandler};
@@ -68,11 +59,9 @@ use msghandler::{MsgHandler, UserMsgHandler};
 // TODO(conflux): this should use ClientTunnel, and it should be moved into
 // the tunnel module.
 #[cfg(feature = "send-control-msg")]
-#[cfg_attr(docsrs, doc(cfg(feature = "send-control-msg")))]
 pub struct Conversation<'r>(&'r ClientTunnel);
 
 #[cfg(feature = "send-control-msg")]
-#[cfg_attr(docsrs, doc(cfg(feature = "send-control-msg")))]
 impl Conversation<'_> {
     /// Send a protocol message as part of an ad-hoc exchange
     ///
@@ -119,6 +108,11 @@ impl Conversation<'_> {
 /// is done preventing for instance multi path calls to be used on a single path. Top level types
 /// should prevent this and thus this object should never be used directly.
 #[derive(Debug)]
+#[cfg_attr(
+    feature = "rpc",
+    derive(derive_deftly::Deftly),
+    derive_deftly(tor_rpcbase::templates::Object)
+)]
 #[allow(dead_code)] // TODO(conflux)
 pub struct ClientTunnel {
     /// The underlying handle to the reactor.
@@ -132,7 +126,7 @@ impl ClientTunnel {
     /// Returns an error if the tunnel has more than one circuit.
     pub fn as_single_circ(&self) -> Result<&ClientCirc> {
         if self.circ.is_multi_path {
-            return Err(bad_api_usage!("Single circuit getter on multi path tunnel"))?;
+            Err(bad_api_usage!("Single circuit getter on multi path tunnel"))?;
         }
         Ok(&self.circ)
     }
@@ -190,6 +184,16 @@ impl ClientTunnel {
         self.circ.all_paths()
     }
 
+    /// Return a representation of the Paths for all the circuits in this tunnel,
+    /// as a map from each circuits' UniqId to its path.
+    ///
+    /// This is only exposed for the RPC subsystem, where it is documented that the
+    /// format of `UniqId` is not stable.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn tagged_paths(&self) -> std::collections::HashMap<UniqId, Arc<Path>> {
+        self.circ.mutable.tagged_paths()
+    }
+
     /// Return a process-unique identifier for this tunnel.
     ///
     /// Returns the reactor unique ID of the main reactor.
@@ -205,7 +209,7 @@ impl ClientTunnel {
     /// NOTE that the Instant returned by this method is not affected by
     /// any runtime mocking; it is the output of an ordinary call to
     /// `Instant::now()`.
-    pub async fn disused_since(&self) -> Result<Option<tor_rtcompat::Instant>> {
+    pub async fn disused_since(&self) -> Result<Option<web_time_compat::Instant>> {
         self.circ.disused_since().await
     }
 
@@ -241,7 +245,7 @@ impl ClientTunnel {
     // un-registered.  However, nothing in the Tor protocol requires it.
     //
     // Any incoming request handlers installed on the other circuits
-    // (which are are shutdown using CtrlCmd::ShutdownAndReturnCircuit)
+    // (which are shutdown using CtrlCmd::ShutdownAndReturnCircuit)
     // will be discarded (along with the reactor of that circuit)
     #[cfg(feature = "hs-service")]
     #[allow(unreachable_code, unused_variables)] // TODO(conflux)
@@ -252,7 +256,7 @@ impl ClientTunnel {
         filter: FILT,
     ) -> Result<impl futures::Stream<Item = IncomingStream> + use<'a, FILT>>
     where
-        FILT: crate::client::stream::IncomingStreamRequestFilter + 'a,
+        FILT: crate::stream::IncomingStreamRequestFilter + 'a,
     {
         use futures::stream::StreamExt;
 
@@ -295,10 +299,13 @@ impl ClientTunnel {
                 req,
                 stream_id,
                 hop,
-                receiver,
-                msg_tx,
-                rate_limit_stream,
-                drain_rate_request_stream,
+                stream_components:
+                    ReactorStreamComponents {
+                        stream_inbound_rx,
+                        stream_outbound_tx,
+                        rate_limit_rx,
+                        drain_rate_request_rx,
+                    },
                 memquota,
                 relay_cell_format,
             } = req_ctx;
@@ -307,7 +314,7 @@ impl ClientTunnel {
             // assertion is just here to make sure that we don't ever
             // accidentally remove or fail to enforce that check, since it is
             // security-critical.
-            assert_eq!(allowed_hop_loc, hop);
+            assert_eq!(Some(allowed_hop_loc), hop);
 
             // TODO(#2002): figure out what this is going to look like
             // for onion services (perhaps we should forbid this function
@@ -316,21 +323,21 @@ impl ClientTunnel {
             // See also:
             // https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/3002#note_3200937
             let target = StreamTarget {
-                tunnel: tunnel.clone(),
-                tx: msg_tx,
-                hop: allowed_hop_loc,
+                tunnel: Tunnel::Client(Arc::clone(&tunnel)),
+                tx: stream_outbound_tx,
+                hop: Some(allowed_hop_loc),
                 stream_id,
                 relay_cell_format,
-                rate_limit_stream,
+                rate_limit_stream: rate_limit_rx,
             };
 
             // can be used to build a reader that supports XON/XOFF flow control
             let xon_xoff_reader_ctrl =
-                XonXoffReaderCtrl::new(drain_rate_request_stream, target.clone());
+                XonXoffReaderCtrl::new(drain_rate_request_rx, target.clone());
 
             let reader = StreamReceiver {
                 target: target.clone(),
-                receiver,
+                receiver: stream_inbound_rx,
                 recv_window: StreamRecvWindow::new(RECV_WINDOW_INIT),
                 ended: false,
             };
@@ -362,47 +369,35 @@ impl ClientTunnel {
         // assuming it's the last hop.
         let hop = TargetHop::LastHop;
 
-        let time_prov = self.circ.time_provider.clone();
-
         let memquota = StreamAccount::new(self.circ.mq_account())?;
-        let (sender, receiver) = stream_queue(
-            #[cfg(not(feature = "flowctl-cc"))]
-            STREAM_READER_BUFFER,
-            &memquota,
-            &time_prov,
-        )?;
         let (tx, rx) = oneshot::channel();
-        let (msg_tx, msg_rx) =
-            MpscSpec::new(CIRCUIT_BUFFER_SIZE).new_mq(time_prov, memquota.as_raw_account())?;
-
-        let (rate_limit_tx, rate_limit_rx) = watch::channel_with(StreamRateLimit::MAX);
-
-        // A channel for the reactor to request a new drain rate from the reader.
-        // Typically this notification will be sent after an XOFF is sent so that the reader can
-        // send us a new drain rate when the stream data queue becomes empty.
-        let mut drain_rate_request_tx = NotifySender::new_typed();
-        let drain_rate_request_rx = drain_rate_request_tx.subscribe();
 
         self.circ
             .control
             .unbounded_send(CtrlMsg::BeginStream {
                 hop,
                 message: begin_msg,
-                sender,
-                rx: msg_rx,
-                rate_limit_notifier: rate_limit_tx,
-                drain_rate_requester: drain_rate_request_tx,
+                memquota: memquota.clone(),
                 done: tx,
                 cmd_checker,
             })
             .map_err(|_| Error::CircuitClosed)?;
 
-        let (stream_id, hop, relay_cell_format) = rx.await.map_err(|_| Error::CircuitClosed)??;
+        let (stream_id, hop, relay_cell_format, stream_components) =
+            rx.await.map_err(|_| Error::CircuitClosed)??;
+
+        // Destructure so that we don't forget to use any fields.
+        let ReactorStreamComponents {
+            stream_inbound_rx,
+            stream_outbound_tx,
+            rate_limit_rx,
+            drain_rate_request_rx,
+        } = stream_components;
 
         let target = StreamTarget {
-            tunnel: self.clone(),
-            tx: msg_tx,
-            hop,
+            tunnel: Tunnel::Client(self.clone()),
+            tx: stream_outbound_tx,
+            hop: Some(hop),
             stream_id,
             relay_cell_format,
             rate_limit_stream: rate_limit_rx,
@@ -413,7 +408,7 @@ impl ClientTunnel {
 
         let stream_receiver = StreamReceiver {
             target: target.clone(),
-            receiver,
+            receiver: stream_inbound_rx,
             recv_window: StreamRecvWindow::new(RECV_WINDOW_INIT),
             ended: false,
         };
@@ -724,25 +719,6 @@ impl TryFrom<ClientCirc> for ClientTunnel {
     }
 }
 
-/// A collection of components that can be combined to implement a Tor stream,
-/// or anything that requires a stream ID.
-///
-/// Not all components may be needed, depending on the purpose of the "stream".
-/// For example we build `RELAY_RESOLVE` requests like we do data streams,
-/// but they won't use the `StreamTarget` as they don't need to send additional
-/// messages.
-#[derive(Debug)]
-pub(crate) struct StreamComponents {
-    /// A [`Stream`](futures::Stream) of incoming relay messages for this Tor stream.
-    pub(crate) stream_receiver: StreamReceiver,
-    /// A handle that can communicate messages to the circuit reactor for this stream.
-    pub(crate) target: StreamTarget,
-    /// The memquota [account](tor_memquota::Account) to use for data on this stream.
-    pub(crate) memquota: StreamAccount,
-    /// The control information needed to add XON/XOFF flow control to the stream.
-    pub(crate) xon_xoff_reader_ctrl: XonXoffReaderCtrl,
-}
-
 /// Convert a [`ResolvedVal`] into a Result, based on whether or not
 /// it represents an error.
 fn resolvedval_to_result(val: ResolvedVal) -> Result<ResolvedVal> {
@@ -801,87 +777,25 @@ impl HopLocation {
     }
 }
 
-/// Internal handle, used to implement a stream on a particular tunnel.
-///
-/// The reader and the writer for a stream should hold a `StreamTarget` for the stream;
-/// the reader should additionally hold an `mpsc::Receiver` to get
-/// relay messages for the stream.
-///
-/// When all the `StreamTarget`s for a stream are dropped, the Reactor will
-/// close the stream by sending an END message to the other side.
-/// You can close a stream earlier by using [`StreamTarget::close`]
-/// or [`StreamTarget::close_pending`].
-#[derive(Clone, Debug)]
-pub(crate) struct StreamTarget {
-    /// Which hop of the circuit this stream is with.
-    hop: HopLocation,
-    /// Reactor ID for this stream.
-    stream_id: StreamId,
-    /// Encoding to use for relay cells sent on this stream.
-    ///
-    /// This is mostly irrelevant, except when deciding
-    /// how many bytes we can pack in a DATA message.
-    relay_cell_format: RelayCellFormat,
-    /// A [`Stream`](futures::Stream) that provides updates to the rate limit for sending data.
-    // TODO(arti#2068): we should consider making this an `Option`
-    rate_limit_stream: watch::Receiver<StreamRateLimit>,
-    /// Channel to send cells down.
-    tx: StreamMpscSender<AnyRelayMsg>,
-    /// Reference to the tunnel that this stream is on.
-    tunnel: Arc<ClientTunnel>,
-}
-
-impl StreamTarget {
-    /// Deliver a relay message for the stream that owns this StreamTarget.
-    ///
-    /// The StreamTarget will set the correct stream ID and pick the
-    /// right hop, but will not validate that the message is well-formed
-    /// or meaningful in context.
-    pub(crate) async fn send(&mut self, msg: AnyRelayMsg) -> Result<()> {
-        self.tx.send(msg).await.map_err(|_| Error::CircuitClosed)?;
-        Ok(())
-    }
-
+impl ClientTunnel {
     /// Close the pending stream that owns this StreamTarget, delivering the specified
     /// END message (if any)
     ///
-    /// The stream is closed by sending a [`CtrlMsg::ClosePendingStream`] message to the reactor.
-    ///
-    /// Returns a [`oneshot::Receiver`] that can be used to await the reactor's response.
-    ///
-    /// The StreamTarget will set the correct stream ID and pick the
-    /// right hop, but will not validate that the message is well-formed
-    /// or meaningful in context.
-    ///
-    /// Note that in many cases, the actual contents of an END message can leak unwanted
-    /// information. Please consider carefully before sending anything but an
-    /// [`End::new_misc()`](tor_cell::relaycell::msg::End::new_misc) message over a `ClientTunnel`.
-    /// (For onion services, we send [`DONE`](tor_cell::relaycell::msg::EndReason::DONE) )
-    ///
-    /// In addition to sending the END message, this function also ensures
-    /// the state of the stream map entry of this stream is updated
-    /// accordingly.
-    ///
-    /// Normally, you shouldn't need to call this function, as streams are implicitly closed by the
-    /// reactor when their corresponding `StreamTarget` is dropped. The only valid use of this
-    /// function is for closing pending incoming streams (a stream is said to be pending if we have
-    /// received the message initiating the stream but have not responded to it yet).
-    ///
-    /// **NOTE**: This function should be called at most once per request.
-    /// Calling it twice is an error.
+    /// See [`StreamTarget::close_pending`].
     #[cfg(feature = "hs-service")]
     pub(crate) fn close_pending(
         &self,
+        stream_id: StreamId,
+        hop: Option<HopLocation>,
         message: crate::stream::CloseStreamBehavior,
     ) -> Result<oneshot::Receiver<Result<()>>> {
         let (tx, rx) = oneshot::channel();
 
-        self.tunnel
-            .circ
+        self.circ
             .control
             .unbounded_send(CtrlMsg::ClosePendingStream {
-                stream_id: self.stream_id,
-                hop: self.hop,
+                stream_id,
+                hop: hop.expect("missing stream hop for client tunnel"),
                 message,
                 done: tx,
             })
@@ -890,81 +804,36 @@ impl StreamTarget {
         Ok(rx)
     }
 
-    /// Queue a "close" for the stream corresponding to this StreamTarget.
-    ///
-    /// Unlike `close_pending`, this method does not allow the caller to provide an `END` message.
-    ///
-    /// Once this method has been called, no more messages may be sent with [`StreamTarget::send`],
-    /// on this `StreamTarget`` or any clone of it.
-    /// The reactor *will* try to flush any already-send messages before it closes the stream.
-    ///
-    /// You don't need to call this method if the stream is closing because all of its StreamTargets
-    /// have been dropped.
-    pub(crate) fn close(&mut self) {
-        Pin::new(&mut self.tx).close_channel();
-    }
-
-    /// Called when a circuit-level protocol error has occurred and the
-    /// tunnel needs to shut down.
-    pub(crate) fn protocol_error(&mut self) {
-        self.tunnel.terminate();
-    }
-
     /// Request to send a SENDME cell for this stream.
     ///
-    /// This sends a request to the circuit reactor to send a stream-level SENDME, but it does not
-    /// block or wait for a response from the circuit reactor.
-    /// An error is only returned if we are unable to send the request.
-    /// This means that if the circuit reactor is unable to send the SENDME, we are not notified of
-    /// this here and an error will not be returned.
-    pub(crate) fn send_sendme(&mut self) -> Result<()> {
-        self.tunnel
-            .circ
+    /// See [`StreamTarget::send_sendme`].
+    pub(crate) fn send_sendme(&self, stream_id: StreamId, hop: Option<HopLocation>) -> Result<()> {
+        self.circ
             .control
             .unbounded_send(CtrlMsg::FlowCtrlUpdate {
                 msg: FlowCtrlMsg::Sendme,
-                stream_id: self.stream_id,
-                hop: self.hop,
+                stream_id,
+                hop: hop.expect("missing stream hop for client tunnel"),
             })
             .map_err(|_| Error::CircuitClosed)
     }
 
     /// Inform the circuit reactor that there has been a change in the drain rate for this stream.
     ///
-    /// Typically the circuit reactor would send this new rate in an XON message to the other end of
-    /// the stream.
-    /// But it may decide not to, and may discard this update.
-    /// For example the stream may have a large amount of buffered data, and the reactor may not
-    /// want to send an XON while the buffer is large.
-    ///
-    /// This sends a message to inform the circuit reactor of the new drain rate,
-    /// but it does not block or wait for a response from the reactor.
-    /// An error is only returned if we are unable to send the update.
-    pub(crate) fn drain_rate_update(&mut self, rate: XonKbpsEwma) -> Result<()> {
-        self.tunnel
-            .circ
+    /// See [`StreamTarget::drain_rate_update`].
+    pub(crate) fn drain_rate_update(
+        &self,
+        stream_id: StreamId,
+        hop: Option<HopLocation>,
+        rate: XonKBpsEwma,
+    ) -> Result<()> {
+        self.circ
             .control
             .unbounded_send(CtrlMsg::FlowCtrlUpdate {
                 msg: FlowCtrlMsg::Xon(rate),
-                stream_id: self.stream_id,
-                hop: self.hop,
+                stream_id,
+                hop: hop.expect("missing stream hop for client tunnel"),
             })
             .map_err(|_| Error::CircuitClosed)
-    }
-
-    /// Return a reference to the tunnel that this `StreamTarget` is using.
-    #[cfg(any(feature = "experimental-api", feature = "stream-ctrl"))]
-    pub(crate) fn tunnel(&self) -> &Arc<ClientTunnel> {
-        &self.tunnel
-    }
-
-    /// Return the kind of relay cell in use on this `StreamTarget`.
-    pub(crate) fn relay_cell_format(&self) -> RelayCellFormat {
-        self.relay_cell_format
-    }
-
-    /// A [`Stream`](futures::Stream) that provides updates to the rate limit for sending data.
-    pub(crate) fn rate_limit_stream(&self) -> &watch::Receiver<StreamRateLimit> {
-        &self.rate_limit_stream
     }
 }

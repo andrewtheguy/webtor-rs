@@ -4,16 +4,25 @@
 
 pub(crate) mod cell_sender;
 pub(crate) mod celltypes;
+pub(crate) mod circ_sender;
 pub(crate) mod circhop;
+pub(crate) mod create;
+pub(crate) mod padding;
+pub(crate) mod reactor;
 pub(crate) mod syncview;
 pub(crate) mod unique_id;
 
 pub use crate::memquota::StreamAccount;
-pub use syncview::CircSyncView;
+pub use syncview::CircHopSyncView;
 pub use unique_id::UniqId;
 
 use crate::ccparams::CongestionControlParams;
 use crate::stream::flow_ctrl::params::FlowCtrlParameters;
+
+pub(crate) use circ_sender::{CircuitRxReceiver, CircuitRxSender};
+
+/// Estimated upper bound for the likely number of hops.
+pub(crate) const HOPS: usize = 6;
 
 /// Description of the network's current rules for building circuits.
 ///
@@ -81,4 +90,34 @@ pub struct CircParameters {
     /// Known limitation: If this value if `u32::MAX`,
     /// then a limit of `u32::MAX - 1` is enforced.
     pub n_outgoing_cells_permitted: Option<u32>,
+}
+
+tor_protover::subprotocol_restricted_set! {
+    /// The enabled/disabled status of subprotocols that are allowed to be requested through a
+    /// subprotocol request during a circuit handshake.
+    ///
+    /// The allowed subprotocols are defined in:
+    /// <https://spec.torproject.org/tor-spec/create-created-cells.html#subproto-request>
+    #[derive(Copy, Clone, Debug, Default)]
+    pub(crate) struct HandshakeSubprotocols {
+        RELAY_CRYPT_CGO,
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test {
+    #[cfg(feature = "relay")]
+    use crate::relay::{CircNetParameters, CongestionControlNetParams};
+
+    pub(crate) use super::circ_sender::test::fake_mpsc;
+
+    /// Return a new [`CircNetParameters`] using default values for unit tests. They are based on
+    /// consensus defaults but should not be considered to be accurate from the one used on the
+    /// production network.
+    #[cfg(feature = "relay")]
+    pub(crate) fn new_circ_net_params() -> CircNetParameters {
+        CircNetParameters {
+            cc: CongestionControlNetParams::defaults_for_tests(),
+        }
+    }
 }

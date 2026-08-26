@@ -28,8 +28,8 @@
 //! so all our channels are client-to-guard or client-to-directory.
 
 use std::pin::Pin;
-use std::time::Duration;
-use tor_rtcompat::Instant;
+// TODO, coarsetime maybe?  But see arti#496 and also we want to use the mockable SleepProvider
+use web_time_compat::{Duration, Instant};
 
 use derive_builder::Builder;
 use educe::Educe;
@@ -40,6 +40,7 @@ use rand::distr::Distribution;
 use tracing::error;
 
 use tor_cell::chancell::msg::{Padding, PaddingNegotiate};
+use tor_config::impl_standard_builder;
 use tor_error::into_internal;
 use tor_rtcompat::SleepProvider;
 use tor_units::IntegerMilliseconds;
@@ -155,12 +156,9 @@ impl ParametersBuilder {
     }
 }
 
-impl Parameters {
-    /// Return a fresh channel-padding parameter builder.
-    pub fn builder() -> ParametersBuilder {
-        ParametersBuilder::default()
-    }
+impl_standard_builder! { Parameters: !Deserialize + !Builder + !Default }
 
+impl Parameters {
     /// Return a `PADDING_NEGOTIATE START` cell specifying precisely these parameters
     ///
     /// This function does not take account of the need to avoid sending particular
@@ -191,9 +189,9 @@ impl Parameters {
 
 /// Timing parameters, "compiled" into a form which can be sampled more efficiently
 ///
-/// According to the docs for [`rand::Rng::gen_range`],
+/// According to the docs for [`rand::RngExt::random_range`],
 /// it is better to construct a distribution,
-/// than to call `gen_range` repeatedly on the same range.
+/// than to call `random_range` repeatedly on the same range.
 #[derive(Debug, Clone)]
 struct PreparedParameters {
     /// The distribution of `X` (not of the ultimate delay, which is `max(X1,X2)`)
@@ -402,7 +400,7 @@ impl<R: SleepProvider> Timer<R> {
         self.as_mut().select_fresh_timeout();
 
         // Bet that we will be going to sleep again, and set up the new trigger time
-        // and waker now.  This will save us a future call to Instant::now.
+        // and waker now.  This will save us a future call to Instant::get.
         self.as_mut().prepare_to_sleep(Some(now));
 
         Padding::new()
@@ -448,6 +446,7 @@ mod test {
     #![allow(clippy::unchecked_time_subtraction)]
     #![allow(clippy::useless_vec)]
     #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
 
     use super::*;
