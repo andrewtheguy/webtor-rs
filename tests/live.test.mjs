@@ -1,11 +1,11 @@
 // End to end against real onion services: one bootstrap, then HTTP and
 // WebSocket over the circuits it builds.
 //
-//   npm run build && npm run seed && npm run test:live
+//   bun run build && bun run seed && bun run test:live
 //
 // Environment:
 //   DIRECTORY_SEED  path to a directory snapshot (default
-//                   tests/.directory-seed.json, written by `npm run seed`).
+//                   tests/.directory-seed.json, written by `bun run seed`).
 //                   Without one the bootstrap downloads every HSDir
 //                   microdescriptor over a single bridge circuit, which takes
 //                   minutes and often exceeds the budget.
@@ -17,7 +17,7 @@ import assert from 'node:assert/strict';
 import { access } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { relative } from 'node:path';
-import { after, before, describe, it } from 'node:test';
+import { afterAll as after, beforeAll as before, describe, it } from 'bun:test';
 import { openHarness } from './support/browser.mjs';
 import { REPO_ROOT } from './support/server.mjs';
 import {
@@ -38,11 +38,10 @@ const STUN_URLS = (process.env.STUN_URLS ?? '')
 /** What the WebSocket cases ask a relay for; short, and always answered. */
 const REQUEST = JSON.stringify(['REQ', 'webtor-test', { kinds: [1], limit: 2 }]);
 
-/** A bootstrap is minutes, and every case after it builds its own circuits. */
-const BOOTSTRAP_TIMEOUT = 10 * 60_000;
+/** Every case after the minutes-long bootstrap builds its own circuits. */
 const CASE_TIMEOUT = 5 * 60_000;
 
-describe('webtor-wasm over Tor', { timeout: BOOTSTRAP_TIMEOUT }, () => {
+describe('webtor-wasm over Tor', () => {
   let harness;
   const started = Date.now();
   const elapsed = () => `${((Date.now() - started) / 1000).toFixed(1)}s`;
@@ -59,7 +58,7 @@ describe('webtor-wasm over Tor', { timeout: BOOTSTRAP_TIMEOUT }, () => {
     } catch {
       console.log(
         `  no directory seed at ${SEED_PATH}; bootstrapping from the network. ` +
-          'Run `npm run seed` to make this fast.',
+          'Run `bun run seed` to make this fast.',
       );
     }
 
@@ -76,7 +75,7 @@ describe('webtor-wasm over Tor', { timeout: BOOTSTRAP_TIMEOUT }, () => {
     await harness?.close();
   });
 
-  it('exports a re-seedable directory cache', { timeout: CASE_TIMEOUT }, async () => {
+  it('exports a re-seedable directory cache', async () => {
     const cache = await harness.call('directoryCache');
     assert.equal(cache.version, 2, 'cache format version');
     assert.ok(
@@ -87,9 +86,9 @@ describe('webtor-wasm over Tor', { timeout: BOOTSTRAP_TIMEOUT }, () => {
       cache.microdescriptorBytes > 100_000,
       `microdescriptors look too small: ${cache.microdescriptorBytes} bytes`,
     );
-  });
+  }, CASE_TIMEOUT);
 
-  it('GETs an onion site', { timeout: CASE_TIMEOUT }, async () => {
+  it('GETs an onion site', async () => {
     const { target, result } = await firstReachable(HTTP_TARGETS, (url) =>
       harness.call('fetch', url, { timeoutMs: ATTEMPT_TIMEOUT_MS }),
     );
@@ -99,9 +98,9 @@ describe('webtor-wasm over Tor', { timeout: BOOTSTRAP_TIMEOUT }, () => {
     assert.match(result.headers['content-type'] ?? '', /text\/html/);
     assert.ok(result.byteLength > 0, 'body is empty');
     assert.match(result.text, /<html/i);
-  });
+  }, CASE_TIMEOUT);
 
-  it('reports a status the server chose', { timeout: CASE_TIMEOUT }, async () => {
+  it('reports a status the server chose', async () => {
     // A path no onion site serves: the response has to come back as a
     // response, not as a thrown error.
     const { result } = await firstReachable(HTTP_TARGETS, (url) =>
@@ -111,9 +110,9 @@ describe('webtor-wasm over Tor', { timeout: BOOTSTRAP_TIMEOUT }, () => {
     );
     assert.ok(result.status >= 400, `expected a 4xx, got ${result.status}`);
     assert.equal(result.ok, false);
-  });
+  }, CASE_TIMEOUT);
 
-  it('sends caller-supplied headers', { timeout: CASE_TIMEOUT }, async () => {
+  it('sends caller-supplied headers', async () => {
     // Nostr relays answer `GET /` with NIP-11 JSON when the Accept header asks
     // for it, and with something else when it does not — so a JSON body here
     // is evidence the header reached the service.
@@ -131,9 +130,9 @@ describe('webtor-wasm over Tor', { timeout: BOOTSTRAP_TIMEOUT }, () => {
     const document = JSON.parse(result.text);
     console.log(`  ${target} is ${document.name ?? 'unnamed'}`);
     assert.equal(typeof document, 'object');
-  });
+  }, CASE_TIMEOUT);
 
-  it('refuses a scheme it cannot carry', { timeout: CASE_TIMEOUT }, async () => {
+  it('refuses a scheme it cannot carry', async () => {
     const host = new URL(HTTP_TARGETS[0]).host;
     await assert.rejects(
       () => harness.call('fetch', `https://${host}/`),
@@ -147,9 +146,9 @@ describe('webtor-wasm over Tor', { timeout: BOOTSTRAP_TIMEOUT }, () => {
       () => harness.call('wsOpen', `http://${host}/`),
       /connectWebSocket needs a ws:\/\/ URL/,
     );
-  });
+  }, CASE_TIMEOUT);
 
-  it('opens a WebSocket and exchanges text', { timeout: CASE_TIMEOUT }, async () => {
+  it('opens a WebSocket and exchanges text', async () => {
     const { target, result } = await firstReachable(WS_TARGETS, async (url) => {
       const { id, seconds } = await harness.call('wsOpen', url, {
         timeoutMs: ATTEMPT_TIMEOUT_MS,
@@ -171,9 +170,9 @@ describe('webtor-wasm over Tor', { timeout: BOOTSTRAP_TIMEOUT }, () => {
       `  ${target} upgraded in ${result.seconds}s, ${result.seen.length} messages`,
     );
     assert.ok(result.seen.length >= 1);
-  });
+  }, CASE_TIMEOUT);
 
-  it('refuses to send past maxMessageBytes', { timeout: CASE_TIMEOUT }, async () => {
+  it('refuses to send past maxMessageBytes', async () => {
     const { result } = await firstReachable(WS_TARGETS, async (url) => {
       const { id } = await harness.call('wsOpen', url, {
         maxMessageBytes: 4,
@@ -190,9 +189,9 @@ describe('webtor-wasm over Tor', { timeout: BOOTSTRAP_TIMEOUT }, () => {
       }
     });
     assert.equal(result, 'refused');
-  });
+  }, CASE_TIMEOUT);
 
-  it('refuses to receive past maxMessageBytes', { timeout: CASE_TIMEOUT }, async () => {
+  it('refuses to receive past maxMessageBytes', async () => {
     const { result } = await firstReachable(WS_TARGETS, async (url) => {
       // Room for the request but not for an event: a relay's REQ reply carries
       // a signed event and runs to hundreds of bytes.
@@ -220,10 +219,10 @@ describe('webtor-wasm over Tor', { timeout: BOOTSTRAP_TIMEOUT }, () => {
       }
     });
     assert.equal(result, 'refused');
-  });
+  }, CASE_TIMEOUT);
 
   // Last: it takes the client away.
-  it('refuses work once closed', { timeout: CASE_TIMEOUT }, async () => {
+  it('refuses work once closed', async () => {
     assert.equal(await harness.call('close'), 'closed');
     await assert.rejects(
       () => harness.call('fetch', HTTP_TARGETS[0], { timeoutMs: ATTEMPT_TIMEOUT_MS }),
@@ -233,5 +232,5 @@ describe('webtor-wasm over Tor', { timeout: BOOTSTRAP_TIMEOUT }, () => {
       () => harness.call('wsOpen', WS_TARGETS[0]),
       /client is closed/,
     );
-  });
+  }, CASE_TIMEOUT);
 });

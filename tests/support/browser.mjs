@@ -24,7 +24,7 @@ async function requireFile(path, hint) {
  * minutes otherwise.
  */
 export async function openHarness({ onLog } = {}) {
-  await requireFile(PACKAGE, 'Run `npm run build` first.');
+  await requireFile(PACKAGE, 'Run `bun run build` first.');
   await requireFile(
     CHROME_PATH,
     'Set CHROME_PATH to a Chrome-family binary.',

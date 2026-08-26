@@ -97,15 +97,17 @@ Two free functions need no client and touch no network: `isOnionHost(host)` and
 Chrome and needs nothing outside this repository.
 
 ```bash
-npm run build     # wasm-pack the package into webtor-wasm/pkg/
-npm test          # API suite: URL helpers and option validation, no network
-npm run seed      # fetch a directory snapshot to tests/.directory-seed.json
-npm run test:live # end to end against public onion services
+bun install       # install dependencies from bun.lock
+bun run build     # wasm-pack the package into webtor-wasm/pkg/
+bun run test      # API suite: URL helpers and option validation, no network
+bun run seed      # fetch a directory snapshot to tests/.directory-seed.json
+bun run test:live # end to end against public onion services
 ```
 
-`npm test` is a second or two. `npm run test:live` bootstraps a real Tor client
+The repository pins its Bun version in `package.json`. `bun run test` is a
+second or two. `bun run test:live` bootstraps a real Tor client
 and builds a fresh set of circuits per case, so it runs in minutes; a snapshot
-from `npm run seed` is what keeps the bootstrap to under a minute, and a
+from `bun run seed` is what keeps the bootstrap to under a minute, and a
 snapshot expires when its consensus does, three hours after it is made. See
 `tests/README.md`.
 
@@ -130,8 +132,8 @@ The release version is the `webtor-wasm` crate version — not the workspace
 version, which tracks the upstream webtor-rs lineage. Bump the crate version,
 push `main`, and run the `Publish` workflow (`gh workflow run publish.yml`): it
 reads the version from `cargo metadata`, refuses to overwrite an existing
-release, builds the package, `npm pack`s it, and creates the tag and release. A
-SemVer pre-release version such as `0.0.1-alpha.1` is published as a GitHub
+release, builds the package, `bun pm pack`s it, and creates the tag and release.
+A SemVer pre-release version such as `0.0.1-alpha.1` is published as a GitHub
 pre-release automatically.
 
 The current line is `0.0.1-alpha.*`.
@@ -140,7 +142,7 @@ The current line is `0.0.1-alpha.*`.
 
 ```
 webtor/       the Tor client: directory, circuits, onion rendezvous, HTTP, WebSocket
-webtor-wasm/  the wasm-bindgen surface published to npm
+webtor-wasm/  the wasm-bindgen surface packed for distribution
 subtle-tls/   the TLS 1.3 session the bridge channel runs inside (see its README)
 tests/        the browser test project
 scripts/      onion_ws_probe.py, a SOCKS-based cross-check

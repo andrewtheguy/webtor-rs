@@ -56,19 +56,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: package-lock.json
+      - uses: oven-sh/setup-bun@v2
 
       - uses: Swatinem/rust-cache@v2
 
-      - run: npm ci
+      - run: bun ci
 
-      - run: npm run build
+      - run: bun run build
 
-      - run: npm pack
+      - run: bun pm pack
         working-directory: webtor-wasm/pkg
 
       - uses: actions/upload-artifact@v4
