@@ -10,7 +10,27 @@ This directory contains the browser-specific fork of the small part of Arti that
 | --- | --- | --- |
 | `tor-proto` | Targeted fork | Relaxes the channel and channel-reactor generic bound from `tor_rtcompat::Runtime` to `CoarseTimeProvider + SleepProvider`. Nothing else differs from the published package; the manifest is byte-identical to upstream's. |
 
-The browser client hands `tor-proto` an already-connected stream, so its channel reactor needs only the time and sleep subset of the runtime contract. Upstream's `Runtime` supertrait additionally demands blocking, TCP, Unix, UDP and TLS providers that `WasmRuntime` has nothing to implement with. Implementing those as stubs purely to satisfy a bound is the alternative to this patch; do not switch to it without first weighing its maintenance cost against four one-line bound changes.
+### Why the patch is needed
+
+Without it, the browser build does not compile. With `[patch.crates-io]` removed and pristine `tor-proto` 0.45.0 in its place, `cargo check --workspace --target wasm32-unknown-unknown` fails with 31 errors from a single cause, at `VerifiedClientChannel::finish()` and `Reactor::run()` in `webtor/src/client.rs`:
+
+```text
+the trait bound `WasmRuntime: Runtime` is not satisfied
+the trait bound `WasmRuntime: futures::task::Spawn` is not satisfied
+the trait bound `WasmRuntime: Blocking` is not satisfied
+the trait bound `WasmRuntime: NetStreamProvider` is not satisfied
+the trait bound `WasmRuntime: NetStreamProvider<unix::SocketAddr>` is not satisfied
+the trait bound `WasmRuntime: TlsProvider<_>` is not satisfied
+the trait bound `WasmRuntime: UdpProvider` is not satisfied
+```
+
+`tor_rtcompat::Runtime` is a supertrait alias for `Sync + Send + Spawn + Blocking + Clone + SleepProvider + CoarseTimeProvider + NetStreamProvider<net::SocketAddr> + NetStreamProvider<unix::SocketAddr> + TlsProvider + UdpProvider + Debug + 'static`. The browser client hands `tor-proto` an already-connected stream, so it has no sockets, no listeners and no TLS stack of its own to satisfy those with.
+
+The bound is also wider than the code it guards. In the non-relay path the runtime value is used exactly twice, both as `DynTimeProvider::new(runtime.clone())` — in `Channel::new` and in `Reactor::run` — and that constructor's own bound is `R: SleepProvider + CoarseTimeProvider`. The patch therefore narrows the bound to what is actually called rather than removing a capability anything uses.
+
+The alternative is implementing the whole contract on `WasmRuntime`: TCP and Unix stream providers, a TLS provider, a UDP provider, and `Blocking`, whose `block_on`/`reenter_block_on` cannot be honored on a browser thread at all. That trades four one-line bound changes for a set of stubs that can only panic. Do not switch to it without weighing that cost.
+
+**The relaxation holds only while the `relay` feature is off.** `Reactor::handle_create` passes `&self.runtime` to a relay-side create handler; it is `#[cfg(feature = "relay")]` and this build never enables it. Enabling `relay` would reintroduce a real `Runtime` requirement and invalidate the patch.
 
 The supported feature surface is the one selected in the workspace `Cargo.toml`: `tor-proto/hs-client`, `tor-proto/send-control-msg`, and `tor-linkspec/decode+verbatim`, plus their transitive requirements. Because the fork is otherwise pristine, the remaining upstream features are upstream's own; they are still not compatibility promises for this build.
 
