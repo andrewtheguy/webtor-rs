@@ -25,7 +25,14 @@ pTransfer adds:
   shape reached here (`scheme://<v3 onion>[:port][/path][?query]`) so the
   `url` crate and its IDNA/Unicode tables stay out of the binary; and
 - `anonymous-signaling-wasm`, a plain WebSocket binding used only for Nostr
-  signaling over onion streams.
+  signaling over onion streams, with a console subscriber for `tracing`
+  warnings and errors so a reactor's exit reason reaches the browser console.
+
+Directory bootstrap keeps the microdescriptors of a supplied directory whose
+consensus has expired: microdescriptors have no lifetime of their own, so a
+fresh consensus names almost all of them and only the rest are downloaded.
+Directory requests are bounded, and a bridge instance that stops answering
+(Snowflake balances one fingerprint over several) costs one reconnect.
 
 The fork keeps only those two browser entry transports, on-demand onion
 circuits, and the TLS session a Tor relay's ORPort demands on the bridge

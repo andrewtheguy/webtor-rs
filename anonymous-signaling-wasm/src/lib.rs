@@ -6,6 +6,8 @@
 //! caller, so every `connect` runs on a client that has already completed
 //! one full onion rendezvous.
 
+mod console_log;
+
 use futures::future::{AbortHandle, Abortable};
 use futures::lock::Mutex;
 use std::cell::{Cell, RefCell};
@@ -21,7 +23,7 @@ use webtor::{
 };
 
 const MAX_NOSTR_MESSAGE_BYTES: usize = 1024 * 1024;
-const CONNECTION_TIMEOUT_MS: u64 = 240_000;
+const CONNECTION_TIMEOUT_MS: u64 = 300_000;
 /// The Tor Project's website as an onion service. Fetching it exercises the
 /// whole onion client: HSDir lookup, introduction, rendezvous and a stream.
 const ONION_CHECK_URL: &str =
@@ -155,6 +157,7 @@ impl AnonymousSignalingClient {
     ) -> js_sys::Promise {
         future_to_promise(async move {
             console_error_panic_hook::set_once();
+            console_log::install();
             let stun_urls = stun_urls
                 .iter()
                 .map(|value| {
