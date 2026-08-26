@@ -36,6 +36,9 @@ pub enum TorError {
     Internal(String),
     #[error("NetDoc error: {0}")]
     NetDoc(#[from] tor_netdoc::Error),
+
+    #[error("Onion service error: {0}")]
+    Onion(String),
 }
 
 impl TorError {

@@ -2,6 +2,7 @@
 
 use crate::config::{LogCallback, LogType};
 use crate::error::{Result, TorError};
+use crate::onion::HsDirParams;
 use crate::relay::{Relay, RelayManager};
 use crate::time::system_time_now;
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
@@ -24,12 +25,20 @@ use tracing::{debug, error, info, warn};
 
 const RELAYS_PER_ROLE: usize = 32;
 const MIN_RELAYS_PER_ROLE: usize = 10;
-const MICRODESCRIPTOR_CHUNK_SIZE: usize = 16;
+/// Every HSDir is needed to place an onion service on its hash ring, so a
+/// directory downloaded in the browser carries thousands of microdescriptors.
+/// Requests of 92 digests (what C Tor sends) and several streams at once both
+/// got the bridge circuit torn down, so this stays at the small sequential
+/// batches that are known to work; a caller-supplied directory seed skips
+/// the download entirely and is the intended path.
+const MICRODESCRIPTOR_CHUNK_SIZE: usize = 46;
+const MAX_PARALLEL_CHUNKS: usize = 1;
+const MIN_HSDIR_RELAYS: usize = 100;
 /// Bounds what one directory response off a Tor stream may buffer. The bridge
 /// serving it is untrusted, so this caps an endless stream and a decompression
 /// bomb; it does not bound directory data supplied by the embedding page.
 const MAX_DIRECTORY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
-const DIRECTORY_CACHE_VERSION: u32 = 1;
+const DIRECTORY_CACHE_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct DirectoryCache {
@@ -63,7 +72,8 @@ impl DirectoryCache {
 struct ProcessedDirectory {
     relays: Vec<Relay>,
     middle_count: usize,
-    exit_count: usize,
+    hsdir_count: usize,
+    hsdir_params: HsDirParams,
 }
 
 /// Directory manager for handling network documents
@@ -71,6 +81,7 @@ pub struct DirectoryManager {
     pub relay_manager: Arc<RwLock<RelayManager>>,
     on_log: Option<LogCallback>,
     cache: Arc<RwLock<Option<DirectoryCache>>>,
+    hsdir_params: Arc<RwLock<Option<HsDirParams>>>,
 }
 
 impl DirectoryManager {
@@ -79,6 +90,7 @@ impl DirectoryManager {
             relay_manager,
             on_log,
             cache: Arc::new(RwLock::new(None)),
+            hsdir_params: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -132,6 +144,15 @@ impl DirectoryManager {
         Ok(())
     }
 
+    /// The onion-service placement parameters of the installed consensus.
+    pub(crate) async fn hsdir_params(&self) -> Result<HsDirParams> {
+        self.hsdir_params
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| TorError::Onion("No Tor directory is installed".to_string()))
+    }
+
     pub async fn cache_json(&self) -> Result<Option<String>> {
         let cache = self.cache.read().await;
         cache.as_ref().map(DirectoryCache::encode).transpose()
@@ -143,13 +164,14 @@ impl DirectoryManager {
             let mut manager = self.relay_manager.write().await;
             manager.update_relays(processed.relays);
         }
+        *self.hsdir_params.write().await = Some(processed.hsdir_params);
 
         info!("Updated RelayManager with {} relays", count);
         let source = if from_cache { "supplied" } else { "downloaded" };
         self.log(
             &format!(
-                "Loaded {} {} Tor relays ({} middle, {} HTTPS exit)",
-                count, source, processed.middle_count, processed.exit_count
+                "Loaded {} {} Tor relays ({} middle, {} HSDir)",
+                count, source, processed.middle_count, processed.hsdir_count
             ),
             LogType::Success,
         );
@@ -182,42 +204,11 @@ impl DirectoryManager {
 
     async fn fetch_consensus_body(&self, tunnel: Arc<ClientTunnel>) -> Result<String> {
         info!("Fetching consensus from bridge...");
-
-        let mut stream = tunnel
-            .begin_dir_stream()
-            .await
-            .map_err(|e| TorError::Internal(format!("Failed to begin dir stream: {}", e)))?;
-
-        let path = "/tor/status-vote/current/consensus-microdesc";
-        let request = format!(
-            "GET {} HTTP/1.0\r\n\
-             Host: directory\r\n\
-             Accept-Encoding: deflate\r\n\
-             Connection: close\r\n\
-             \r\n",
-            path
-        );
-
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .map_err(|e| TorError::Network(format!("Failed to write dir request: {}", e)))?;
-        stream
-            .flush()
-            .await
-            .map_err(|e| TorError::Network(format!("Failed to flush dir request: {}", e)))?;
-
-        // Read and decode the response. Stop at Content-Length rather than
-        // waiting indefinitely for the directory stream to close.
-        let response = read_directory_response(&mut stream).await?;
-
-        info!("Received consensus response: {} bytes", response.len());
-
-        // 5. Process response
-        let body = decode_directory_response(&response)?;
-        String::from_utf8(body).map_err(|e| {
-            TorError::serialization(format!("Directory consensus is not UTF-8: {}", e))
-        })
+        let body =
+            fetch_directory_document(&tunnel, "/tor/status-vote/current/consensus-microdesc")
+                .await?;
+        info!("Received consensus: {} bytes", body.len());
+        Ok(body)
     }
 
     async fn fetch_microdescriptors_body(
@@ -225,8 +216,6 @@ impl DirectoryManager {
         tunnel: Arc<ClientTunnel>,
         digests: &[[u8; 32]],
     ) -> Result<String> {
-        const MAX_PARALLEL_CHUNKS: usize = 1;
-
         info!(
             "Fetching {} microdescriptors in chunks of {} (max {} parallel)...",
             digests.len(),
@@ -236,23 +225,16 @@ impl DirectoryManager {
 
         let chunks: Vec<&[[u8; 32]]> = digests.chunks(MICRODESCRIPTOR_CHUNK_SIZE).collect();
         let total_chunks = chunks.len();
+        let total_batches = total_chunks.div_ceil(MAX_PARALLEL_CHUNKS);
         let mut all_results = Vec::new();
 
-        // Process chunks in batches of MAX_PARALLEL_CHUNKS
         for (batch_idx, batch) in chunks.chunks(MAX_PARALLEL_CHUNKS).enumerate() {
             let batch_start = batch_idx * MAX_PARALLEL_CHUNKS;
-            info!(
-                "Fetching chunk batch {}/{} (chunks {}-{})",
-                batch_idx + 1,
-                total_chunks.div_ceil(MAX_PARALLEL_CHUNKS),
-                batch_start + 1,
-                (batch_start + batch.len()).min(total_chunks)
-            );
             self.log(
                 &format!(
                     "Downloading Tor relay descriptors (batch {}/{})...",
                     batch_idx + 1,
-                    total_chunks.div_ceil(MAX_PARALLEL_CHUNKS)
+                    total_batches
                 ),
                 LogType::Info,
             );
@@ -261,16 +243,14 @@ impl DirectoryManager {
                 .iter()
                 .enumerate()
                 .map(|(i, chunk)| {
-                    let chunk_idx = batch_start + i;
                     self.fetch_microdescriptors_chunk(
                         tunnel.clone(),
                         chunk,
-                        chunk_idx,
+                        batch_start + i,
                         total_chunks,
                     )
                 })
                 .collect();
-
             let results = futures::future::try_join_all(futures).await?;
             all_results.extend(results);
         }
@@ -296,50 +276,53 @@ impl DirectoryManager {
             total_chunks,
             digests.len()
         );
-
-        let mut stream = tunnel
-            .begin_dir_stream()
-            .await
-            .map_err(|e| TorError::Internal(format!("Failed to begin dir stream: {}", e)))?;
-
         let digests_str: Vec<String> = digests
             .iter()
             .map(encode_microdescriptor_digest)
             .collect();
         let path = format!("/tor/micro/d/{}", digests_str.join("-"));
-
-        let request = format!(
-            "GET {} HTTP/1.0\r\n\
-             Host: directory\r\n\
-             Accept-Encoding: deflate\r\n\
-             Connection: close\r\n\
-             \r\n",
-            path
-        );
-
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .map_err(|e| TorError::Network(format!("Failed to write dir request: {}", e)))?;
-        stream
-            .flush()
-            .await
-            .map_err(|e| TorError::Network(format!("Failed to flush dir request: {}", e)))?;
-
-        let response = read_directory_response(&mut stream).await?;
-
+        let body = fetch_directory_document(&tunnel, &path).await?;
         debug!(
             "Chunk {}/{}: received {} bytes",
             chunk_idx + 1,
             total_chunks,
-            response.len()
+            body.len()
         );
-
-        let body = decode_directory_response(&response)?;
-        String::from_utf8(body).map_err(|e| {
-            TorError::serialization(format!("Microdescriptor response is not UTF-8: {}", e))
-        })
+        Ok(body)
     }
+}
+
+/// GET one document from the directory cache at the end of `tunnel`, with
+/// the request shape Tor clients use, and return the decoded body.
+pub(crate) async fn fetch_directory_document(
+    tunnel: &Arc<ClientTunnel>,
+    path: &str,
+) -> Result<String> {
+    let mut stream = tunnel
+        .clone()
+        .begin_dir_stream()
+        .await
+        .map_err(|e| TorError::Internal(format!("Failed to begin dir stream: {}", e)))?;
+    let request = format!(
+        "GET {} HTTP/1.0\r\n\
+         Host: directory\r\n\
+         Accept-Encoding: deflate\r\n\
+         Connection: close\r\n\
+         \r\n",
+        path
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| TorError::Network(format!("Failed to write dir request: {}", e)))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| TorError::Network(format!("Failed to flush dir request: {}", e)))?;
+    let response = read_directory_response(&mut stream).await?;
+    let body = decode_directory_response(&response)?;
+    String::from_utf8(body)
+        .map_err(|e| TorError::serialization(format!("Directory document is not UTF-8: {}", e)))
 }
 
 fn select_microdescriptor_digests(consensus_body: &str) -> Result<Vec<[u8; 32]>> {
@@ -367,24 +350,16 @@ fn select_microdescriptor_digests(consensus_body: &str) -> Result<Vec<[u8; 32]>>
         })
         .map(|router| *router.md_digest())
         .collect();
-    let mut exit_digests: Vec<[u8; 32]> = inner_consensus
+    let hsdir_digests: Vec<[u8; 32]> = inner_consensus
         .relays()
         .iter()
-        .filter(|router| {
-            router.is_flagged_fast()
-                && router.is_flagged_stable()
-                && router.is_flagged_exit()
-                && !router.is_flagged_bad_exit()
-                && router.weight().is_nonzero()
-        })
+        .filter(|router| router.is_flagged_hsdir())
         .map(|router| *router.md_digest())
         .collect();
 
     let mut rng = rand::thread_rng();
     middle_digests.shuffle(&mut rng);
-    exit_digests.shuffle(&mut rng);
     middle_digests.truncate(RELAYS_PER_ROLE);
-    exit_digests.truncate(RELAYS_PER_ROLE);
 
     if middle_digests.len() < MIN_RELAYS_PER_ROLE {
         return Err(TorError::ConsensusFetch(format!(
@@ -392,17 +367,17 @@ fn select_microdescriptor_digests(consensus_body: &str) -> Result<Vec<[u8; 32]>>
             middle_digests.len()
         )));
     }
-    if exit_digests.len() < MIN_RELAYS_PER_ROLE {
+    if hsdir_digests.len() < MIN_HSDIR_RELAYS {
         return Err(TorError::ConsensusFetch(format!(
-            "Consensus has only {} eligible exit relays",
-            exit_digests.len()
+            "Consensus has only {} HSDir relays",
+            hsdir_digests.len()
         )));
     }
 
     let mut seen = HashSet::new();
     Ok(middle_digests
         .into_iter()
-        .chain(exit_digests)
+        .chain(hsdir_digests)
         .filter(|digest| seen.insert(*digest))
         .collect())
 }
@@ -422,6 +397,7 @@ fn process_directory_documents(
             ))
         })?;
     let inner_consensus = &consensus.consensus;
+    let hsdir_params = HsDirParams::from_consensus(inner_consensus)?;
 
     let mut router_statuses = HashMap::new();
     for router in inner_consensus.relays() {
@@ -466,12 +442,6 @@ fn process_directory_documents(
             if router.is_flagged_guard() {
                 flags.insert("Guard".to_string());
             }
-            if router.is_flagged_exit() && microdescriptor.ipv4_policy().allows_port(443) {
-                flags.insert("Exit".to_string());
-            }
-            if router.is_flagged_bad_exit() {
-                flags.insert("BadExit".to_string());
-            }
             if router.is_flagged_hsdir() {
                 flags.insert("HSDir".to_string());
             }
@@ -502,27 +472,22 @@ fn process_directory_documents(
                 && relay.flags.contains("V2Dir")
         })
         .count();
-    let exit_count = relays
+    let hsdir_count = relays
         .iter()
-        .filter(|relay| {
-            relay.flags.contains("Fast")
-                && relay.flags.contains("Stable")
-                && relay.flags.contains("Exit")
-                && !relay.flags.contains("BadExit")
-        })
+        .filter(|relay| relay.flags.contains("HSDir"))
         .count();
-
-    if middle_count < MIN_RELAYS_PER_ROLE || exit_count < MIN_RELAYS_PER_ROLE {
+    if middle_count < MIN_RELAYS_PER_ROLE || hsdir_count < MIN_HSDIR_RELAYS {
         return Err(TorError::ConsensusFetch(format!(
-            "Directory returned insufficient usable relays (middle: {}, HTTPS exit: {})",
-            middle_count, exit_count
+            "Directory returned insufficient usable relays (middle: {}, HSDir: {})",
+            middle_count, hsdir_count
         )));
     }
 
     Ok(ProcessedDirectory {
         relays,
         middle_count,
-        exit_count,
+        hsdir_count,
+        hsdir_params,
     })
 }
 

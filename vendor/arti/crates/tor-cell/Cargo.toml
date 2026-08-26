@@ -20,7 +20,7 @@ experimental = ["experimental-udp", "hs", "hs-pow-full", "conflux", "testing"]
 experimental-udp = ["__is_experimental"]
 
 # "hs" = (all) hidden service support, either client or server
-hs = []
+hs = ["tor-hscrypto", "__is_experimental"]
 
 # Enable testing only API
 testing = ["experimental-udp", "__is_experimental"]
@@ -59,6 +59,7 @@ tor-basic-utils = { path = "../tor-basic-utils", version = "0.37.0" }
 tor-bytes = { path = "../tor-bytes", version = "0.37.0" }
 tor-cert = { path = "../tor-cert", version = "0.37.0" }
 tor-error = { path = "../tor-error", version = "0.37.0" }
+tor-hscrypto = { path = "../tor-hscrypto", version = "0.37.0", optional = true, features = ["memquota-memcost"] }
 tor-linkspec = { path = "../tor-linkspec", version = "0.37.0" }
 tor-llcrypto = { path = "../tor-llcrypto", version = "0.37.0", features = ["memquota-memcost"] }
 tor-memquota = { version = "0.37.0", path = "../tor-memquota", default-features = false }

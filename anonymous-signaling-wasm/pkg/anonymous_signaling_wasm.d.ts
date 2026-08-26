@@ -5,21 +5,19 @@ export class AnonymousSignalingClient {
   private constructor();
   free(): void;
   [Symbol.dispose](): void;
-  /**
-   * Issues one HTTP request over the verified Tor circuit and buffers the
-   * whole response. Unlike a browser `fetch`, this never leaves the WASM
-   * module as a browser request, so the origin's CORS policy does not apply
-   * and the exit address is what the server sees.
-   *
-   * `headers` is a plain object of name/value pairs; `body` is sent
-   * verbatim, so a multipart upload is assembled by the caller. Redirects
-   * are reported, not followed: the caller decides whether a `Location` is
-   * worth another circuit round trip.
-   */
-  httpRequest(method: string, url: string, headers: any, body?: Uint8Array | null): Promise<any>;
   directoryCache(): Promise<any>;
   close(): Promise<any>;
+  /**
+   * Bootstrap a Tor client and prove it can reach an onion service.
+   *
+   * `directory_seed` is the directory data a previous `directoryCache()`
+   * returned, or empty. `stun_urls` is used by the WebRTC bridge path;
+   * `websocket_bridge` selects the direct Snowflake WebSocket instead.
+   */
   static create(directory_seed: string | null | undefined, stun_urls: Array<any>, websocket_bridge: boolean): Promise<any>;
+  /**
+   * Open a WebSocket to a Nostr relay at `ws://<address>.onion[/path]`.
+   */
   connect(relay_url: string): Promise<any>;
 }
 
@@ -42,14 +40,13 @@ export interface InitOutput {
   readonly anonymoussignalingclient_connect: (a: number, b: number, c: number) => any;
   readonly anonymoussignalingclient_create: (a: number, b: number, c: any, d: number) => any;
   readonly anonymoussignalingclient_directoryCache: (a: number) => any;
-  readonly anonymoussignalingclient_httpRequest: (a: number, b: number, c: number, d: number, e: number, f: any, g: number, h: number) => any;
   readonly anonymoussignalingsocket_close: (a: number) => any;
   readonly anonymoussignalingsocket_receive: (a: number) => any;
   readonly anonymoussignalingsocket_send: (a: number, b: number, c: number) => any;
-  readonly wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___web_sys_91ba62fe70348d71___features__gen_CloseEvent__CloseEvent_____: (a: number, b: number, c: any) => void;
-  readonly wasm_bindgen_80478907236fa2b9___closure__destroy___dyn_core_e4e32f5ae772ed90___ops__function__FnMut__web_sys_91ba62fe70348d71___features__gen_CloseEvent__CloseEvent____Output_______: (a: number, b: number) => void;
   readonly wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___wasm_bindgen_80478907236fa2b9___JsValue_____: (a: number, b: number, c: any) => void;
   readonly wasm_bindgen_80478907236fa2b9___closure__destroy___dyn_core_e4e32f5ae772ed90___ops__function__FnMut__wasm_bindgen_80478907236fa2b9___JsValue____Output_______: (a: number, b: number) => void;
+  readonly wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___web_sys_91ba62fe70348d71___features__gen_CloseEvent__CloseEvent_____: (a: number, b: number, c: any) => void;
+  readonly wasm_bindgen_80478907236fa2b9___closure__destroy___dyn_core_e4e32f5ae772ed90___ops__function__FnMut__web_sys_91ba62fe70348d71___features__gen_CloseEvent__CloseEvent____Output_______: (a: number, b: number) => void;
   readonly wasm_bindgen_80478907236fa2b9___convert__closures_____invoke______: (a: number, b: number) => void;
   readonly wasm_bindgen_80478907236fa2b9___closure__destroy___dyn_core_e4e32f5ae772ed90___ops__function__FnMut_____Output_______: (a: number, b: number) => void;
   readonly wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___wasm_bindgen_80478907236fa2b9___JsValue__wasm_bindgen_80478907236fa2b9___JsValue_____: (a: number, b: number, c: any, d: any) => void;

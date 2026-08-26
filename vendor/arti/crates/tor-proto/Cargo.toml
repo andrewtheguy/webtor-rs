@@ -53,9 +53,9 @@ experimental = [
 conflux = ["tor-cell/conflux", "__is_experimental"]
 flowctl-cc = ["__is_experimental"]
 
-hs-client = []
-hs-service = []
-hs-common = []
+hs-client = ["hs-common"]
+hs-service = ["hs-common"]
+hs-common = ["tor-hscrypto"]
 experimental-api = ["__is_experimental"]
 # start_conversation etc.; TODO HS should be renamed
 send-control-msg = []
@@ -116,6 +116,7 @@ tor-cell = { path = "../tor-cell", version = "0.37.0" }
 tor-cert = { path = "../tor-cert", version = "0.37.0" }
 tor-checkable = { path = "../tor-checkable", version = "0.37.0" }
 tor-error = { path = "../tor-error", version = "0.37.0" }
+tor-hscrypto = { path = "../tor-hscrypto", version = "0.37.0", features = ["memquota-memcost"], optional = true }
 tor-linkspec = { path = "../tor-linkspec", version = "0.37.0" }
 tor-llcrypto = { path = "../tor-llcrypto", version = "0.37.0", features = ["memquota-memcost"] }
 tor-log-ratelim = { path = "../tor-log-ratelim", version = "0.37.0" }

@@ -10,6 +10,7 @@ mod directory;
 mod error;
 mod http;
 mod kcp_stream;
+mod onion;
 mod relay;
 mod retry;
 mod smux;
@@ -22,7 +23,7 @@ mod wasm_runtime;
 mod webrtc_stream;
 mod websocket;
 
-pub use client::TorClient;
+pub use client::{is_onion_host, TorClient};
 pub use config::{BridgeType, LogType, TorClientOptions};
 pub use error::{Result, TorError};
 pub use http::{HttpRequest, HttpResponse};

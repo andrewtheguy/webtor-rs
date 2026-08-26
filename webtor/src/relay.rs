@@ -166,10 +166,6 @@ impl RelayCriteria {
         self
     }
 
-    pub fn without_flag(mut self, flag: &str) -> Self {
-        self.exclude_flags.insert(flag.to_string());
-        self
-    }
 
     pub fn without_fingerprint(mut self, fingerprint: &str) -> Self {
         self.exclude_fingerprints.insert(fingerprint.to_string());
@@ -278,7 +274,9 @@ impl RelayManager {
 pub mod flags {
     #[cfg(test)]
     pub const AUTHORITY: &str = "Authority";
+    #[cfg(test)]
     pub const BAD_EXIT: &str = "BadExit";
+    #[cfg(test)]
     pub const EXIT: &str = "Exit";
     pub const FAST: &str = "Fast";
     #[cfg(test)]
@@ -305,15 +303,6 @@ pub mod selection {
             .with_flag(flags::FAST)
             .with_flag(flags::STABLE)
             .with_flag(flags::V2DIR)
-    }
-
-    /// Select exit relays (Fast, Stable, Exit, not BadExit)
-    pub fn exit_relays() -> RelayCriteria {
-        RelayCriteria::new()
-            .with_flag(flags::FAST)
-            .with_flag(flags::STABLE)
-            .with_flag(flags::EXIT)
-            .without_flag(flags::BAD_EXIT)
     }
 
 }
@@ -352,12 +341,6 @@ mod tests {
         assert_eq!(middle_relays.len(), 1);
         assert!(middle_relays[0].flags.contains(flags::V2DIR));
 
-        // Test exit relay selection
-        let exit_criteria = selection::exit_relays();
-        let exit_relays = manager.select_relays(&exit_criteria).unwrap();
-        assert_eq!(exit_relays.len(), 1);
-        assert!(exit_relays[0].flags.contains(flags::EXIT));
-        assert!(!exit_relays[0].flags.contains(flags::BAD_EXIT));
     }
 
     mod proptests {

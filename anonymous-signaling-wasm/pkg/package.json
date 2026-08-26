@@ -2,7 +2,7 @@
   "name": "@andrewtheguy/anonymous-signaling-wasm",
   "type": "module",
   "description": "Tor-backed WebSocket transport for pTransfer Nostr signaling",
-  "version": "0.0.1-alpha.2",
+  "version": "0.0.1-alpha.3",
   "license": "SEE LICENSE IN ../LICENSE",
   "files": [
     "anonymous_signaling_wasm_bg.wasm",

@@ -1,37 +1,32 @@
+//! Browser binding for pTransfer's anonymous Nostr signaling.
+//!
+//! The client reaches Nostr relays only as onion services. Bootstrap opens
+//! the Snowflake bridge channel and installs a directory; it is then proven
+//! against the Tor Project's own onion site before it is handed to the
+//! caller, so every `connect` runs on a client that has already completed
+//! one full onion rendezvous.
+
 use async_tungstenite::tungstenite::{protocol::Message, Error as WebSocketError};
 use futures::lock::Mutex;
 use futures::StreamExt;
-use serde::Deserialize;
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use subtle_tls::{TlsConfig, TlsConnector, TlsStream, TlsVersion};
 use url::Url;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
-use webtor::{DataStream, LogType, TorClient, TorClientOptions, TorError};
+use webtor::{is_onion_host, DataStream, LogType, TorClient, TorClientOptions, TorError};
 
 const MAX_NOSTR_MESSAGE_BYTES: usize = 1024 * 1024;
 const CONNECTION_TIMEOUT_MS: u64 = 240_000;
-const TOR_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
-const TOR_CHECK_URL: &str = "https://check.torproject.org/api/ip";
-/// Echoes any frame back verbatim, so a returned nonce is proof of a working
-/// round trip. It must serve TLS 1.3, since subtle-tls offers nothing older:
-/// `ws.postman-echo.com`, for one, is TLS 1.2 only and drops the connection
-/// mid-handshake. This endpoint opens with an unsolicited greeting frame,
-/// which the nonce comparison below skips.
-const WEBSOCKET_CHECK_URL: &str = "wss://echo.websocket.org/";
-const WEBSOCKET_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
-const RELAY_TCP_TIMEOUT: Duration = Duration::from_secs(30);
-const RELAY_TLS_TIMEOUT: Duration = Duration::from_secs(30);
+/// The Tor Project's website as an onion service. Fetching it exercises the
+/// whole onion client: HSDir lookup, introduction, rendezvous and a stream.
+const ONION_CHECK_URL: &str =
+    "http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/";
+const ONION_CHECK_TIMEOUT: Duration = Duration::from_secs(240);
+const RELAY_STREAM_TIMEOUT: Duration = Duration::from_secs(240);
 const RELAY_WEBSOCKET_TIMEOUT: Duration = Duration::from_secs(30);
-
-#[derive(Deserialize)]
-struct TorCheckResponse {
-    #[serde(rename = "IsTor")]
-    is_tor: bool,
-}
 
 fn js_error(context: &str, error: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&format!("{context}: {error}"))
@@ -45,100 +40,30 @@ fn log_tor_progress(message: &str, log_type: LogType) {
     }
 }
 
-async fn verify_tor_exit(client: &TorClient) -> Result<(), JsValue> {
-    log_tor_progress("Verifying the Tor exit...", LogType::Info);
+async fn verify_onion_client(client: &TorClient) -> Result<(), JsValue> {
+    log_tor_progress(
+        "Verifying the onion client against the Tor Project onion site...",
+        LogType::Info,
+    );
     let response = webtor::with_timeout(
-        TOR_CHECK_TIMEOUT,
-        "Tor exit verification",
-        client.get(TOR_CHECK_URL),
+        ONION_CHECK_TIMEOUT,
+        "Onion client verification",
+        client.get(ONION_CHECK_URL),
     )
     .await
-    .map_err(|error| js_error("Tor exit verification request failed", error))?;
-
+    .map_err(|error| js_error("Onion client verification request failed", error))?;
     if !response.is_success() {
         return Err(JsValue::from_str(&format!(
-            "Tor exit verification returned HTTP {}",
+            "Onion client verification returned HTTP {}",
             response.status
         )));
     }
-
-    let check = response
-        .json::<TorCheckResponse>()
-        .map_err(|error| js_error("Tor exit verification response was invalid", error))?;
-    if !check.is_tor {
-        return Err(JsValue::from_str(
-            "Tor exit verification failed: Tor Check did not recognize the connection as Tor",
-        ));
-    }
-
-    log_tor_progress("Tor exit verified.", LogType::Success);
+    log_tor_progress("Onion client verified.", LogType::Success);
     Ok(())
 }
 
-/// Runs immediately after the exit is verified and before the caller opens any
-/// relay stream. Proves the verified exit can carry a single `wss` stream, so
-/// a bridge that cannot carry any WebSocket stops looking exactly like Nostr
-/// relays that happen to be unreachable — today both fail the same way, with
-/// every relay stream timing out and nothing to tell the two apart.
-async fn verify_websocket_stream(client: &TorClient) -> Result<(), JsValue> {
-    log_tor_progress("Verifying a WebSocket stream over Tor...", LogType::Info);
-    let url = Url::parse(WEBSOCKET_CHECK_URL)
-        .map_err(|error| js_error("WebSocket verification URL is invalid", error))?;
-
-    let tls_stream = connect_tls(client, &url).await?;
-    let (socket, _) = webtor::with_timeout(
-        RELAY_WEBSOCKET_TIMEOUT,
-        "WebSocket verification handshake",
-        async {
-            async_tungstenite::client_async(url.as_str(), tls_stream)
-                .await
-                .map_err(|error| TorError::websocket_connection(error.to_string()))
-        },
-    )
-    .await
-    .map_err(|error| js_error("WebSocket verification handshake failed", error))?;
-
-    let (mut writer, mut reader) = socket.split();
-    let nonce = format!("ptransfer-websocket-check-{}", js_sys::Math::random());
-    webtor::with_timeout(
-        WEBSOCKET_CHECK_TIMEOUT,
-        "WebSocket verification echo",
-        async {
-            writer
-                .send(Message::Text(nonce.clone().into()))
-                .await
-                .map_err(|error| TorError::websocket_connection(error.to_string()))?;
-            while let Some(message) = reader.next().await {
-                match message
-                    .map_err(|error| TorError::websocket_connection(error.to_string()))?
-                {
-                    Message::Text(text) if text.as_str() == nonce => return Ok(()),
-                    Message::Ping(payload) => {
-                        writer.send(Message::Pong(payload)).await.map_err(|error| {
-                            TorError::websocket_connection(error.to_string())
-                        })?;
-                    }
-                    Message::Close(_) => break,
-                    // A greeting or any other frame is not the echo; keep reading.
-                    _ => continue,
-                }
-            }
-            Err(TorError::websocket_connection(
-                "the echo endpoint closed before returning the nonce".to_string(),
-            ))
-        },
-    )
-    .await
-    .map_err(|error| js_error("WebSocket verification failed", error))?;
-
-    let _ = writer.send(Message::Close(None)).await;
-    log_tor_progress("WebSocket over Tor verified.", LogType::Success);
-    Ok(())
-}
-
-type RelayTlsStream = TlsStream<DataStream>;
-type RelayWriter = async_tungstenite::WebSocketSender<RelayTlsStream>;
-type RelayReader = async_tungstenite::WebSocketReceiver<RelayTlsStream>;
+type RelayWriter = async_tungstenite::WebSocketSender<DataStream>;
+type RelayReader = async_tungstenite::WebSocketReceiver<DataStream>;
 
 fn signaling_client_options(stun_urls: Vec<String>, websocket_bridge: bool) -> TorClientOptions {
     let options = if websocket_bridge {
@@ -151,73 +76,18 @@ fn signaling_client_options(stun_urls: Vec<String>, websocket_bridge: bool) -> T
         .with_on_log(log_tor_progress)
 }
 
-async fn connect_tls(client: &TorClient, url: &Url) -> Result<RelayTlsStream, JsValue> {
+/// The relay URL an onion relay socket is allowed to have: `ws://` on a
+/// `.onion` host. `wss://` is refused rather than tolerated because a TLS
+/// layer over an onion circuit is redundant and this client carries none.
+fn parse_onion_relay_url(relay_url: &str) -> Result<Url, String> {
+    let url = Url::parse(relay_url).map_err(|error| format!("Invalid relay URL: {error}"))?;
     let host = url
         .host_str()
-        .ok_or_else(|| JsValue::from_str("Relay URL has no host"))?;
-    log_tor_progress(
-        &format!("Opening a Tor stream to {host}..."),
-        LogType::Info,
-    );
-    let tls13_config = TlsConfig {
-        skip_verification: false,
-        alpn_protocols: vec!["http/1.1".to_string()],
-        // subtle-tls carries TLS 1.2 again, but nothing here negotiates it:
-        // every retained path requires TLS 1.3.
-        version: TlsVersion::Tls13,
-    };
-    let tls13_connector = TlsConnector::with_config(tls13_config);
-    let stream = webtor::with_timeout(
-        RELAY_TCP_TIMEOUT,
-        "Nostr relay Tor stream",
-        client.open_stream(url),
-    )
-    .await
-    .map_err(|error| js_error("Failed to open Tor stream", error))?;
-    log_tor_progress(
-        &format!("Tor stream to {host} opened; starting TLS..."),
-        LogType::Info,
-    );
-
-    let tls_stream = webtor::with_timeout(RELAY_TLS_TIMEOUT, "Nostr relay TLS handshake", async {
-        tls13_connector
-            .connect(stream, host)
-            .await
-            .map_err(|error| TorError::tls(error.to_string()))
-    })
-    .await
-    .map_err(|error| js_error("Relay TLS 1.3 failed", error))?;
-    log_tor_progress(
-        &format!("TLS established with {host}."),
-        LogType::Success,
-    );
-    Ok(tls_stream)
-}
-
-/// Accepts a plain object of header name/value pairs. Anything else is a
-/// caller mistake worth reporting rather than silently dropping.
-fn parse_request_headers(headers: &JsValue) -> Result<Vec<(String, String)>, JsValue> {
-    if headers.is_undefined() || headers.is_null() {
-        return Ok(Vec::new());
+        .ok_or_else(|| "Relay URL has no host".to_string())?;
+    if url.scheme() != "ws" || !is_onion_host(host) {
+        return Err("Anonymous signaling requires a ws:// relay on a .onion host".to_string());
     }
-    let object = headers
-        .dyn_ref::<js_sys::Object>()
-        .ok_or_else(|| JsValue::from_str("Request headers must be an object"))?;
-    js_sys::Object::entries(object)
-        .iter()
-        .map(|entry| {
-            let entry = js_sys::Array::from(&entry);
-            let name = entry
-                .get(0)
-                .as_string()
-                .ok_or_else(|| JsValue::from_str("Request header names must be strings"))?;
-            let value = entry
-                .get(1)
-                .as_string()
-                .ok_or_else(|| JsValue::from_str("Request header values must be strings"))?;
-            Ok((name, value))
-        })
-        .collect()
+    Ok(url)
 }
 
 #[wasm_bindgen]
@@ -227,6 +97,11 @@ pub struct AnonymousSignalingClient {
 
 #[wasm_bindgen]
 impl AnonymousSignalingClient {
+    /// Bootstrap a Tor client and prove it can reach an onion service.
+    ///
+    /// `directory_seed` is the directory data a previous `directoryCache()`
+    /// returned, or empty. `stun_urls` is used by the WebRTC bridge path;
+    /// `websocket_bridge` selects the direct Snowflake WebSocket instead.
     #[wasm_bindgen(js_name = create)]
     pub fn create(
         directory_seed: Option<String>,
@@ -243,18 +118,15 @@ impl AnonymousSignalingClient {
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            // The direct WebSocket bridge dials Snowflake itself, so it needs
-            // no STUN; the WebRTC proxy path cannot negotiate without one.
             if !websocket_bridge && stun_urls.is_empty() {
                 return Err(JsValue::from_str(
                     "Anonymous signaling over WebRTC requires at least one STUN URL",
                 ));
             }
+
             let client = TorClient::new(signaling_client_options(stun_urls, websocket_bridge))
                 .await
                 .map_err(|error| js_error("Failed to initialize webtor", error))?;
-            // Bootstrap starts from this directory data when it is present and
-            // still valid; otherwise webtor downloads a consensus itself.
             if let Some(encoded) = directory_seed.filter(|value| !value.is_empty()) {
                 client.set_directory_seed(&encoded).await;
             }
@@ -262,19 +134,7 @@ impl AnonymousSignalingClient {
                 .ensure_ready()
                 .await
                 .map_err(|error| js_error("Failed to establish Tor connection", error))?;
-            verify_tor_exit(&client).await?;
-            // Widen the trust store before any relay connection. Not fatal:
-            // the embedded roots still reach part of the network, so a failed
-            // fetch narrows what is reachable rather than breaking signaling.
-            if let Err(error) = client.load_ca_bundle().await {
-                log_tor_progress(
-                    &format!(
-                        "Could not load the CA bundle; only the embedded roots are trusted: {error}"
-                    ),
-                    LogType::Error,
-                );
-            }
-            verify_websocket_stream(&client).await?;
+            verify_onion_client(&client).await?;
 
             Ok(JsValue::from(Self {
                 client: Arc::new(client),
@@ -295,95 +155,45 @@ impl AnonymousSignalingClient {
         })
     }
 
-    /// Issues one HTTP request over the verified Tor circuit and buffers the
-    /// whole response. Unlike a browser `fetch`, this never leaves the WASM
-    /// module as a browser request, so the origin's CORS policy does not apply
-    /// and the exit address is what the server sees.
-    ///
-    /// `headers` is a plain object of name/value pairs; `body` is sent
-    /// verbatim, so a multipart upload is assembled by the caller. Redirects
-    /// are reported, not followed: the caller decides whether a `Location` is
-    /// worth another circuit round trip.
-    #[wasm_bindgen(js_name = httpRequest)]
-    pub fn http_request(
-        &self,
-        method: String,
-        url: String,
-        headers: JsValue,
-        body: Option<Vec<u8>>,
-    ) -> js_sys::Promise {
-        let client = self.client.clone();
-        future_to_promise(async move {
-            let url = Url::parse(&url).map_err(|error| js_error("Invalid request URL", error))?;
-            let headers = parse_request_headers(&headers)?;
-            let response = client
-                .send(webtor::HttpRequest {
-                    method,
-                    url,
-                    headers,
-                    body,
-                })
-                .await
-                .map_err(|error| js_error("Tor HTTP request failed", error))?;
-
-            let rendered_headers = js_sys::Object::new();
-            for (name, value) in response.headers() {
-                js_sys::Reflect::set(
-                    &rendered_headers,
-                    &JsValue::from_str(name),
-                    &JsValue::from_str(value),
-                )?;
-            }
-            let result = js_sys::Object::new();
-            js_sys::Reflect::set(
-                &result,
-                &JsValue::from_str("status"),
-                &JsValue::from_f64(f64::from(response.status)),
-            )?;
-            js_sys::Reflect::set(&result, &JsValue::from_str("headers"), &rendered_headers)?;
-            js_sys::Reflect::set(
-                &result,
-                &JsValue::from_str("body"),
-                &js_sys::Uint8Array::from(response.bytes()),
-            )?;
-            Ok(result.into())
-        })
-    }
-
+    /// Open a WebSocket to a Nostr relay at `ws://<address>.onion[/path]`.
     #[wasm_bindgen(js_name = connect)]
     pub fn connect(&self, relay_url: String) -> js_sys::Promise {
         let client = self.client.clone();
         future_to_promise(async move {
-            let url =
-                Url::parse(&relay_url).map_err(|error| js_error("Invalid relay URL", error))?;
-            if url.scheme() != "wss" {
-                return Err(JsValue::from_str(
-                    "Anonymous signaling requires a secure wss:// relay",
-                ));
-            }
-
-            let tls_stream = connect_tls(&client, &url).await?;
+            let url = parse_onion_relay_url(&relay_url).map_err(|error| JsValue::from_str(&error))?;
             log_tor_progress(
-                &format!("Upgrading the Tor stream to WebSocket for {relay_url}..."),
+                &format!("Opening an onion stream to {relay_url}..."),
+                LogType::Info,
+            );
+            let stream = webtor::with_timeout(
+                RELAY_STREAM_TIMEOUT,
+                "Nostr relay onion stream",
+                client.open_stream(&url),
+            )
+            .await
+            .map_err(|error| js_error("Failed to open onion stream", error))?;
+
+            log_tor_progress(
+                &format!("Upgrading the onion stream to WebSocket for {relay_url}..."),
                 LogType::Info,
             );
             let (socket, _) = webtor::with_timeout(
                 RELAY_WEBSOCKET_TIMEOUT,
                 "Nostr relay WebSocket handshake",
                 async {
-                    async_tungstenite::client_async(url.as_str(), tls_stream)
+                    async_tungstenite::client_async(url.as_str(), stream)
                         .await
                         .map_err(|error| TorError::websocket_connection(error.to_string()))
                 },
             )
-                .await
-                .map_err(|error| js_error("Nostr WebSocket handshake failed", error))?;
+            .await
+            .map_err(|error| js_error("Nostr WebSocket handshake failed", error))?;
             log_tor_progress(
                 &format!("Connected to Nostr relay {relay_url} through Tor."),
                 LogType::Success,
             );
-            let (writer, reader) = socket.split();
 
+            let (writer, reader) = socket.split();
             Ok(JsValue::from(AnonymousSignalingSocket {
                 writer: Rc::new(Mutex::new(writer)),
                 reader: Rc::new(Mutex::new(reader)),
@@ -398,29 +208,6 @@ impl AnonymousSignalingClient {
             client.close().await;
             Ok(JsValue::UNDEFINED)
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn signaling_uses_snowflake_webrtc_with_caller_stun_urls() {
-        let options = signaling_client_options(vec!["stun:example.com".to_string()], false);
-        let webtor::BridgeType::SnowflakeWebRtc { stun_urls, .. } = options.bridge else {
-            panic!("signaling must use Snowflake WebRTC");
-        };
-        assert_eq!(stun_urls, vec!["stun:example.com"]);
-    }
-
-    #[test]
-    fn signaling_uses_the_direct_websocket_bridge_when_asked() {
-        let options = signaling_client_options(vec!["stun:example.com".to_string()], true);
-        assert!(matches!(
-            options.bridge,
-            webtor::BridgeType::SnowflakeWebSocket { .. }
-        ));
     }
 }
 
@@ -462,7 +249,6 @@ impl AnonymousSignalingSocket {
                 if closed.get() {
                     return Ok(JsValue::NULL);
                 }
-
                 let next = reader.lock().await.next().await;
                 match next {
                     Some(Ok(Message::Text(text))) => {
@@ -513,5 +299,42 @@ impl AnonymousSignalingSocket {
             }
             Ok(JsValue::UNDEFINED)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signaling_uses_snowflake_webrtc_with_caller_stun_urls() {
+        let options = signaling_client_options(vec!["stun:example.com".to_string()], false);
+        let webtor::BridgeType::SnowflakeWebRtc { stun_urls, .. } = options.bridge else {
+            panic!("signaling must use Snowflake WebRTC");
+        };
+        assert_eq!(stun_urls, vec!["stun:example.com"]);
+    }
+
+    #[test]
+    fn signaling_uses_the_direct_websocket_bridge_when_asked() {
+        let options = signaling_client_options(vec!["stun:example.com".to_string()], true);
+        assert!(matches!(
+            options.bridge,
+            webtor::BridgeType::SnowflakeWebSocket { .. }
+        ));
+    }
+
+    #[test]
+    fn relay_urls_must_be_plain_websockets_on_onion_hosts() {
+        assert!(parse_onion_relay_url(
+            "ws://nerostrrgb5fhj6dnzhjbgmnkpy2berdlczh6tuh2jsqrjok3j4zoxid.onion"
+        )
+        .is_ok());
+        assert!(parse_onion_relay_url(
+            "wss://nerostrrgb5fhj6dnzhjbgmnkpy2berdlczh6tuh2jsqrjok3j4zoxid.onion"
+        )
+        .is_err());
+        assert!(parse_onion_relay_url("ws://relay.example").is_err());
+        assert!(parse_onion_relay_url("wss://relay.example").is_err());
     }
 }
