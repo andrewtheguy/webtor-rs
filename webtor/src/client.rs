@@ -9,6 +9,7 @@ use crate::config::{BridgeType, LogType, TorClientOptions, SNOWFLAKE_FINGERPRINT
 use crate::directory::DirectoryManager;
 use crate::error::{Result, TorError};
 use crate::http::{build_request, execute_request, HttpRequest, HttpResponse};
+use crate::onion_url::OnionUrl;
 use crate::onion::OnionConnector;
 use crate::relay::RelayManager;
 use crate::retry::with_timeout;
@@ -17,7 +18,7 @@ use crate::snowflake_ws::SnowflakeWsStream;
 use crate::time::system_time_now;
 use crate::wasm_runtime::WasmRuntime;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use async_lock::{Mutex, RwLock};
 use tor_linkspec::OwnedChanTargetBuilder;
 use tor_llcrypto::pk::rsa::RsaIdentity;
 use tor_memquota::MemoryQuotaTracker;
@@ -25,7 +26,6 @@ use tor_proto::channel::ChannelBuilder;
 use tor_proto::client::stream::DataStream;
 use tor_proto::memquota::{ChannelAccount, SpecificAccount};
 use tracing::{debug, error, info};
-use url::Url;
 
 pub struct TorClient {
     options: TorClientOptions,
@@ -73,7 +73,7 @@ impl TorClient {
 
     /// GET an `http://` URL on an onion service and buffer the response.
     pub async fn get(&self, url: &str) -> Result<HttpResponse> {
-        self.send(HttpRequest::get(Url::parse(url)?)).await
+        self.send(HttpRequest::get(OnionUrl::parse(url)?)).await
     }
 
     /// Issue one plain HTTP/1.1 request to an onion service. The onion
@@ -85,31 +85,15 @@ impl TorClient {
                 "Onion HTTP requests use http://; the circuit already encrypts them",
             ));
         }
-        let host = request
-            .url
-            .host_str()
-            .ok_or_else(|| TorError::http_request("Invalid URL: no host"))?
-            .to_string();
-        let wire = build_request(&request, &host)?;
+        let wire = build_request(&request, request.url.host())?;
         let mut stream = self.open_stream(&request.url).await?;
         execute_request(&mut stream, &wire).await
     }
 
     /// Open a raw stream to the URL's onion service and port.
-    pub async fn open_stream(&self, url: &Url) -> Result<DataStream> {
+    pub async fn open_stream(&self, url: &OnionUrl) -> Result<DataStream> {
         self.ensure_ready().await?;
-        let host = url
-            .host_str()
-            .ok_or_else(|| TorError::Configuration("URL has no host".to_string()))?;
-        let port = url
-            .port_or_known_default()
-            .ok_or_else(|| TorError::Configuration("URL has no port".to_string()))?;
-        if !is_onion_host(host) {
-            return Err(TorError::Configuration(format!(
-                "{host} is not an onion service; this client only reaches .onion hosts"
-            )));
-        }
-        self.onion.connect(host, port).await
+        self.onion.connect(url.host(), url.port()).await
     }
 
     pub async fn ensure_ready(&self) -> Result<()> {
@@ -274,10 +258,6 @@ impl TorClient {
 }
 
 /// Whether `host` names a v3 onion service rather than a clearnet host.
-pub fn is_onion_host(host: &str) -> bool {
-    host.to_ascii_lowercase().ends_with(".onion")
-}
-
 fn parse_snowflake_identity() -> Result<RsaIdentity> {
     let bytes = hex::decode(SNOWFLAKE_FINGERPRINT)
         .map_err(|error| TorError::Configuration(format!("Invalid bridge identity: {error}")))?;
@@ -292,17 +272,5 @@ mod tests {
     #[test]
     fn snowflake_identity_is_valid() {
         assert!(parse_snowflake_identity().is_ok());
-    }
-
-    #[test]
-    fn onion_hosts_are_recognized() {
-        assert!(is_onion_host(
-            "nerostrrgb5fhj6dnzhjbgmnkpy2berdlczh6tuh2jsqrjok3j4zoxid.onion"
-        ));
-        assert!(is_onion_host(
-            "2GZYXA5IHM7NSGGFXNU52RCK2VV4RVMDLKIU3ZZUI5DU4XYCLEN53WID.ONION"
-        ));
-        assert!(!is_onion_host("relay.example"));
-        assert!(!is_onion_host("onion"));
     }
 }

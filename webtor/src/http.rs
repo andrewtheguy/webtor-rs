@@ -5,8 +5,8 @@
 use crate::error::{Result, TorError};
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use std::collections::HashMap;
+use crate::onion_url::OnionUrl;
 use tracing::debug;
-use url::Url;
 
 /// A whole response is buffered in memory before the caller sees it, so this
 /// bounds what one request can cost. Callers streaming anything larger have to
@@ -25,13 +25,13 @@ const RESERVED_HEADERS: [&str; 4] = [
 
 pub struct HttpRequest {
     pub method: String,
-    pub url: Url,
+    pub url: OnionUrl,
     pub headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
 }
 
 impl HttpRequest {
-    pub fn get(url: Url) -> Self {
+    pub fn get(url: OnionUrl) -> Self {
         Self {
             method: "GET".to_string(),
             url,
@@ -49,18 +49,9 @@ pub(crate) fn build_request(request: &HttpRequest, host: &str) -> Result<Vec<u8>
             request.method
         )));
     }
-    let path = if request.url.path().is_empty() {
-        "/"
-    } else {
-        request.url.path()
-    };
-    let query = request
-        .url
-        .query()
-        .map(|value| format!("?{value}"))
-        .unwrap_or_default();
+    let target = request.url.path_and_query();
 
-    let mut head = format!("{method} {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: pTransfer\r\nConnection: close\r\n");
+    let mut head = format!("{method} {target} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: pTransfer\r\nConnection: close\r\n");
     for (name, value) in &request.headers {
         // A newline in either half would let a caller inject headers, or a
         // whole second request, into the stream.
@@ -244,7 +235,7 @@ mod tests {
 
     #[test]
     fn builds_a_get_request() {
-        let url = Url::parse("http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/api/ip?format=json").unwrap();
+        let url = OnionUrl::parse("http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/api/ip?format=json").unwrap();
         let request =
             String::from_utf8(build_request(&HttpRequest::get(url), "check.torproject.org").unwrap())
                 .unwrap();
@@ -257,7 +248,7 @@ mod tests {
     fn builds_a_body_request_with_a_length() {
         let request = HttpRequest {
             method: "put".to_string(),
-            url: Url::parse("http://example.onion/upload").unwrap(),
+            url: OnionUrl::parse("http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/upload").unwrap(),
             headers: vec![("Content-Type".to_string(), "text/plain".to_string())],
             body: Some(b"hello".to_vec()),
         };
@@ -272,7 +263,7 @@ mod tests {
     fn rejects_header_injection() {
         let request = HttpRequest {
             method: "POST".to_string(),
-            url: Url::parse("http://example.onion/").unwrap(),
+            url: OnionUrl::parse("http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/").unwrap(),
             headers: vec![("X-Evil".to_string(), "a\r\nX-Injected: 1".to_string())],
             body: None,
         };
@@ -284,7 +275,7 @@ mod tests {
     fn rejects_client_owned_headers() {
         let request = HttpRequest {
             method: "POST".to_string(),
-            url: Url::parse("http://example.onion/").unwrap(),
+            url: OnionUrl::parse("http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/").unwrap(),
             headers: vec![("content-length".to_string(), "9".to_string())],
             body: Some(b"hello".to_vec()),
         };
@@ -302,12 +293,12 @@ mod tests {
 
     #[test]
     fn exposes_response_headers() {
-        let raw = b"HTTP/1.1 302 Found\r\nLocation: http://example.onion/a\r\nContent-Length: 0\r\n\r\n";
+        let raw = b"HTTP/1.1 302 Found\r\nLocation: http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/a\r\nContent-Length: 0\r\n\r\n";
         let response = parse_response(raw).unwrap();
         assert_eq!(response.status, 302);
         assert_eq!(
             response.headers().get("location").map(String::as_str),
-            Some("http://example.onion/a")
+            Some("http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/a")
         );
     }
 

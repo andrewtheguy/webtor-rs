@@ -47,10 +47,9 @@ web-sys = { version = "0.3.69", features = [
 ] }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
-tokio = { version = "1", features = ["sync", "macros", "io-util", "rt", "time"] }
 futures = "0.3"
-url = "2.5"
-tracing = "0.1"
+# Debug and trace strings are compiled out of release builds.
+tracing = { version = "0.1", features = ["release_max_level_info"] }
 
 # Tor-related dependencies (Arti 1.8.0)
 tor-rtcompat = { version = "0.37.0", default-features = false }
@@ -59,6 +58,7 @@ tor-netdoc = { version = "0.37.0", default-features = false, features = ["hs-cli
 tor-linkspec = { version = "0.37.0", features = ["decode", "verbatim"] }
 tor-cell = { version = "0.37.0", features = ["hs"] }
 tor-hscrypto = "0.37.0"
+tor-checkable = "0.37.0"
 tor-bytes = "0.37.0"
 tor-llcrypto = "0.37.0"
 tor-memquota = { version = "0.37.0", default-features = false }
@@ -66,7 +66,6 @@ tor-protover = "0.37.0"
 tor-units = "0.37.0"
 
 # Cryptography
-rsa = "0.9"
 hex = "0.4"
 base64 = "0.22"
 
