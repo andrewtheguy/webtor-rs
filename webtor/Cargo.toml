@@ -9,12 +9,14 @@ description = "Core Tor client implementation for web browsers"
 [dependencies]
 # Async locks (no runtime needed)
 async-lock = "3"
+async-trait = "0.1"
 futures = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
 # Tor protocol implementation
 tor-rtcompat = { workspace = true }
+tor-general-addr = { workspace = true }
 tor-proto = { workspace = true }
 tor-protover = { workspace = true }
 tor-units = { workspace = true }

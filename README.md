@@ -5,9 +5,6 @@ anonymous Nostr signaling. The repository contains the Rust workspace and the
 generated `@andrewtheguy/anonymous-signaling-wasm` package consumed by the
 adjacent pTransfer checkout.
 
-Upstream provenance and the retained Arti crates are documented in
-[UPSTREAM.md](./UPSTREAM.md).
-
 ## What the client does
 
 The client reaches Nostr relays only as v3 onion services. It never builds a

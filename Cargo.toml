@@ -53,6 +53,7 @@ tracing = { version = "0.1", features = ["release_max_level_info"] }
 
 # Tor-related dependencies (Arti 2.5.1)
 tor-rtcompat = { version = "0.45.0", default-features = false }
+tor-general-addr = "0.45.0"
 tor-proto = { version = "0.45.0", default-features = false, features = ["hs-client", "send-control-msg"] }
 tor-netdoc = { version = "0.45.0", default-features = false, features = ["hs-client"] }
 tor-linkspec = { version = "0.45.0", features = ["decode", "verbatim"] }
@@ -75,9 +76,6 @@ gloo-timers = { version = "0.3", features = ["futures"] }
 
 # KCP reliable transport
 kcp = "0.6"
-
-[patch.crates-io]
-tor-proto = { path = "vendor/arti/crates/tor-proto" }
 
 # Release profile optimized for WASM bundle size
 [profile.release]

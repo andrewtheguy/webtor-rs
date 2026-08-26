@@ -22,6 +22,7 @@ mod snowflake_ws;
 mod time;
 mod turbo;
 mod wasm_runtime;
+mod wasm_runtime_unsupported;
 mod webrtc_stream;
 mod websocket;
 
