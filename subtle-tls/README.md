@@ -1,112 +1,78 @@
 # subtle-tls
 
-TLS 1.3 and 1.2 client implementation using the browser SubtleCrypto API for WASM environments.
+The TLS 1.3 client that fronts webtor's Tor link channel.
 
-## Overview
+A Tor relay's ORPort speaks TLS, so the bytes a Snowflake tunnel carries to the
+bridge have to be a TLS session even though the browser already wrapped the
+outer hop. This crate is that session and nothing else — it is not a general
+TLS library, and it should not be used as one.
 
-This crate provides TLS 1.3 encryption with automatic TLS 1.2 fallback for WASM environments where native crypto libraries like `ring` cannot be used. It leverages the browser's SubtleCrypto API for cryptographic operations.
+## Scope
 
-## Features
+One profile, no negotiation:
 
-- TLS 1.3 client implementation with automatic TLS 1.2 fallback
-- Key exchange: P-256 ECDH (via SubtleCrypto), X25519 (via pure Rust)
-- Cipher suites: AES-128-GCM, AES-256-GCM (via SubtleCrypto), ChaCha20-Poly1305 (via pure Rust)
-- Certificate chain validation with hostname verification
-- Trust store with embedded Let's Encrypt roots (~3.5KB)
-- AsyncRead/AsyncWrite interface
+- TLS 1.3 only. There is no TLS 1.2 fallback and no earlier version.
+- X25519 key exchange only (`crypto::X25519KeyPair`), advertised as the sole
+  supported group.
+- ChaCha20-Poly1305 only, with SHA-256 for the transcript and HKDF.
+- **No certificate validation, no hostname verification and no trust store.**
+  The server's certificate is accepted as presented and handed back through
+  `TlsStream::peer_certificate`. Tor does not trust the TLS certificate: it
+  authenticates the relay through the CERTS cells exchanged on the channel,
+  which need the peer certificate bytes and nothing more.
+- `server_name` fills the SNI extension and has no other effect.
+
+Everything is pure Rust (`chacha20poly1305`, `sha2`, `hmac`, `x25519-dalek`),
+so the record layer can encrypt from inside `poll_read`/`poll_write` without an
+await point. The crate name is a leftover: an earlier version reached for the
+browser's SubtleCrypto API, which is async and therefore could not be called
+from a `poll_` method. Nothing here touches WebCrypto today.
 
 ## Usage
 
-```rust
-use subtle_tls::TlsConnector;
-
-let connector = TlsConnector::new();
-let mut tls_stream = connector.connect(tcp_stream, "example.com").await?;
-
-// Read/write using async methods
-tls_stream.write(b"GET / HTTP/1.1\r\n\r\n").await?;
-let mut response = vec![0u8; 4096];
-let n = tls_stream.read(&mut response).await?;
-```
-
-## Configuration
+`TlsStream::connect` performs the handshake and returns a stream implementing
+`futures::io::AsyncRead + AsyncWrite`.
 
 ```rust
-use subtle_tls::{TlsConnector, TlsConfig};
+use futures::io::{AsyncReadExt, AsyncWriteExt};
+use subtle_tls::TlsStream;
 
-let config = TlsConfig {
-    skip_verification: false,  // Set to true for testing (INSECURE!)
-    alpn_protocols: vec!["http/1.1".to_string(), "h2".to_string()],
-};
+let mut tls = TlsStream::connect(transport, "snowflake.torproject.net").await?;
+tls.write_all(&cell).await?;
+let mut buffer = [0u8; 512];
+let count = tls.read(&mut buffer).await?;
 
-let connector = TlsConnector::with_config(config);
+// What Tor actually authenticates the peer with:
+let der = tls.peer_certificate();
 ```
 
-## Testing
+In webtor this wraps the Snowflake transports — see `snowflake_ws.rs` and
+`snowflake_webrtc.rs` — and the resulting stream is what `tor-proto` builds its
+channel on.
 
-### WASM tests - Node.js (full test suite)
+## Layout
 
-All 53 tests run in Node.js thanks to the `globalThis.crypto` fallback:
+```
+src/
+├── lib.rs        # re-exports: TlsStream, TlsError, Result
+├── crypto.rs     # X25519, ChaCha20-Poly1305, SHA-256, HMAC, HKDF
+├── handshake.rs  # ClientHello/ServerHello, key schedule, transcript
+├── record.rs     # record layer framing and encryption
+├── stream.rs     # TlsStream: handshake driver + AsyncRead/AsyncWrite
+└── error.rs      # TlsError
+```
+
+## Tests
+
+Unit tests cover the crypto primitives and the record layer, and run natively:
 
 ```bash
-# Requires: cargo install wasm-bindgen-cli
-# And .cargo/config.toml with runner = "wasm-bindgen-test-runner"
-WASM_BINDGEN_USE_NODE_EXPERIMENTAL=1 cargo test --target wasm32-unknown-unknown -p subtle-tls
+cargo test -p subtle-tls
 ```
 
-This runs all tests including:
-- P-256 ECDH key exchange (via Node's WebCrypto)
-- X25519 key exchange (pure Rust)
-- AES-128-GCM and AES-256-GCM encryption (via Node's WebCrypto)
-- ChaCha20-Poly1305 encryption (pure Rust)
-- SHA-256/SHA-384 hashing (via Node's WebCrypto)
-- HKDF key derivation (via Node's WebCrypto)
-- Handshake message building/parsing
-- Record layer encryption/decryption
-- Trust store certificate parsing
-- Certificate verification
-- Error types and config
-
-### WASM tests - Browser
-
-For browser testing (alternative to Node.js):
-
-```bash
-# Using Chrome (requires chromedriver)
-wasm-pack test --headless --chrome
-
-# Using Firefox (requires geckodriver)
-wasm-pack test --headless --firefox
-```
-
-**Note**: Browser tests require WebDriver:
-- Chrome: `chromedriver` (install via `brew install chromedriver` on macOS)
-- Firefox: `geckodriver` (install via `brew install geckodriver` on macOS)
-
-## Architecture
-
-```
-subtle-tls/
-├── src/
-│   ├── lib.rs           # Public API (TlsConnector, TlsConfig)
-│   ├── crypto.rs        # Cryptographic primitives (ECDH, AES-GCM, HKDF, etc.)
-│   ├── handshake.rs     # TLS 1.3 handshake protocol
-│   ├── record.rs        # TLS record layer with encryption
-│   ├── stream.rs        # TlsStream wrapper with async I/O
-│   ├── cert.rs          # Certificate validation
-│   ├── trust_store.rs   # Root CA certificates
-│   └── error.rs         # Error types
-└── tests/
-    └── integration_tests.rs  # WASM integration tests
-```
-
-## Security Considerations
-
-- This implementation is for educational and experimental use
-- Supports TLS 1.3 (preferred) with TLS 1.2 fallback; older protocol versions are not supported
-- Certificate validation uses embedded Let's Encrypt roots by default
-- The `skip_verification` option should NEVER be used in production
-- ChaCha20-Poly1305 uses pure Rust (not SubtleCrypto) since browsers don't support it
+The handshake itself has no offline test; it is exercised end to end whenever
+webtor bootstraps, since every bootstrap opens a channel to the bridge through
+this crate.
 
 ## License
 
