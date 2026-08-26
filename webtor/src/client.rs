@@ -4,7 +4,7 @@ use crate::circuit::CircuitManager;
 use crate::config::{BridgeType, LogType, TorClientOptions, SNOWFLAKE_FINGERPRINT};
 use crate::directory::DirectoryManager;
 use crate::error::{Result, TorError};
-use crate::http::{HttpResponse, TorHttpClient};
+use crate::http::{HttpRequest, HttpResponse, TorHttpClient};
 use crate::relay::RelayManager;
 use crate::retry::with_timeout;
 use crate::snowflake_webrtc::{SnowflakeWebRtcConfig, SnowflakeWebRtcStream};
@@ -94,8 +94,12 @@ impl TorClient {
     }
 
     pub async fn get(&self, url: &str) -> Result<HttpResponse> {
+        self.send(HttpRequest::get(Url::parse(url)?)).await
+    }
+
+    pub async fn send(&self, request: HttpRequest) -> Result<HttpResponse> {
         self.ensure_ready().await?;
-        self.http_client.get(Url::parse(url)?).await
+        self.http_client.send(request).await
     }
 
     pub async fn open_stream(&self, url: &Url) -> Result<DataStream> {

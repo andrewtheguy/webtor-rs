@@ -142,6 +142,13 @@ function makeMutClosure(arg0, arg1, dtor, f) {
     return real;
 }
 
+function passArray8ToWasm0(arg, malloc) {
+    const ptr = malloc(arg.length * 1, 1) >>> 0;
+    getUint8ArrayMemory0().set(arg, ptr / 1);
+    WASM_VECTOR_LEN = arg.length;
+    return ptr;
+}
+
 function passStringToWasm0(arg, malloc, realloc) {
     if (realloc === undefined) {
         const buf = cachedTextEncoder.encode(arg);
@@ -208,12 +215,12 @@ if (!('encodeInto' in cachedTextEncoder)) {
 
 let WASM_VECTOR_LEN = 0;
 
-function wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___wasm_bindgen_80478907236fa2b9___JsValue_____(arg0, arg1, arg2) {
-    wasm.wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___wasm_bindgen_80478907236fa2b9___JsValue_____(arg0, arg1, arg2);
-}
-
 function wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___web_sys_91ba62fe70348d71___features__gen_CloseEvent__CloseEvent_____(arg0, arg1, arg2) {
     wasm.wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___web_sys_91ba62fe70348d71___features__gen_CloseEvent__CloseEvent_____(arg0, arg1, arg2);
+}
+
+function wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___wasm_bindgen_80478907236fa2b9___JsValue_____(arg0, arg1, arg2) {
+    wasm.wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___wasm_bindgen_80478907236fa2b9___JsValue_____(arg0, arg1, arg2);
 }
 
 function wasm_bindgen_80478907236fa2b9___convert__closures_____invoke______(arg0, arg1) {
@@ -261,6 +268,32 @@ export class AnonymousSignalingClient {
     free() {
         const ptr = this.__destroy_into_raw();
         wasm.__wbg_anonymoussignalingclient_free(ptr, 0);
+    }
+    /**
+     * Issues one HTTP request over the verified Tor circuit and buffers the
+     * whole response. Unlike a browser `fetch`, this never leaves the WASM
+     * module as a browser request, so the origin's CORS policy does not apply
+     * and the exit address is what the server sees.
+     *
+     * `headers` is a plain object of name/value pairs; `body` is sent
+     * verbatim, so a multipart upload is assembled by the caller. Redirects
+     * are reported, not followed: the caller decides whether a `Location` is
+     * worth another circuit round trip.
+     * @param {string} method
+     * @param {string} url
+     * @param {any} headers
+     * @param {Uint8Array | null} [body]
+     * @returns {Promise<any>}
+     */
+    httpRequest(method, url, headers, body) {
+        const ptr0 = passStringToWasm0(method, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(url, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        var ptr2 = isLikeNone(body) ? 0 : passArray8ToWasm0(body, wasm.__wbindgen_malloc);
+        var len2 = WASM_VECTOR_LEN;
+        const ret = wasm.anonymoussignalingclient_httpRequest(this.__wbg_ptr, ptr0, len0, ptr1, len1, headers, ptr2, len2);
+        return ret;
     }
     /**
      * @returns {Promise<any>}
@@ -397,6 +430,10 @@ function __wbg_get_imports() {
         const ret = typeof(arg0) === 'function';
         return ret;
     };
+    imports.wbg.__wbg___wbindgen_is_null_dfda7d66506c95b5 = function(arg0) {
+        const ret = arg0 === null;
+        return ret;
+    };
     imports.wbg.__wbg___wbindgen_is_object_ce774f3490692386 = function(arg0) {
         const val = arg0;
         const ret = typeof(val) === 'object' && val !== null;
@@ -501,6 +538,10 @@ function __wbg_get_imports() {
         const ret = arg0.encrypt(arg1, arg2, arg3);
         return ret;
     }, arguments) };
+    imports.wbg.__wbg_entries_83c79938054e065f = function(arg0) {
+        const ret = Object.entries(arg0);
+        return ret;
+    };
     imports.wbg.__wbg_error_7534b8e9a36f1ab4 = function(arg0, arg1) {
         let deferred0_0;
         let deferred0_1;
@@ -521,6 +562,10 @@ function __wbg_get_imports() {
     }, arguments) };
     imports.wbg.__wbg_fetch_8119fbf8d0e4f4d1 = function(arg0, arg1) {
         const ret = arg0.fetch(arg1);
+        return ret;
+    };
+    imports.wbg.__wbg_from_29a8414a7a7cd19d = function(arg0) {
+        const ret = Array.from(arg0);
         return ret;
     };
     imports.wbg.__wbg_generateKey_1575e199b1d2d83d = function() { return handleError(function (arg0, arg1, arg2, arg3) {
@@ -563,6 +608,16 @@ function __wbg_get_imports() {
         let result;
         try {
             result = arg0 instanceof ArrayBuffer;
+        } catch (_) {
+            result = false;
+        }
+        const ret = result;
+        return ret;
+    };
+    imports.wbg.__wbg_instanceof_Object_577e21051f7bcb79 = function(arg0) {
+        let result;
+        try {
+            result = arg0 instanceof Object;
         } catch (_) {
             result = false;
         }
@@ -898,11 +953,6 @@ function __wbg_get_imports() {
         const ret = getStringFromWasm0(arg0, arg1);
         return ret;
     };
-    imports.wbg.__wbindgen_cast_3eeb20012a217678 = function(arg0, arg1) {
-        // Cast intrinsic for `Closure(Closure { dtor_idx: 542, function: Function { arguments: [], shim_idx: 543, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-        const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen_80478907236fa2b9___closure__destroy___dyn_core_e4e32f5ae772ed90___ops__function__FnMut_____Output_______, wasm_bindgen_80478907236fa2b9___convert__closures_____invoke______);
-        return ret;
-    };
     imports.wbg.__wbindgen_cast_487fe066279ecfde = function(arg0, arg1) {
         // Cast intrinsic for `Closure(Closure { dtor_idx: 25, function: Function { arguments: [NamedExternref("Event")], shim_idx: 59, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
         const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen_80478907236fa2b9___closure__destroy___dyn_core_e4e32f5ae772ed90___ops__function__FnMut__web_sys_91ba62fe70348d71___features__gen_CloseEvent__CloseEvent____Output_______, wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___web_sys_91ba62fe70348d71___features__gen_CloseEvent__CloseEvent_____);
@@ -928,9 +978,14 @@ function __wbg_get_imports() {
         const ret = arg0;
         return ret;
     };
-    imports.wbg.__wbindgen_cast_ee95a8a3c3def373 = function(arg0, arg1) {
-        // Cast intrinsic for `Closure(Closure { dtor_idx: 1151, function: Function { arguments: [Externref], shim_idx: 1152, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    imports.wbg.__wbindgen_cast_debc67207ab34267 = function(arg0, arg1) {
+        // Cast intrinsic for `Closure(Closure { dtor_idx: 1155, function: Function { arguments: [Externref], shim_idx: 1156, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
         const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen_80478907236fa2b9___closure__destroy___dyn_core_e4e32f5ae772ed90___ops__function__FnMut__wasm_bindgen_80478907236fa2b9___JsValue____Output_______, wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___wasm_bindgen_80478907236fa2b9___JsValue_____);
+        return ret;
+    };
+    imports.wbg.__wbindgen_cast_e4bcf834b96fe531 = function(arg0, arg1) {
+        // Cast intrinsic for `Closure(Closure { dtor_idx: 546, function: Function { arguments: [], shim_idx: 547, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+        const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen_80478907236fa2b9___closure__destroy___dyn_core_e4e32f5ae772ed90___ops__function__FnMut_____Output_______, wasm_bindgen_80478907236fa2b9___convert__closures_____invoke______);
         return ret;
     };
     imports.wbg.__wbindgen_init_externref_table = function() {

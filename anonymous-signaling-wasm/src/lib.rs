@@ -194,6 +194,32 @@ async fn connect_tls(client: &TorClient, url: &Url) -> Result<RelayTlsStream, Js
     Ok(tls_stream)
 }
 
+/// Accepts a plain object of header name/value pairs. Anything else is a
+/// caller mistake worth reporting rather than silently dropping.
+fn parse_request_headers(headers: &JsValue) -> Result<Vec<(String, String)>, JsValue> {
+    if headers.is_undefined() || headers.is_null() {
+        return Ok(Vec::new());
+    }
+    let object = headers
+        .dyn_ref::<js_sys::Object>()
+        .ok_or_else(|| JsValue::from_str("Request headers must be an object"))?;
+    js_sys::Object::entries(object)
+        .iter()
+        .map(|entry| {
+            let entry = js_sys::Array::from(&entry);
+            let name = entry
+                .get(0)
+                .as_string()
+                .ok_or_else(|| JsValue::from_str("Request header names must be strings"))?;
+            let value = entry
+                .get(1)
+                .as_string()
+                .ok_or_else(|| JsValue::from_str("Request header values must be strings"))?;
+            Ok((name, value))
+        })
+        .collect()
+}
+
 #[wasm_bindgen]
 pub struct AnonymousSignalingClient {
     client: Arc<TorClient>,
@@ -266,6 +292,61 @@ impl AnonymousSignalingClient {
                 .map_err(|error| js_error("Failed to export Tor directory cache", error))?
                 .ok_or_else(|| JsValue::from_str("Tor directory cache is unavailable"))?;
             Ok(JsValue::from_str(&encoded))
+        })
+    }
+
+    /// Issues one HTTP request over the verified Tor circuit and buffers the
+    /// whole response. Unlike a browser `fetch`, this never leaves the WASM
+    /// module as a browser request, so the origin's CORS policy does not apply
+    /// and the exit address is what the server sees.
+    ///
+    /// `headers` is a plain object of name/value pairs; `body` is sent
+    /// verbatim, so a multipart upload is assembled by the caller. Redirects
+    /// are reported, not followed: the caller decides whether a `Location` is
+    /// worth another circuit round trip.
+    #[wasm_bindgen(js_name = httpRequest)]
+    pub fn http_request(
+        &self,
+        method: String,
+        url: String,
+        headers: JsValue,
+        body: Option<Vec<u8>>,
+    ) -> js_sys::Promise {
+        let client = self.client.clone();
+        future_to_promise(async move {
+            let url = Url::parse(&url).map_err(|error| js_error("Invalid request URL", error))?;
+            let headers = parse_request_headers(&headers)?;
+            let response = client
+                .send(webtor::HttpRequest {
+                    method,
+                    url,
+                    headers,
+                    body,
+                })
+                .await
+                .map_err(|error| js_error("Tor HTTP request failed", error))?;
+
+            let rendered_headers = js_sys::Object::new();
+            for (name, value) in response.headers() {
+                js_sys::Reflect::set(
+                    &rendered_headers,
+                    &JsValue::from_str(name),
+                    &JsValue::from_str(value),
+                )?;
+            }
+            let result = js_sys::Object::new();
+            js_sys::Reflect::set(
+                &result,
+                &JsValue::from_str("status"),
+                &JsValue::from_f64(f64::from(response.status)),
+            )?;
+            js_sys::Reflect::set(&result, &JsValue::from_str("headers"), &rendered_headers)?;
+            js_sys::Reflect::set(
+                &result,
+                &JsValue::from_str("body"),
+                &js_sys::Uint8Array::from(response.bytes()),
+            )?;
+            Ok(result.into())
         })
     }
 

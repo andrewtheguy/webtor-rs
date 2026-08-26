@@ -25,6 +25,6 @@ mod websocket;
 pub use client::TorClient;
 pub use config::{BridgeType, LogType, TorClientOptions};
 pub use error::{Result, TorError};
-pub use http::HttpResponse;
+pub use http::{HttpRequest, HttpResponse};
 pub use retry::with_timeout;
 pub use tor_proto::client::stream::DataStream;
