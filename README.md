@@ -25,6 +25,36 @@ before it resolves, so every method below runs on a verified circuit.
 - `directoryCache()` exports the consensus and microdescriptors from the last
   successful bootstrap so the caller can persist them.
 
+## Onion relay probe
+
+`scripts/onion_ws_probe.py` asks whether a Nostr relay exposed as an onion
+service accepts a WebSocket and serves a `REQ` over it. The WASM client cannot
+answer that yet — it has no onion client — so this speaks SOCKS5 to a running
+Tor, then the WebSocket handshake and RFC 6455 framing by hand. Standard
+library only.
+
+```bash
+./scripts/onion_ws_probe.py ws://<addr>.onion
+TOR_SOCKS_PROXY='[fdb8::1]:32050' ./scripts/onion_ws_probe.py ws://<addr>.onion
+```
+
+The proxy defaults to `127.0.0.1:9050`; `--proxy` and `TOR_SOCKS_PROXY` both
+override it, and an IPv6 literal needs brackets. It exits non-zero on failure
+and names the step that failed, so a Tor SOCKS `0x04` (no descriptor, service
+down) reads differently from a relay that upgrades and then refuses the `REQ`.
+
+A `ws://` URL carries no TLS, which is the point: the onion protocol
+authenticates the service against its own address and encrypts the circuit end
+to end, so a relay reached this way needs neither an exit nor a certificate.
+`wss://` is supported for relays that insist on it — including clearnet
+relays through an exit, which is useful for comparison — with the certificate
+deliberately unchecked, since these are routinely self-signed.
+
+Relay addresses come from
+[`0xtrr/onion-service-nostr-relays`](https://github.com/0xtrr/onion-service-nostr-relays),
+a community-maintained list with no uptime tracking; expect a share of any
+sample to be gone.
+
 ## Releases
 
 The wasm-pack output is published as a `.tgz` asset on a GitHub release, and
