@@ -2,3 +2,4 @@
 /target/
 *.tgz
 /anonymous-signaling-wasm/LICENSE
+tmp/
