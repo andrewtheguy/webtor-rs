@@ -1,0 +1,112 @@
+name: Publish
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from anonymous-signaling-wasm
+        id: version
+        run: |
+          set -euo pipefail
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "jq is required but not installed" >&2
+            exit 1
+          fi
+          metadata=$(cargo metadata --no-deps --format-version 1)
+          version=$(printf '%s' "$metadata" | jq -r '.packages[] | select(.name=="anonymous-signaling-wasm") | .version')
+          if [ -z "$version" ] || [ "$version" = "null" ]; then
+            echo "Failed to extract version from cargo metadata" >&2
+            exit 1
+          fi
+          # A SemVer pre-release identifier (0.0.1-alpha.1) marks the GitHub
+          # release as a pre-release, so the published version alone decides it.
+          case "$version" in
+            *-*) prerelease=true ;;
+            *) prerelease=false ;;
+          esac
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+
+      - name: Block if release already exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists" >&2
+            exit 1
+          fi
+
+  build-wasm:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - run: npm pack
+        working-directory: anonymous-signaling-wasm/pkg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm-pkg
+          path: anonymous-signaling-wasm/pkg/*.tgz
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, build-wasm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create draft release and upload artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          args=(--repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$TAG" --draft --generate-notes)
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$TAG" "${args[@]}"
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" dist/*
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          gh release edit "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false
