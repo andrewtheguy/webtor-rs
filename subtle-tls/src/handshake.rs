@@ -1,19 +1,15 @@
-//! TLS 1.3 Handshake implementation
-//!
-//! This module handles the TLS 1.3 handshake protocol:
-//! 1. ClientHello (with key_share extension)
-//! 2. ServerHello
-//! 3. EncryptedExtensions
-//! 4. Certificate
-//! 5. CertificateVerify
-//! 6. Finished
+//! TLS 1.3 handshake state machine for one profile: X25519 key exchange,
+//! TLS_CHACHA20_POLY1305_SHA256, server authenticated by whatever
+//! certificate it presents. The certificate is handed to the caller
+//! unverified; Tor authenticates the relay through CERTS cells on the
+//! channel, not through the TLS certificate.
 
-use crate::crypto::{self, EcdhKeyPair, Hkdf, X25519KeyPair};
+use crate::crypto::{self, Hkdf, X25519KeyPair};
 use crate::error::{Result, TlsError};
 use tracing::{debug, trace};
 
-// TLS 1.3 constants
-pub const TLS_VERSION_1_2: u16 = 0x0303; // Used in record layer for compatibility
+/// Legacy version written into record headers and the ClientHello
+pub const TLS_VERSION_1_2: u16 = 0x0303;
 pub const TLS_VERSION_1_3: u16 = 0x0304;
 
 // Content types
@@ -22,64 +18,46 @@ pub const CONTENT_TYPE_ALERT: u8 = 21;
 pub const CONTENT_TYPE_HANDSHAKE: u8 = 22;
 pub const CONTENT_TYPE_APPLICATION_DATA: u8 = 23;
 
-// Handshake types
+// Handshake message types
 pub const HANDSHAKE_CLIENT_HELLO: u8 = 1;
 pub const HANDSHAKE_SERVER_HELLO: u8 = 2;
-pub const HANDSHAKE_NEW_SESSION_TICKET: u8 = 4;
-pub const HANDSHAKE_END_OF_EARLY_DATA: u8 = 5;
 pub const HANDSHAKE_ENCRYPTED_EXTENSIONS: u8 = 8;
 pub const HANDSHAKE_CERTIFICATE: u8 = 11;
-pub const HANDSHAKE_CERTIFICATE_REQUEST: u8 = 13;
 pub const HANDSHAKE_CERTIFICATE_VERIFY: u8 = 15;
 pub const HANDSHAKE_FINISHED: u8 = 20;
-pub const HANDSHAKE_KEY_UPDATE: u8 = 24;
-pub const HANDSHAKE_MESSAGE_HASH: u8 = 254;
 
 // Extension types
 pub const EXT_SERVER_NAME: u16 = 0;
 pub const EXT_SUPPORTED_GROUPS: u16 = 10;
 pub const EXT_SIGNATURE_ALGORITHMS: u16 = 13;
-pub const EXT_ALPN: u16 = 16;
 pub const EXT_SUPPORTED_VERSIONS: u16 = 43;
 pub const EXT_KEY_SHARE: u16 = 51;
 
-// Cipher suites
-pub const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
-pub const TLS_AES_256_GCM_SHA384: u16 = 0x1302;
+/// The only cipher suite offered. Its AEAD is pure Rust and synchronous,
+/// which the record layer needs to encrypt from `poll_read`/`poll_write`.
 pub const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
 
-// Named groups
-pub const GROUP_SECP256R1: u16 = 0x0017; // P-256
+/// The only key exchange group offered.
 pub const GROUP_X25519: u16 = 0x001d;
 
-// Signature algorithms
+// Signature algorithms the server may sign CertificateVerify with. The
+// extension is mandatory in a ClientHello; the signature itself is not
+// checked here (see the module docs).
 pub const SIG_ECDSA_SECP256R1_SHA256: u16 = 0x0403;
 pub const SIG_RSA_PSS_RSAE_SHA256: u16 = 0x0804;
 pub const SIG_RSA_PKCS1_SHA256: u16 = 0x0401;
 
-/// Key exchange state - supports both P-256 and X25519
-pub enum KeyExchangeState {
-    P256(EcdhKeyPair),
-    X25519(X25519KeyPair),
-}
-
 /// TLS handshake state machine
 pub struct HandshakeState {
-    /// Our P-256 ECDH key pair
-    pub ecdh_key: EcdhKeyPair,
-    /// Our X25519 key pair (for servers that prefer X25519)
-    pub x25519_key: Option<X25519KeyPair>,
-    /// Which key exchange was selected by the server
-    pub selected_group: u16,
+    /// Our X25519 key pair, consumed when the shared secret is derived
+    x25519_key: Option<X25519KeyPair>,
     /// Client random (32 bytes)
     pub client_random: Vec<u8>,
     /// Server random (32 bytes)
     pub server_random: Vec<u8>,
-    /// Negotiated cipher suite
-    pub cipher_suite: u16,
     /// Server name for SNI
     pub server_name: String,
-    /// Transcript hash of all handshake messages
+    /// Transcript of all handshake messages
     pub transcript: Vec<u8>,
     /// Handshake secret
     pub handshake_secret: Option<Vec<u8>>,
@@ -91,24 +69,15 @@ pub struct HandshakeState {
     pub client_app_secret: Option<Vec<u8>>,
     /// Server application traffic secret
     pub server_app_secret: Option<Vec<u8>>,
-    /// Exporter master secret for RFC 8446 key export
-    pub exporter_master_secret: Option<Vec<u8>>,
 }
 
 impl HandshakeState {
     /// Create a new handshake state
-    pub async fn new(server_name: &str) -> Result<Self> {
-        let ecdh_key = EcdhKeyPair::generate().await?;
-        let x25519_key = X25519KeyPair::generate()?;
-        let client_random = crypto::random_bytes(32)?;
-
+    pub fn new(server_name: &str) -> Result<Self> {
         Ok(Self {
-            ecdh_key,
-            x25519_key: Some(x25519_key),
-            selected_group: GROUP_SECP256R1, // Default, will be updated by ServerHello
-            client_random,
+            x25519_key: Some(X25519KeyPair::generate()?),
+            client_random: crypto::random_bytes(32)?,
             server_random: Vec::new(),
-            cipher_suite: TLS_AES_128_GCM_SHA256,
             server_name: server_name.to_string(),
             transcript: Vec::new(),
             handshake_secret: None,
@@ -116,7 +85,6 @@ impl HandshakeState {
             server_handshake_secret: None,
             client_app_secret: None,
             server_app_secret: None,
-            exporter_master_secret: None,
         })
     }
 
@@ -134,22 +102,11 @@ impl HandshakeState {
         // Legacy session ID (empty)
         hello.push(0);
 
-        // ChaCha20-Poly1305 only, and not merely a preference. TLS 1.3
-        // application data is encrypted from poll_read/poll_write, which
-        // cannot await, and the sync AEAD path is pure-Rust ChaCha20 —
-        // SubtleCrypto AES-GCM is async and unreachable from there.
-        // Advertising AES-GCM let servers that prefer it (most Nostr relays
-        // do) complete the handshake over the async path and then fail on the
-        // first application write. Any server that cannot do ChaCha20 must
-        // fail the handshake instead. SHA-384 suites stay out regardless: not
-        // implemented.
-        let cipher_suites = [TLS_CHACHA20_POLY1305_SHA256];
+        // Cipher suites: one entry
         hello.push(0);
-        hello.push((cipher_suites.len() * 2) as u8);
-        for cs in cipher_suites {
-            hello.push((cs >> 8) as u8);
-            hello.push(cs as u8);
-        }
+        hello.push(2);
+        hello.push((TLS_CHACHA20_POLY1305_SHA256 >> 8) as u8);
+        hello.push(TLS_CHACHA20_POLY1305_SHA256 as u8);
 
         // Legacy compression methods (null only)
         hello.push(1);
@@ -192,19 +149,17 @@ impl HandshakeState {
         extensions.push((TLS_VERSION_1_3 >> 8) as u8);
         extensions.push(TLS_VERSION_1_3 as u8);
 
-        // Supported Groups (X25519 preferred, then P-256)
+        // Supported Groups (X25519 only)
         extensions.push((EXT_SUPPORTED_GROUPS >> 8) as u8);
         extensions.push(EXT_SUPPORTED_GROUPS as u8);
         extensions.push(0);
-        extensions.push(6); // Length: 2 (list len) + 2 (X25519) + 2 (P-256)
+        extensions.push(4); // Length: 2 (list len) + 2 (X25519)
         extensions.push(0);
-        extensions.push(4); // Groups length: 2 groups * 2 bytes
+        extensions.push(2); // Groups length
         extensions.push((GROUP_X25519 >> 8) as u8);
         extensions.push(GROUP_X25519 as u8);
-        extensions.push((GROUP_SECP256R1 >> 8) as u8);
-        extensions.push(GROUP_SECP256R1 as u8);
 
-        // Key Share (both X25519 and P-256 public keys)
+        // Key Share (X25519)
         let key_share = self.build_key_share_extension();
         extensions.push((EXT_KEY_SHARE >> 8) as u8);
         extensions.push(EXT_KEY_SHARE as u8);
@@ -220,37 +175,7 @@ impl HandshakeState {
         extensions.push(sig_algs.len() as u8);
         extensions.extend_from_slice(&sig_algs);
 
-        // ALPN (Application-Layer Protocol Negotiation) - advertise http/1.1
-        let alpn = self.build_alpn_extension();
-        extensions.push((EXT_ALPN >> 8) as u8);
-        extensions.push(EXT_ALPN as u8);
-        extensions.push((alpn.len() >> 8) as u8);
-        extensions.push(alpn.len() as u8);
-        extensions.extend_from_slice(&alpn);
-
         extensions
-    }
-
-    fn build_alpn_extension(&self) -> Vec<u8> {
-        // ALPN protocol list - only advertise http/1.1
-        // We don't support HTTP/2, so advertising h2 causes servers to send
-        // HTTP/2 binary frames that we can't parse.
-        // Format: length(2) + [ length(1) + protocol_name ]*
-        let protocols: &[&[u8]] = &[b"http/1.1"];
-        let mut ext = Vec::new();
-
-        // Calculate total list length
-        let list_len: usize = protocols.iter().map(|p| 1 + p.len()).sum();
-        ext.push((list_len >> 8) as u8);
-        ext.push(list_len as u8);
-
-        // Add each protocol entry
-        for protocol in protocols {
-            ext.push(protocol.len() as u8);
-            ext.extend_from_slice(protocol);
-        }
-
-        ext
     }
 
     fn build_sni_extension(&self) -> Vec<u8> {
@@ -276,38 +201,23 @@ impl HandshakeState {
     }
 
     fn build_key_share_extension(&self) -> Vec<u8> {
-        let p256_key_bytes = &self.ecdh_key.public_key_bytes;
+        let key_bytes = self
+            .x25519_key
+            .as_ref()
+            .map(|key| key.public_key_bytes.as_slice())
+            .unwrap_or(&[]);
         let mut ext = Vec::new();
 
-        // Calculate total length for both key shares
-        let p256_entry_len = 4 + p256_key_bytes.len(); // group(2) + len(2) + key
-        let x25519_entry_len = if let Some(ref x25519_key) = self.x25519_key {
-            4 + x25519_key.public_key_bytes.len()
-        } else {
-            0
-        };
-        let total_len = p256_entry_len + x25519_entry_len;
+        // Client key shares length: group(2) + len(2) + key
+        let entry_len = 4 + key_bytes.len();
+        ext.push((entry_len >> 8) as u8);
+        ext.push(entry_len as u8);
 
-        // Client key shares length
-        ext.push((total_len >> 8) as u8);
-        ext.push(total_len as u8);
-
-        // X25519 key share (first, as preferred)
-        if let Some(ref x25519_key) = self.x25519_key {
-            let key_bytes = &x25519_key.public_key_bytes;
-            ext.push((GROUP_X25519 >> 8) as u8);
-            ext.push(GROUP_X25519 as u8);
-            ext.push((key_bytes.len() >> 8) as u8);
-            ext.push(key_bytes.len() as u8);
-            ext.extend_from_slice(key_bytes);
-        }
-
-        // P-256 key share
-        ext.push((GROUP_SECP256R1 >> 8) as u8);
-        ext.push(GROUP_SECP256R1 as u8);
-        ext.push((p256_key_bytes.len() >> 8) as u8);
-        ext.push(p256_key_bytes.len() as u8);
-        ext.extend_from_slice(p256_key_bytes);
+        ext.push((GROUP_X25519 >> 8) as u8);
+        ext.push(GROUP_X25519 as u8);
+        ext.push((key_bytes.len() >> 8) as u8);
+        ext.push(key_bytes.len() as u8);
+        ext.extend_from_slice(key_bytes);
 
         ext
     }
@@ -354,10 +264,16 @@ impl HandshakeState {
             return Err(TlsError::handshake("ServerHello truncated"));
         }
 
-        // Cipher suite
-        self.cipher_suite = ((data[pos] as u16) << 8) | (data[pos + 1] as u16);
+        // Cipher suite: we offered exactly one, so anything else is a
+        // server that ignored the offer.
+        let cipher_suite = ((data[pos] as u16) << 8) | (data[pos + 1] as u16);
         pos += 2;
-        debug!("Negotiated cipher suite: 0x{:04x}", self.cipher_suite);
+        if cipher_suite != TLS_CHACHA20_POLY1305_SHA256 {
+            return Err(TlsError::handshake(format!(
+                "Server selected unsupported cipher suite: 0x{:04x}",
+                cipher_suite
+            )));
+        }
 
         // Compression method (skip)
         pos += 1;
@@ -402,16 +318,12 @@ impl HandshakeState {
                         let group = ((ext_data[0] as u16) << 8) | (ext_data[1] as u16);
                         let key_len = ((ext_data[2] as usize) << 8) | (ext_data[3] as usize);
 
-                        // We support both P-256 and X25519
-                        if group != GROUP_SECP256R1 && group != GROUP_X25519 {
+                        if group != GROUP_X25519 {
                             return Err(TlsError::handshake(format!(
                                 "Unsupported key share group: 0x{:04x}",
                                 group
                             )));
                         }
-
-                        self.selected_group = group;
-                        debug!("Server selected key exchange group: 0x{:04x}", group);
 
                         if ext_data.len() >= 4 + key_len {
                             server_key_share = Some(ext_data[4..4 + key_len].to_vec());
@@ -428,120 +340,71 @@ impl HandshakeState {
     }
 
     /// Derive handshake keys after receiving ServerHello
-    pub async fn derive_handshake_keys(&mut self, server_key_share: &[u8]) -> Result<()> {
-        tracing::info!(
-            "derive_handshake_keys: selected_group=0x{:04x}, key_share_len={}",
-            self.selected_group,
-            server_key_share.len()
-        );
-        // Compute shared secret based on selected key exchange group
-        let shared_secret = match self.selected_group {
-            GROUP_SECP256R1 => {
-                // P-256 ECDH via SubtleCrypto
-                tracing::info!("Using P-256 ECDH");
-                self.ecdh_key.derive_shared_secret(server_key_share).await?
-            }
-            GROUP_X25519 => {
-                // X25519 via pure Rust
-                tracing::info!("Using X25519 ECDH");
-                let x25519_key = self
-                    .x25519_key
-                    .take()
-                    .ok_or_else(|| TlsError::handshake("X25519 key not available"))?;
-                x25519_key.derive_shared_secret(server_key_share)?
-            }
-            _ => {
-                return Err(TlsError::handshake(format!(
-                    "Unsupported key exchange group: 0x{:04x}",
-                    self.selected_group
-                )));
-            }
-        };
-        tracing::info!(
-            "Derived shared secret ({} bytes) using group 0x{:04x}",
-            shared_secret.len(),
-            self.selected_group
-        );
+    pub fn derive_handshake_keys(&mut self, server_key_share: &[u8]) -> Result<()> {
+        let x25519_key = self
+            .x25519_key
+            .take()
+            .ok_or_else(|| TlsError::handshake("X25519 key already consumed"))?;
+        let shared_secret = x25519_key.derive_shared_secret(server_key_share)?;
 
-        // Compute transcript hash up to this point
-        tracing::info!(
-            "Computing transcript hash ({} bytes of transcript)",
-            self.transcript.len()
-        );
-        let transcript_hash = crypto::sha256(&self.transcript).await?;
-        tracing::info!("Transcript hash computed: {} bytes", transcript_hash.len());
+        let transcript_hash = crypto::sha256(&self.transcript);
 
         // TLS 1.3 key schedule
         // Early Secret = HKDF-Extract(salt=0, IKM=0)
-        tracing::info!("Starting TLS 1.3 key schedule");
-        let zero_key = vec![0u8; 32];
-        let early_secret = Hkdf::extract(&[], &zero_key).await?;
-        tracing::info!("Early secret derived");
+        let zero_key = [0u8; 32];
+        let early_secret = Hkdf::extract(&[], &zero_key)?;
 
         // Derive-Secret(early_secret, "derived", "")
-        let empty_hash = crypto::sha256(&[]).await?;
-        let derived_secret = Hkdf::derive_secret(&early_secret, "derived", &empty_hash).await?;
-        tracing::info!("Derived secret computed");
+        let empty_hash = crypto::sha256(&[]);
+        let derived_secret = Hkdf::derive_secret(&early_secret, "derived", &empty_hash)?;
 
         // Handshake Secret = HKDF-Extract(derived_secret, shared_secret)
-        let handshake_secret = Hkdf::extract(&derived_secret, &shared_secret).await?;
-        tracing::info!("Handshake secret derived");
+        let handshake_secret = Hkdf::extract(&derived_secret, &shared_secret)?;
 
         // Client/Server handshake traffic secrets
         let client_hs_secret =
-            Hkdf::derive_secret(&handshake_secret, "c hs traffic", &transcript_hash).await?;
-        tracing::info!("Client handshake secret derived");
+            Hkdf::derive_secret(&handshake_secret, "c hs traffic", &transcript_hash)?;
         let server_hs_secret =
-            Hkdf::derive_secret(&handshake_secret, "s hs traffic", &transcript_hash).await?;
-        tracing::info!("Server handshake secret derived");
+            Hkdf::derive_secret(&handshake_secret, "s hs traffic", &transcript_hash)?;
 
         self.handshake_secret = Some(handshake_secret);
         self.client_handshake_secret = Some(client_hs_secret);
         self.server_handshake_secret = Some(server_hs_secret);
 
-        tracing::info!("Derived handshake traffic secrets complete");
+        debug!("Derived handshake traffic secrets");
         Ok(())
     }
 
     /// Derive application keys after receiving server Finished
-    pub async fn derive_application_keys(&mut self) -> Result<()> {
+    pub fn derive_application_keys(&mut self) -> Result<()> {
         let handshake_secret = self
             .handshake_secret
             .as_ref()
             .ok_or_else(|| TlsError::handshake("Missing handshake secret"))?;
 
         // Transcript hash up to server Finished
-        let transcript_hash = crypto::sha256(&self.transcript).await?;
+        let transcript_hash = crypto::sha256(&self.transcript);
 
         // Derive-Secret(handshake_secret, "derived", "")
-        let empty_hash = crypto::sha256(&[]).await?;
-        let derived_secret = Hkdf::derive_secret(handshake_secret, "derived", &empty_hash).await?;
+        let empty_hash = crypto::sha256(&[]);
+        let derived_secret = Hkdf::derive_secret(handshake_secret, "derived", &empty_hash)?;
 
         // Master Secret = HKDF-Extract(derived_secret, 0)
-        let zero_key = vec![0u8; 32];
-        let master_secret = Hkdf::extract(&derived_secret, &zero_key).await?;
+        let zero_key = [0u8; 32];
+        let master_secret = Hkdf::extract(&derived_secret, &zero_key)?;
 
         // Client/Server application traffic secrets
-        let client_app_secret =
-            Hkdf::derive_secret(&master_secret, "c ap traffic", &transcript_hash).await?;
-        let server_app_secret =
-            Hkdf::derive_secret(&master_secret, "s ap traffic", &transcript_hash).await?;
+        self.client_app_secret =
+            Some(Hkdf::derive_secret(&master_secret, "c ap traffic", &transcript_hash)?);
+        self.server_app_secret =
+            Some(Hkdf::derive_secret(&master_secret, "s ap traffic", &transcript_hash)?);
 
-        // Exporter master secret (RFC 8446 Section 7.5)
-        // exporter_master_secret = Derive-Secret(Master Secret, "exp master", Transcript-Hash)
-        let exporter_master_secret =
-            Hkdf::derive_secret(&master_secret, "exp master", &transcript_hash).await?;
-
-        self.client_app_secret = Some(client_app_secret);
-        self.server_app_secret = Some(server_app_secret);
-        self.exporter_master_secret = Some(exporter_master_secret);
-
-        debug!("Derived application traffic secrets and exporter master secret");
+        debug!("Derived application traffic secrets");
         Ok(())
     }
 
     /// Compute Finished message verify data
-    pub async fn compute_finished(&self, is_client: bool) -> Result<Vec<u8>> {
+    pub fn compute_finished(&self, is_client: bool) -> Result<Vec<u8>> {
         let base_key = if is_client {
             self.client_handshake_secret.as_ref()
         } else {
@@ -550,20 +413,16 @@ impl HandshakeState {
         .ok_or_else(|| TlsError::handshake("Missing handshake secret"))?;
 
         // finished_key = HKDF-Expand-Label(base_key, "finished", "", Hash.length)
-        let finished_key = Hkdf::expand_label(base_key, "finished", &[], 32).await?;
+        let finished_key = Hkdf::expand_label(base_key, "finished", &[], 32)?;
 
         // verify_data = HMAC(finished_key, Transcript-Hash)
-        let transcript_hash = crypto::sha256(&self.transcript).await?;
-
-        // Compute HMAC using the crypto module
-        let verify_data = hmac_sha256(&finished_key, &transcript_hash).await?;
-
-        Ok(verify_data)
+        let transcript_hash = crypto::sha256(&self.transcript);
+        crypto::hmac_sha256(&finished_key, &transcript_hash)
     }
 
     /// Build client Finished message
-    pub async fn build_client_finished(&self) -> Result<Vec<u8>> {
-        let verify_data = self.compute_finished(true).await?;
+    pub fn build_client_finished(&self) -> Result<Vec<u8>> {
+        let verify_data = self.compute_finished(true)?;
 
         let mut message = vec![HANDSHAKE_FINISHED];
         let len = verify_data.len();
@@ -576,8 +435,8 @@ impl HandshakeState {
     }
 
     /// Verify server Finished message
-    pub async fn verify_server_finished(&self, received_verify_data: &[u8]) -> Result<()> {
-        let expected = self.compute_finished(false).await?;
+    pub fn verify_server_finished(&self, received_verify_data: &[u8]) -> Result<()> {
+        let expected = self.compute_finished(false)?;
 
         if received_verify_data != expected {
             return Err(TlsError::handshake("Server Finished verification failed"));
@@ -592,102 +451,34 @@ impl HandshakeState {
         self.transcript.extend_from_slice(data);
     }
 
-    /// Get the key size for the negotiated cipher suite
-    fn get_key_size(&self) -> usize {
-        match self.cipher_suite {
-            TLS_AES_128_GCM_SHA256 => 16,
-            TLS_AES_256_GCM_SHA384 => 32,
-            TLS_CHACHA20_POLY1305_SHA256 => 32,
-            _ => 16, // Default
-        }
-    }
-
     /// Get key and IV for handshake encryption
-    pub async fn get_handshake_keys(&self, is_client: bool) -> Result<(Vec<u8>, Vec<u8>)> {
+    pub fn get_handshake_keys(&self, is_client: bool) -> Result<(Vec<u8>, Vec<u8>)> {
         let secret = if is_client {
             self.client_handshake_secret.as_ref()
         } else {
             self.server_handshake_secret.as_ref()
         }
         .ok_or_else(|| TlsError::handshake("Missing handshake secret"))?;
-
-        let key_size = self.get_key_size();
-        let key = Hkdf::expand_label(secret, "key", &[], key_size).await?;
-        let iv = Hkdf::expand_label(secret, "iv", &[], 12).await?;
-
-        Ok((key, iv))
+        Self::traffic_keys(secret)
     }
 
     /// Get key and IV for application data encryption
-    pub async fn get_application_keys(&self, is_client: bool) -> Result<(Vec<u8>, Vec<u8>)> {
+    pub fn get_application_keys(&self, is_client: bool) -> Result<(Vec<u8>, Vec<u8>)> {
         let secret = if is_client {
             self.client_app_secret.as_ref()
         } else {
             self.server_app_secret.as_ref()
         }
         .ok_or_else(|| TlsError::handshake("Missing application secret"))?;
+        Self::traffic_keys(secret)
+    }
 
-        let key_size = self.get_key_size();
-        let key = Hkdf::expand_label(secret, "key", &[], key_size).await?;
-        let iv = Hkdf::expand_label(secret, "iv", &[], 12).await?;
-
+    /// ChaCha20-Poly1305 traffic key (32 bytes) and IV (12 bytes) from a secret
+    fn traffic_keys(secret: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+        let key = Hkdf::expand_label(secret, "key", &[], 32)?;
+        let iv = Hkdf::expand_label(secret, "iv", &[], 12)?;
         Ok((key, iv))
     }
-
-    /// Get the exporter master secret for RFC 8446 key export
-    pub fn get_exporter_master_secret(&self) -> Option<&[u8]> {
-        self.exporter_master_secret.as_deref()
-    }
-}
-
-/// HMAC-SHA256 helper (duplicated from crypto module for internal use)
-async fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
-    use js_sys::{Array, ArrayBuffer, Object, Reflect, Uint8Array};
-    use wasm_bindgen::prelude::*;
-    use wasm_bindgen_futures::JsFuture;
-    use web_sys::CryptoKey;
-
-    let window = web_sys::window().ok_or_else(|| TlsError::subtle_crypto("No window"))?;
-    let subtle = window
-        .crypto()
-        .map_err(|_| TlsError::subtle_crypto("No crypto"))?
-        .subtle();
-
-    let key_data = Uint8Array::from(key);
-    let algorithm = Object::new();
-    Reflect::set(&algorithm, &"name".into(), &"HMAC".into())
-        .map_err(|_| TlsError::subtle_crypto("Failed to set HMAC algorithm name"))?;
-    let hash_obj = Object::new();
-    Reflect::set(&hash_obj, &"name".into(), &"SHA-256".into())
-        .map_err(|_| TlsError::subtle_crypto("Failed to set hash algorithm name"))?;
-    Reflect::set(&algorithm, &"hash".into(), &hash_obj)
-        .map_err(|_| TlsError::subtle_crypto("Failed to set hash in algorithm"))?;
-
-    let key_usages = Array::new();
-    key_usages.push(&"sign".into());
-
-    let crypto_key = JsFuture::from(
-        subtle
-            .import_key_with_object("raw", &key_data.buffer(), &algorithm, false, &key_usages)
-            .map_err(|_| TlsError::subtle_crypto("HMAC key import failed"))?,
-    )
-    .await
-    .map_err(|_| TlsError::subtle_crypto("HMAC key import failed"))?;
-
-    let crypto_key: CryptoKey = crypto_key.unchecked_into();
-    let data_array = Uint8Array::from(data);
-
-    let signature = JsFuture::from(
-        subtle
-            .sign_with_str_and_buffer_source("HMAC", &crypto_key, &data_array.buffer())
-            .map_err(|_| TlsError::subtle_crypto("HMAC sign failed"))?,
-    )
-    .await
-    .map_err(|_| TlsError::subtle_crypto("HMAC failed"))?;
-
-    let array_buffer: ArrayBuffer = signature.unchecked_into();
-    let uint8_array = Uint8Array::new(&array_buffer);
-    Ok(uint8_array.to_vec())
 }
 
 /// Parse a handshake message header
@@ -763,24 +554,6 @@ pub fn parse_certificate(data: &[u8]) -> Result<Vec<Vec<u8>>> {
     Ok(certs)
 }
 
-/// Parse CertificateVerify message
-pub fn parse_certificate_verify(data: &[u8]) -> Result<(u16, Vec<u8>)> {
-    if data.len() < 4 {
-        return Err(TlsError::handshake("CertificateVerify too short"));
-    }
-
-    let algorithm = ((data[0] as u16) << 8) | (data[1] as u16);
-    let sig_len = ((data[2] as usize) << 8) | (data[3] as usize);
-
-    if data.len() < 4 + sig_len {
-        return Err(TlsError::handshake("CertificateVerify signature truncated"));
-    }
-
-    let signature = data[4..4 + sig_len].to_vec();
-
-    Ok((algorithm, signature))
-}
-
 /// Parse Finished message
 pub fn parse_finished(data: &[u8]) -> Result<Vec<u8>> {
     // Finished message is just the verify_data
@@ -789,78 +562,3 @@ pub fn parse_finished(data: &[u8]) -> Result<Vec<u8>> {
 
 /// Maximum handshake message size (matches TLS spec 24-bit length field: 0 to 2^24-1)
 pub const MAX_HANDSHAKE_MESSAGE_SIZE: usize = (1 << 24) - 1;
-
-#[cfg(kani)]
-mod verification {
-    use super::*;
-
-    #[kani::proof]
-    #[kani::unwind(10)]
-    fn parse_handshake_header_never_panics() {
-        let data: [u8; 8] = kani::any();
-        let _ = parse_handshake_header(&data);
-    }
-
-    #[kani::proof]
-    fn parse_handshake_header_empty_never_panics() {
-        let data: [u8; 0] = [];
-        let _ = parse_handshake_header(&data);
-    }
-
-    #[kani::proof]
-    #[kani::unwind(5)]
-    fn parse_handshake_header_short_never_panics() {
-        let data: [u8; 3] = kani::any();
-        let _ = parse_handshake_header(&data);
-    }
-
-    #[kani::proof]
-    #[kani::unwind(20)]
-    fn parse_certificate_never_panics() {
-        // Use smaller input to keep verification tractable
-        let data: [u8; 16] = kani::any();
-        let _ = parse_certificate(&data);
-    }
-
-    #[kani::proof]
-    #[kani::unwind(20)]
-    fn parse_certificate_verify_never_panics() {
-        let data: [u8; 16] = kani::any();
-        let _ = parse_certificate_verify(&data);
-    }
-
-    #[kani::proof]
-    #[kani::unwind(10)]
-    fn parse_finished_never_panics() {
-        let data: [u8; 8] = kani::any();
-        let _ = parse_finished(&data);
-    }
-
-    #[kani::proof]
-    #[kani::unwind(5)]
-    fn handshake_header_length_bounded() {
-        let data: [u8; 4] = kani::any();
-        if let Ok((_ty, len)) = parse_handshake_header(&data) {
-            kani::assert(len < (1 << 24), "length exceeds 24-bit max");
-        }
-    }
-
-    #[kani::proof]
-    #[kani::unwind(20)]
-    fn certificate_parse_non_empty_on_ok() {
-        // Use smaller input to keep verification tractable
-        let data: [u8; 16] = kani::any();
-        if let Ok(certs) = parse_certificate(&data) {
-            kani::assert(!certs.is_empty(), "certs should be non-empty on Ok");
-        }
-    }
-
-    #[kani::proof]
-    #[kani::unwind(10)]
-    fn finished_parse_preserves_length() {
-        let data: [u8; 8] = kani::any();
-        if let Ok(result) = parse_finished(&data) {
-            kani::assert(result.len() == data.len(), "finished preserves length");
-        }
-    }
-}

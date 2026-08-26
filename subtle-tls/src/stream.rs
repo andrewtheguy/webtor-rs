@@ -2,8 +2,6 @@
 //!
 //! Wraps an underlying stream with TLS encryption after handshake.
 
-use crate::cert::CertificateVerifier;
-use crate::crypto;
 use crate::error::{Result, TlsError};
 use crate::handshake::{
     self, HandshakeState, CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA,
@@ -12,7 +10,6 @@ use crate::handshake::{
     HANDSHAKE_SERVER_HELLO,
 };
 use crate::record::RecordLayer;
-use crate::TlsConfig;
 use futures::io::{AsyncRead, AsyncWrite};
 use std::io;
 use std::pin::Pin;
@@ -31,29 +28,25 @@ pub struct TlsStream<S> {
     read_pos: usize,
     /// DER-encoded peer certificate (for CertifiedConn)
     peer_certificate: Option<Vec<u8>>,
-    /// TLS keying material (for export_keying_material)
-    keying_material: Option<KeyingMaterial>,
     /// Buffer for accumulating encrypted record data being read
     record_read_buffer: Vec<u8>,
     /// Buffer for pending write data (encrypted, ready to send to transport)
     record_write_buffer: Vec<u8>,
 }
 
-/// Stored keying material for RFC 8446 key export
-struct KeyingMaterial {
-    /// Exporter master secret derived during handshake
-    exporter_master_secret: Vec<u8>,
-}
-
 impl<S> TlsStream<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    /// Perform TLS handshake and return encrypted stream
-    pub async fn connect(mut stream: S, server_name: &str, config: TlsConfig) -> Result<Self> {
+    /// Perform the TLS 1.3 handshake and return the encrypted stream.
+    ///
+    /// `server_name` only fills the SNI extension. The server's certificate
+    /// is accepted as presented and exposed through `peer_certificate`; the
+    /// caller (Tor's channel handshake) is what authenticates the peer.
+    pub async fn connect(mut stream: S, server_name: &str) -> Result<Self> {
         info!("Starting TLS 1.3 handshake with {}", server_name);
 
-        let mut handshake = HandshakeState::new(server_name).await?;
+        let mut handshake = HandshakeState::new(server_name)?;
         let mut record_layer = RecordLayer::new();
 
         // Step 1: Send ClientHello
@@ -79,23 +72,13 @@ where
         handshake.update_transcript(&server_hello_msg);
 
         let server_key_share = handshake.parse_server_hello(&server_hello_data)?;
-        info!(
-            "Parsed ServerHello, cipher suite: 0x{:04x}",
-            handshake.cipher_suite
-        );
-
-        // Set cipher suite on record layer
-        record_layer.set_cipher_suite(handshake.cipher_suite);
 
         // Step 3: Derive handshake keys
-        info!("Deriving handshake keys...");
-        handshake.derive_handshake_keys(&server_key_share).await?;
-        info!("Handshake keys derived");
+        handshake.derive_handshake_keys(&server_key_share)?;
 
         // Activate server->client encryption
-        let (read_key, read_iv) = handshake.get_handshake_keys(false).await?;
-        record_layer.set_read_cipher(&read_key, &read_iv).await?;
-        info!("Read cipher activated");
+        let (read_key, read_iv) = handshake.get_handshake_keys(false)?;
+        record_layer.set_read_cipher(&read_key, &read_iv)?;
 
         // Step 4: Receive encrypted handshake messages
         // (EncryptedExtensions, Certificate, CertificateVerify, Finished)
@@ -104,7 +87,6 @@ where
             &mut stream,
             &mut record_layer,
             &mut handshake,
-            &config,
         )
         .await
         {
@@ -120,13 +102,13 @@ where
         info!("Encrypted handshake complete");
 
         // Step 5: Derive application keys
-        handshake.derive_application_keys().await?;
+        handshake.derive_application_keys()?;
 
         // Step 6: Activate client->server encryption and send Finished
-        let (write_key, write_iv) = handshake.get_handshake_keys(true).await?;
-        record_layer.set_write_cipher(&write_key, &write_iv).await?;
+        let (write_key, write_iv) = handshake.get_handshake_keys(true)?;
+        record_layer.set_write_cipher(&write_key, &write_iv)?;
 
-        let client_finished = handshake.build_client_finished().await?;
+        let client_finished = handshake.build_client_finished()?;
         handshake.update_transcript(&client_finished);
         record_layer
             .write_record(&mut stream, CONTENT_TYPE_HANDSHAKE, &client_finished)
@@ -134,23 +116,12 @@ where
         debug!("Sent client Finished");
 
         // Step 7: Switch to application keys
-        let (app_read_key, app_read_iv) = handshake.get_application_keys(false).await?;
-        let (app_write_key, app_write_iv) = handshake.get_application_keys(true).await?;
-        record_layer
-            .set_read_cipher(&app_read_key, &app_read_iv)
-            .await?;
-        record_layer
-            .set_write_cipher(&app_write_key, &app_write_iv)
-            .await?;
+        let (app_read_key, app_read_iv) = handshake.get_application_keys(false)?;
+        let (app_write_key, app_write_iv) = handshake.get_application_keys(true)?;
+        record_layer.set_read_cipher(&app_read_key, &app_read_iv)?;
+        record_layer.set_write_cipher(&app_write_key, &app_write_iv)?;
 
         info!("TLS 1.3 handshake completed with {}", server_name);
-
-        // Store exporter master secret for RFC 8446 key export
-        let keying_material = handshake
-            .get_exporter_master_secret()
-            .map(|secret| KeyingMaterial {
-                exporter_master_secret: secret.to_vec(),
-            });
 
         Ok(Self {
             inner: stream,
@@ -158,7 +129,6 @@ where
             read_buffer: Vec::new(),
             read_pos: 0,
             peer_certificate,
-            keying_material,
             record_read_buffer: Vec::new(),
             record_write_buffer: Vec::new(),
         })
@@ -218,24 +188,16 @@ where
         }
     }
 
-    /// Process encrypted handshake messages and return the peer certificate (if any)
+    /// Process encrypted handshake messages and return the peer's leaf
+    /// certificate (if it sent one)
     async fn process_encrypted_handshake(
         stream: &mut S,
         record_layer: &mut RecordLayer,
         handshake: &mut HandshakeState,
-        config: &TlsConfig,
     ) -> Result<Option<Vec<u8>>> {
         let mut got_encrypted_extensions = false;
-        let mut got_certificate = false;
-        let mut got_certificate_verify = false;
         let mut got_finished = false;
-
-        // Store certificate chain and verify data for validation
         let mut cert_chain: Vec<Vec<u8>> = Vec::new();
-        let mut cert_verify_algorithm: u16 = 0;
-        let mut cert_verify_signature: Vec<u8> = Vec::new();
-        // Transcript hash at the point of CertificateVerify (before the message itself)
-        let mut transcript_before_cert_verify: Vec<u8> = Vec::new();
 
         // Buffer for accumulating fragmented handshake messages
         let mut handshake_buffer: Vec<u8> = Vec::new();
@@ -313,25 +275,18 @@ where
                                 debug!("Received Certificate ({} bytes)", msg_body.len());
                                 handshake.update_transcript(&msg_data);
                                 cert_chain = handshake::parse_certificate(msg_body)?;
-                                got_certificate = true;
                             }
                             HANDSHAKE_CERTIFICATE_VERIFY => {
+                                // Not checked: Tor authenticates the relay
+                                // through CERTS cells, not this signature.
                                 debug!("Received CertificateVerify");
-                                // Save transcript hash before adding CertificateVerify
-                                transcript_before_cert_verify =
-                                    crypto::sha256(&handshake.transcript).await?;
                                 handshake.update_transcript(&msg_data);
-                                let (algorithm, signature) =
-                                    handshake::parse_certificate_verify(msg_body)?;
-                                cert_verify_algorithm = algorithm;
-                                cert_verify_signature = signature;
-                                got_certificate_verify = true;
                             }
                             HANDSHAKE_FINISHED => {
                                 info!("Received server Finished ({} bytes)", msg_body.len());
                                 let verify_data = handshake::parse_finished(msg_body)?;
                                 info!("Verifying server Finished...");
-                                handshake.verify_server_finished(&verify_data).await?;
+                                handshake.verify_server_finished(&verify_data)?;
                                 info!("Server Finished verified OK");
                                 handshake.update_transcript(&msg_data);
                                 got_finished = true;
@@ -355,35 +310,6 @@ where
 
         if !got_encrypted_extensions {
             return Err(TlsError::handshake("Missing EncryptedExtensions"));
-        }
-
-        // Validate certificates if not skipping verification
-        if !config.skip_verification {
-            if !got_certificate {
-                return Err(TlsError::handshake("Missing Certificate message"));
-            }
-            if !got_certificate_verify {
-                return Err(TlsError::handshake("Missing CertificateVerify message"));
-            }
-
-            // Verify certificate chain
-            let verifier = CertificateVerifier::new(&handshake.server_name, false);
-            verifier.verify_chain(&cert_chain).await?;
-
-            // Verify CertificateVerify signature
-            // We need the server's public key from the leaf certificate
-            if let Some(leaf_der) = cert_chain.first() {
-                // Extract SubjectPublicKeyInfo from the certificate
-                let server_public_key = extract_public_key_spki(leaf_der)?;
-
-                crate::cert::verify_certificate_verify(
-                    cert_verify_algorithm,
-                    &cert_verify_signature,
-                    &transcript_before_cert_verify,
-                    &server_public_key,
-                )
-                .await?;
-            }
         }
 
         debug!("Encrypted handshake phase completed");
@@ -796,17 +722,6 @@ where
     }
 }
 
-/// Extract SubjectPublicKeyInfo (SPKI) from a DER-encoded X.509 certificate
-fn extract_public_key_spki(cert_der: &[u8]) -> Result<Vec<u8>> {
-    use x509_parser::prelude::*;
-
-    let (_, cert) = X509Certificate::from_der(cert_der)
-        .map_err(|e| TlsError::certificate(format!("Failed to parse certificate: {}", e)))?;
-
-    // The raw field contains the DER-encoded SubjectPublicKeyInfo
-    Ok(cert.public_key().raw.to_vec())
-}
-
 // Implement tor_rtcompat traits for TlsStream
 
 impl<S> tor_rtcompat::StreamOps for TlsStream<S>
@@ -826,93 +741,12 @@ where
 
     fn export_keying_material(
         &self,
-        len: usize,
-        label: &[u8],
-        context: Option<&[u8]>,
+        _len: usize,
+        _label: &[u8],
+        _context: Option<&[u8]>,
     ) -> io::Result<Vec<u8>> {
-        // RFC 8446 Section 7.5: Exporters
-        // TLS-Exporter(label, context_value, key_length) =
-        //     HKDF-Expand-Label(Derive-Secret(Secret, label, ""),
-        //                       "exporter", Hash(context_value), key_length)
-
-        let keying_material = self.keying_material.as_ref().ok_or_else(|| {
-            io::Error::other("Keying material not available (handshake incomplete?)")
-        })?;
-
-        let context_data = context.unwrap_or(&[]);
-
-        // Hash the context value
-        use sha2::Digest;
-        let context_hash: [u8; 32] = sha2::Sha256::digest(context_data).into();
-
-        // Derive-Secret(exporter_master_secret, label, "") = HKDF-Expand-Label(secret, label, empty_hash, 32)
-        let empty_hash: [u8; 32] = sha2::Sha256::digest([]).into();
-        let derived_secret = hkdf_expand_label_sync(
-            &keying_material.exporter_master_secret,
-            label,
-            &empty_hash,
-            32,
-        )
-        .map_err(io::Error::other)?;
-
-        // HKDF-Expand-Label(derived_secret, "exporter", context_hash, len)
-        let result = hkdf_expand_label_sync(&derived_secret, b"exporter", &context_hash, len)
-            .map_err(io::Error::other)?;
-
-        debug!("export_keying_material: exported {} bytes", len);
-        Ok(result)
+        // Only a client that authenticates itself to the relay needs the TLS
+        // exporter, and this one never does.
+        Err(io::Error::other("TLS keying material export is not supported"))
     }
-}
-
-/// Synchronous HKDF-Expand-Label for TLS 1.3 (RFC 8446)
-/// Uses pure Rust hmac/sha2 crates instead of async SubtleCrypto
-fn hkdf_expand_label_sync(
-    secret: &[u8],
-    label: &[u8],
-    context: &[u8],
-    length: usize,
-) -> std::result::Result<Vec<u8>, &'static str> {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-
-    // Build HkdfLabel structure
-    // HkdfLabel = struct {
-    //     uint16 length = Length;
-    //     opaque label<7..255> = "tls13 " + Label;
-    //     opaque context<0..255> = Context;
-    // }
-    let mut full_label = b"tls13 ".to_vec();
-    full_label.extend_from_slice(label);
-
-    let mut hkdf_label = Vec::new();
-    hkdf_label.push((length >> 8) as u8);
-    hkdf_label.push(length as u8);
-    hkdf_label.push(full_label.len() as u8);
-    hkdf_label.extend_from_slice(&full_label);
-    hkdf_label.push(context.len() as u8);
-    hkdf_label.extend_from_slice(context);
-
-    // HKDF-Expand
-    let hash_len = 32; // SHA-256
-    let n = length.div_ceil(hash_len);
-
-    if n > 255 {
-        return Err("HKDF output too long");
-    }
-
-    let mut okm = Vec::with_capacity(length);
-    let mut t = Vec::new();
-
-    for i in 1..=n {
-        let mut mac =
-            Hmac::<Sha256>::new_from_slice(secret).map_err(|_| "Invalid HMAC key length")?;
-        mac.update(&t);
-        mac.update(&hkdf_label);
-        mac.update(&[i as u8]);
-        t = mac.finalize().into_bytes().to_vec();
-        okm.extend_from_slice(&t);
-    }
-
-    okm.truncate(length);
-    Ok(okm)
 }

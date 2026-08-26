@@ -274,10 +274,6 @@ impl RelayManager {
 pub mod flags {
     #[cfg(test)]
     pub const AUTHORITY: &str = "Authority";
-    #[cfg(test)]
-    pub const BAD_EXIT: &str = "BadExit";
-    #[cfg(test)]
-    pub const EXIT: &str = "Exit";
     pub const FAST: &str = "Fast";
     #[cfg(test)]
     pub const GUARD: &str = "Guard";
@@ -326,11 +322,8 @@ mod tests {
     fn test_relay_selection() {
         let relays = vec![
             create_test_relay("relay1", vec![flags::FAST, flags::STABLE, flags::V2DIR]),
-            create_test_relay("relay2", vec![flags::FAST, flags::STABLE, flags::EXIT]),
-            create_test_relay(
-                "relay3",
-                vec![flags::FAST, flags::STABLE, flags::EXIT, flags::BAD_EXIT],
-            ),
+            create_test_relay("relay2", vec![flags::FAST, flags::STABLE]),
+            create_test_relay("relay3", vec![flags::FAST, flags::STABLE, flags::GUARD]),
         ];
 
         let manager = RelayManager::new(relays);
@@ -349,8 +342,6 @@ mod tests {
 
         const ALL_FLAGS: &[&str] = &[
             flags::AUTHORITY,
-            flags::BAD_EXIT,
-            flags::EXIT,
             flags::FAST,
             flags::GUARD,
             flags::HSDIR,

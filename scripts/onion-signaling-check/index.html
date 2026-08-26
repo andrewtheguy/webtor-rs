@@ -42,7 +42,8 @@
   window.runCheck = async (relayUrls, websocketBridge, directorySeed) => {
     await init();
     const started = performance.now();
-    const client = await AnonymousSignalingClient.create(directorySeed ?? undefined, [], websocketBridge);
+    const stunUrls = websocketBridge ? [] : ['stun:stun.l.google.com:19302'];
+    const client = await AnonymousSignalingClient.create(directorySeed ?? undefined, stunUrls, websocketBridge);
     const bootstrapSeconds = Number(((performance.now() - started) / 1000).toFixed(1));
     log(`client ready in ${bootstrapSeconds}s`);
     const results = [];
