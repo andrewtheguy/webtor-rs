@@ -82,10 +82,12 @@ would otherwise leave a limit un-enforced for minutes before anything noticed.
   `maxMessageBytes` (default 1048576), `timeoutMs` (default 240000). The
   socket has `send(text)`, `sendBinary(bytes)`, `receive()` and `close()`;
   `receive()` answers pings itself and resolves to `null` once the peer closes.
-- `directoryCache()` — the consensus and microdescriptors from the last
-  successful bootstrap, to persist and hand back as `directorySeed`. The format
-  is versioned; a seed from an older client is rejected and a fresh directory
-  downloaded.
+- `directoryCache()` — the consensus, the authority certificates that check its
+  signatures, and the microdescriptors from the last successful bootstrap, to
+  persist and hand back as `directorySeed`. A seed is verified against the
+  pinned directory authorities before any of it is installed, so it needs no
+  trust of its own. The format is versioned; a seed from an older client is
+  rejected and a fresh directory downloaded.
 - `close()` — aborts calls still building circuits and tears the client down.
 
 Two free functions need no client and touch no network: `isOnionHost(host)` and

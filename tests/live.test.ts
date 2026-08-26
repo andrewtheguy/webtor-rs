@@ -81,10 +81,16 @@ describe('webtor-wasm over Tor', () => {
 
   it('exports a re-seedable directory cache', async () => {
     const cache = await harness.call('directoryCache');
-    assert.equal(cache.version, 2, 'cache format version');
+    assert.equal(cache.version, 3, 'cache format version');
     assert.ok(
       cache.consensusBytes > 100_000,
       `consensus looks too small: ${cache.consensusBytes} bytes`,
+    );
+    // Five authority certificates are the minimum that can check a consensus,
+    // and each is a couple of kilobytes.
+    assert.ok(
+      cache.certificateBytes > 5_000,
+      `authority certificates look too small: ${cache.certificateBytes} bytes`,
     );
     assert.ok(
       cache.microdescriptorBytes > 100_000,

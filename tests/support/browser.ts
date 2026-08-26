@@ -75,6 +75,7 @@ export interface HarnessCalls {
       bytes: number;
       version: number;
       consensusBytes: number;
+      certificateBytes: number;
       microdescriptorBytes: number;
     };
   };

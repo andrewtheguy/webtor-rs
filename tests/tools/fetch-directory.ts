@@ -9,10 +9,13 @@
  * hash ring comes from its microdescriptor, and that is thousands of documents
  * through one circuit.
  *
- * This fetches the same two documents straight from a directory authority and
- * writes them in the shape `directorySeed` accepts. A microdesc consensus is
- * valid for three hours and the client rejects an expired one, so a snapshot
- * has to be rebuilt to stay useful.
+ * This fetches those documents straight from a directory authority, along with
+ * the authority certificates that check the consensus signatures, and writes
+ * them in the shape `directorySeed` accepts. Nothing vouches for a seed once it
+ * leaves here, so the certificates travel with it and the client verifies the
+ * whole thing before installing a single relay. A microdesc consensus is valid
+ * for three hours and the client rejects an expired one, so a snapshot has to
+ * be rebuilt to stay useful.
  *
  *   bun tests/tools/fetch-directory.ts [output-path]
  */
@@ -32,6 +35,25 @@ const AUTHORITIES = [
 ];
 
 const CONSENSUS_PATH = '/tor/status-vote/current/consensus-microdesc.z';
+
+/**
+ * v3 identity fingerprints of the directory authorities, matching the pinned
+ * set in `webtor/src/authority.rs`. A signature from anyone else is ignored,
+ * and the consensus needs a strict majority of these to be installable.
+ */
+const AUTHORITY_V3IDENTS = new Set([
+  '27102BC123E7AF1D4741AE047E160C91ADC76B21', // bastet
+  '0232AF901C31A04EE9848595AF9BB7620D4C5B2E', // dannenberg
+  'E8A9C45EDE6D711294FADF8E7951F4DE6CA56B58', // dizum
+  '70849B868D606BAECFB6128C5E3D782029AA394F', // faravahar
+  'ED03BB616EB2F60BEC80151114BB25CEF515B226', // gabelmoo
+  '23D15D965BC35114467363C165C4F724B64B4F66', // longclaw
+  '49015F787433103580E3B66A1707A00E60F2D15B', // maatuska
+  'F533C81CEF0BC0267857C99B2F471ADF249FA232', // moria1
+  '2F3DF9CA0E5D36F2685A2DA67184EB8DCB8CBA8C', // tor26
+]);
+/** A consensus is only installable with a strict majority of signatures. */
+const CONSENSUS_THRESHOLD = Math.floor(AUTHORITY_V3IDENTS.size / 2) + 1;
 const REQUEST_TIMEOUT_MS = 60_000;
 /**
  * Digests per microdescriptor request. Each is one 43-character path segment,
@@ -42,7 +64,7 @@ const PARALLEL_REQUESTS = 4;
 /** Floors for a sane consensus, matching what the client refuses to install. */
 const MIN_RELAYS_PER_ROLE = 10;
 const MIN_HSDIR_RELAYS = 100;
-const CACHE_VERSION = 2;
+const CACHE_VERSION = 3;
 
 /** One connection per authority carries hundreds of requests. */
 const keepAliveAgent = new http.Agent({
@@ -147,6 +169,53 @@ function parseRouterEntries(consensus: string): RouterEntry[] {
   return entries;
 }
 
+/**
+ * The certificate ids the consensus signatures name, restricted to the pinned
+ * authorities. A footer line is `directory-signature [algorithm] <id> <sk>`;
+ * the algorithm was added later, so the fingerprints are the last two words.
+ */
+function signingCertIds(consensus: string): { id: string; sk: string }[] {
+  const ids = new Map<string, { id: string; sk: string }>();
+  for (const line of consensus.split('\n')) {
+    if (!line.startsWith('directory-signature ')) continue;
+    const words = line.trim().split(/\s+/);
+    const [id, sk] = words.slice(-2);
+    if (!id || !sk || !AUTHORITY_V3IDENTS.has(id.toUpperCase())) continue;
+    ids.set(`${id}-${sk}`, { id, sk });
+  }
+  return [...ids.values()];
+}
+
+/**
+ * The authority certificates that check `consensus`. The client re-verifies
+ * every one of these, so the check here only catches a snapshot that could
+ * never be installed.
+ */
+async function fetchAuthorityCertificates(consensus: string): Promise<string> {
+  const ids = signingCertIds(consensus);
+  console.log(`Consensus is signed by ${ids.length} known authorities`);
+  if (ids.length < CONSENSUS_THRESHOLD) {
+    throw new Error(
+      `Consensus needs ${CONSENSUS_THRESHOLD} authority signatures, found ${ids.length}`,
+    );
+  }
+  const segments = ids
+    .map(({ id, sk }) => `${id.toLowerCase()}-${sk.toLowerCase()}`)
+    .sort();
+  const certificates = (
+    await fetchFromAuthority(`/tor/keys/fp-sk/${segments.join('+')}.z`)
+  ).toString('utf8');
+  const found =
+    certificates.match(/^dir-key-certificate-version /gm)?.length ?? 0;
+  console.log(`Received ${found} of ${ids.length} authority certificates`);
+  if (found < CONSENSUS_THRESHOLD) {
+    throw new Error(
+      `Received ${found} authority certificates, need ${CONSENSUS_THRESHOLD}`,
+    );
+  }
+  return certificates;
+}
+
 function consensusLifetime(consensus: string): {
   after: string;
   until: string;
@@ -221,6 +290,8 @@ async function main(): Promise<void> {
     `Consensus ${(consensus.length / 1024 / 1024).toFixed(2)} MiB, valid ${lifetime.after} .. ${lifetime.until} UTC`,
   );
 
+  const certificates = await fetchAuthorityCertificates(consensus);
+
   const digests = collectDigests(parseRouterEntries(consensus));
   const microdescriptors = await fetchMicrodescriptors(digests);
   const found = microdescriptors.match(/^onion-key$/gm)?.length ?? 0;
@@ -234,6 +305,7 @@ async function main(): Promise<void> {
   const snapshot = JSON.stringify({
     version: CACHE_VERSION,
     consensus,
+    certificates,
     microdescriptors,
   });
   writeFileSync(outputPath, snapshot);
