@@ -1,0 +1,68 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Onion signaling check</title>
+<pre id="log"></pre>
+<script type="module">
+  // Drives the anonymous-signaling WASM client exactly as pTransfer does:
+  // bootstrap a Tor client (which proves itself against the Tor Project onion
+  // site), then open a Nostr WebSocket to each ws://<address>.onion relay
+  // given and ask it for a couple of kind-1 events.
+  import init, { AnonymousSignalingClient } from '/anonymous-signaling-wasm/pkg/anonymous_signaling_wasm.js';
+
+  const logElement = document.getElementById('log');
+  function log(line) {
+    logElement.textContent += `${line}\n`;
+    console.log(line);
+  }
+
+  async function probeRelay(client, relayUrl) {
+    const started = performance.now();
+    const socket = await client.connect(relayUrl);
+    const elapsed = () => ((performance.now() - started) / 1000).toFixed(1);
+    log(`${relayUrl}: connected in ${elapsed()}s`);
+    await socket.send(JSON.stringify(['REQ', 'probe', { kinds: [1], limit: 2 }]));
+    let events = 0;
+    for (;;) {
+      const text = await socket.receive();
+      if (text == null) throw new Error(`${relayUrl} closed after ${events} events`);
+      const message = JSON.parse(text);
+      if (message[0] === 'EVENT') {
+        events += 1;
+        log(`${relayUrl}: EVENT ${message[2].id.slice(0, 16)}… kind=${message[2].kind}`);
+      } else if (message[0] === 'EOSE') {
+        log(`${relayUrl}: EOSE after ${events} events in ${elapsed()}s`);
+        await socket.close();
+        return { relayUrl, ok: true, events, seconds: Number(elapsed()) };
+      } else if (message[0] === 'CLOSED' || message[0] === 'NOTICE') {
+        throw new Error(`${relayUrl} answered ${message[0]}: ${JSON.stringify(message.slice(1))}`);
+      }
+    }
+  }
+
+  window.runCheck = async (relayUrls, websocketBridge, directorySeed) => {
+    await init();
+    const started = performance.now();
+    const stunUrls = websocketBridge ? [] : ['stun:stun.l.google.com:19302'];
+    const client = await AnonymousSignalingClient.create(directorySeed ?? undefined, stunUrls, websocketBridge);
+    const bootstrapSeconds = Number(((performance.now() - started) / 1000).toFixed(1));
+    log(`client ready in ${bootstrapSeconds}s`);
+    const results = [];
+    for (const relayUrl of relayUrls) {
+      try {
+        results.push(await probeRelay(client, relayUrl));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        log(`${relayUrl}: FAILED ${message}`);
+        results.push({ relayUrl, ok: false, error: message });
+      }
+    }
+    let directoryCacheBytes = 0;
+    try {
+      directoryCacheBytes = (await client.directoryCache()).length;
+    } catch (error) {
+      log(`directoryCache failed: ${error}`);
+    }
+    await client.close();
+    return { bootstrapSeconds, directoryCacheBytes, results };
+  };
+</script>

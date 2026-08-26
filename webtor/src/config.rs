@@ -54,7 +54,7 @@ impl TorClientOptions {
                 broker_url: SNOWFLAKE_BROKER_URL.to_string(),
                 stun_urls,
             },
-            connection_timeout: 240_000,
+            connection_timeout: 300_000,
             on_log: None,
         }
     }
@@ -66,7 +66,7 @@ impl TorClientOptions {
             bridge: BridgeType::SnowflakeWebSocket {
                 url: DIRECT_SNOWFLAKE_WS_URL.to_string(),
             },
-            connection_timeout: 240_000,
+            connection_timeout: 300_000,
             on_log: None,
         }
     }
