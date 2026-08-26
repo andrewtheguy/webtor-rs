@@ -1,5 +1,6 @@
 //! Directory management and consensus fetching
 
+use crate::authority::{authority_certs_path, parse_authority_certs, UncheckedConsensus};
 use crate::config::{LogCallback, LogType};
 use crate::error::{Result, TorError};
 use crate::onion::HsDirParams;
@@ -15,7 +16,6 @@ use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
 use async_lock::RwLock;
-use tor_checkable::Timebound;
 use tor_netdoc::doc::microdesc::MicrodescReader;
 use tor_netdoc::doc::netstatus::{MdConsensus, RelayWeight};
 use tor_netdoc::AllowAnnotations;
@@ -39,19 +39,27 @@ const MIN_HSDIR_RELAYS: usize = 100;
 /// serving it is untrusted, so this caps an endless stream and a decompression
 /// bomb; it does not bound directory data supplied by the embedding page.
 const MAX_DIRECTORY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
-const DIRECTORY_CACHE_VERSION: u32 = 2;
+const DIRECTORY_CACHE_VERSION: u32 = 3;
 /// Bounds on the bridge's directory service. `tor-proto` has none of its
 /// own, and an instance behind the Snowflake fingerprint sometimes takes a
 /// CREATE_FAST or a BEGIN_DIR and never answers; a bounded failure lets the
 /// client reconnect and land on another instance.
 const DIRECTORY_CIRCUIT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONSENSUS_TIMEOUT: Duration = Duration::from_secs(90);
+/// All nine authority certificates come back in about 20 KB, so this is far
+/// more than the transfer needs. It is generous anyway because failing costs
+/// a full bridge reconnect, and an instance that has just served a 3.6 MB
+/// consensus can still take tens of seconds over the next stream.
+const CERTIFICATE_TIMEOUT: Duration = Duration::from_secs(60);
 const MICRODESCRIPTOR_BATCH_TIMEOUT: Duration = Duration::from_secs(40);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct DirectoryCache {
     version: u32,
     consensus: String,
+    /// The authority certificates that check `consensus`. A seed carries its
+    /// own, because nothing checks it before it is installed.
+    certificates: String,
     microdescriptors: String,
 }
 
@@ -125,7 +133,15 @@ impl DirectoryManager {
 
         self.log("Downloading the current Tor consensus...", LogType::Info);
         let consensus_body = self.fetch_consensus_body(tunnel.clone()).await?;
-        let digests = select_microdescriptor_digests(&consensus_body)?;
+        let now = system_time_now();
+        let unchecked = UncheckedConsensus::parse(&consensus_body, now)?;
+        let certificates_body = self.fetch_authority_certificates(&tunnel, &unchecked).await?;
+        let consensus = unchecked.validate(&parse_authority_certs(&certificates_body, now)?)?;
+        self.log(
+            "Tor consensus signatures verified against the directory authorities",
+            LogType::Success,
+        );
+        let digests = select_microdescriptor_digests(&consensus)?;
         info!("Selected {} microdescriptor digests", digests.len());
 
         let mut microdescs_body = String::new();
@@ -161,12 +177,13 @@ impl DirectoryManager {
             missing.len()
         );
 
-        let processed = process_directory_documents(&consensus_body, &microdescs_body)?;
+        let processed = process_directory_documents(&consensus, &microdescs_body)?;
         self.install_directory(processed, false).await;
         self.retained_microdescriptors.write().await.clear();
         *self.cache.write().await = Some(DirectoryCache {
             version: DIRECTORY_CACHE_VERSION,
             consensus: consensus_body,
+            certificates: certificates_body,
             microdescriptors: microdescs_body,
         });
 
@@ -176,8 +193,11 @@ impl DirectoryManager {
     pub async fn load_cache(&self, encoded: &str) -> Result<()> {
         self.log("Validating cached Tor directory data...", LogType::Info);
         let cache = DirectoryCache::decode(encoded)?;
-        let processed = match process_directory_documents(&cache.consensus, &cache.microdescriptors)
-        {
+        let processed = match validate_directory_documents(
+            &cache.consensus,
+            &cache.certificates,
+            &cache.microdescriptors,
+        ) {
             Ok(processed) => processed,
             Err(error) => {
                 let known = index_microdescriptors(&cache.microdescriptors);
@@ -264,6 +284,36 @@ impl DirectoryManager {
         )
         .await?;
         info!("Received consensus: {} bytes", body.len());
+        Ok(body)
+    }
+
+    /// Download the authority certificates that `consensus`'s signatures
+    /// name. The bridge serving them is untrusted, which is the whole point:
+    /// a certificate it substitutes fails its own self-signature check, and
+    /// one it omits leaves the consensus short of a majority.
+    async fn fetch_authority_certificates(
+        &self,
+        tunnel: &Arc<ClientTunnel>,
+        consensus: &UncheckedConsensus,
+    ) -> Result<String> {
+        let ids = consensus.required_cert_ids();
+        if ids.is_empty() {
+            return Err(TorError::ConsensusFetch(
+                "Consensus carries no signature from a known directory authority".to_string(),
+            ));
+        }
+        info!("Fetching {} authority certificates from bridge...", ids.len());
+        self.log(
+            "Downloading Tor directory authority certificates...",
+            LogType::Info,
+        );
+        let body = crate::retry::with_timeout(
+            CERTIFICATE_TIMEOUT,
+            "Authority certificate download",
+            fetch_directory_document(tunnel, &authority_certs_path(&ids)),
+        )
+        .await?;
+        info!("Received authority certificates: {} bytes", body.len());
         Ok(body)
     }
 
@@ -428,21 +478,8 @@ pub(crate) async fn fetch_directory_document(
         .map_err(|e| TorError::serialization(format!("Directory document is not UTF-8: {}", e)))
 }
 
-fn select_microdescriptor_digests(consensus_body: &str) -> Result<Vec<[u8; 32]>> {
-    info!("Parsing full consensus");
-    let (_, _, unvalidated) = MdConsensus::parse(consensus_body)
-        .map_err(|error| TorError::serialization(format!("Failed to parse consensus: {}", error)))?;
-    let consensus = unvalidated
-        .if_valid_at(&system_time_now())
-        .map_err(|error| {
-            TorError::ConsensusFetch(format!(
-                "Consensus timeliness check failed: {}",
-                error
-            ))
-        })?;
-    let inner_consensus = &consensus.consensus;
-
-    let mut middle_digests: Vec<[u8; 32]> = inner_consensus
+fn select_microdescriptor_digests(consensus: &MdConsensus) -> Result<Vec<[u8; 32]>> {
+    let mut middle_digests: Vec<[u8; 32]> = consensus
         .relays()
         .iter()
         .filter(|router| {
@@ -453,7 +490,7 @@ fn select_microdescriptor_digests(consensus_body: &str) -> Result<Vec<[u8; 32]>>
         })
         .map(|router| *router.md_digest())
         .collect();
-    let hsdir_digests: Vec<[u8; 32]> = inner_consensus
+    let hsdir_digests: Vec<[u8; 32]> = consensus
         .relays()
         .iter()
         .filter(|router| router.is_flagged_hsdir())
@@ -485,25 +522,29 @@ fn select_microdescriptor_digests(consensus_body: &str) -> Result<Vec<[u8; 32]>>
         .collect())
 }
 
-fn process_directory_documents(
+/// Check `consensus_body` against `certificates_body` and turn the result,
+/// with `microdescriptors_body`, into the relays to install. This is the only
+/// way a supplied directory reaches [`RelayManager`]: a seed arrives with no
+/// circuit behind it, so it carries the certificates that vouch for it.
+fn validate_directory_documents(
     consensus_body: &str,
+    certificates_body: &str,
     microdescriptors_body: &str,
 ) -> Result<ProcessedDirectory> {
-    let (_, _, unvalidated) = MdConsensus::parse(consensus_body)
-        .map_err(|error| TorError::serialization(format!("Failed to parse consensus: {}", error)))?;
-    let consensus = unvalidated
-        .if_valid_at(&system_time_now())
-        .map_err(|error| {
-            TorError::ConsensusFetch(format!(
-                "Consensus timeliness check failed: {}",
-                error
-            ))
-        })?;
-    let inner_consensus = &consensus.consensus;
-    let hsdir_params = HsDirParams::from_consensus(inner_consensus)?;
+    let now = system_time_now();
+    let consensus = UncheckedConsensus::parse(consensus_body, now)?
+        .validate(&parse_authority_certs(certificates_body, now)?)?;
+    process_directory_documents(&consensus, microdescriptors_body)
+}
+
+fn process_directory_documents(
+    consensus: &MdConsensus,
+    microdescriptors_body: &str,
+) -> Result<ProcessedDirectory> {
+    let hsdir_params = HsDirParams::from_consensus(consensus)?;
 
     let mut router_statuses = HashMap::new();
-    for router in inner_consensus.relays() {
+    for router in consensus.relays() {
         router_statuses.insert(*router.md_digest(), router.clone());
     }
 
@@ -787,6 +828,7 @@ mod tests {
         let cache = DirectoryCache {
             version: DIRECTORY_CACHE_VERSION,
             consensus: "consensus".to_string(),
+            certificates: "certificates".to_string(),
             microdescriptors: "microdescriptors".to_string(),
         };
 
@@ -794,7 +836,22 @@ mod tests {
 
         assert_eq!(decoded.version, DIRECTORY_CACHE_VERSION);
         assert_eq!(decoded.consensus, "consensus");
+        assert_eq!(decoded.certificates, "certificates");
         assert_eq!(decoded.microdescriptors, "microdescriptors");
+    }
+
+    #[test]
+    fn directory_cache_rejects_a_seed_without_certificates() {
+        let encoded = serde_json::json!({
+            "version": DIRECTORY_CACHE_VERSION,
+            "consensus": "consensus",
+            "microdescriptors": "microdescriptors"
+        })
+        .to_string();
+
+        let error = DirectoryCache::decode(&encoded).unwrap_err();
+
+        assert!(error.to_string().contains("certificates"), "{}", error);
     }
 
     #[test]
@@ -802,6 +859,7 @@ mod tests {
         let encoded = serde_json::json!({
             "version": DIRECTORY_CACHE_VERSION + 1,
             "consensus": "consensus",
+            "certificates": "certificates",
             "microdescriptors": "microdescriptors"
         })
         .to_string();

@@ -39,9 +39,12 @@ Environment: `DIRECTORY_SEED` (default `tests/.directory-seed.json`), `BRIDGE`
 
 ## The directory snapshot
 
-`bun run seed` fetches the microdesc consensus and every microdescriptor in it
-from a directory authority and writes them in the shape `directorySeed`
-accepts. Without it the browser downloads the directory over a single Snowflake
+`bun run seed` fetches the microdesc consensus, the authority certificates that
+check its signatures, and every microdescriptor in it from a directory
+authority, and writes them in the shape `directorySeed` accepts. The
+certificates travel with the snapshot because the client verifies the consensus
+against the pinned directory authorities before installing a relay from it, and
+a seed arrives with no circuit behind it to vouch for it. Without a snapshot the browser downloads the directory over a single Snowflake
 circuit — and it needs *every* HSDir microdescriptor, because a relay's
 position on the hash ring comes from the ed25519 identity in its
 microdescriptor, so that is thousands of documents through one circuit.

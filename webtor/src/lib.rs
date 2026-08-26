@@ -11,6 +11,7 @@
 //! streams ([`TorClient::open_stream`]) and, through [`onion_websocket`],
 //! speaks RFC 6455 over one.
 
+mod authority;
 mod circuit;
 mod client;
 mod config;
