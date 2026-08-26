@@ -1,6 +1,6 @@
 Strict no backward compatibility or legacy code path under any circumstances, bump package version to signal breaking changes instead.
 
-Always use extractable: false for Web Crypto API keys even for asymmetric keys because public keys can always be exported
+No change logs on the repo because git already tracks all changes, and the commit history is the change log.
 
 run cargo clippy and cargo test after rust changes
 
