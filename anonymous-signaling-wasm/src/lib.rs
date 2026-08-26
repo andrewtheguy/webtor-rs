@@ -7,9 +7,11 @@
 //! one full onion rendezvous.
 
 use async_tungstenite::tungstenite::{protocol::Message, Error as WebSocketError};
+use futures::future::{AbortHandle, Abortable};
 use futures::lock::Mutex;
 use futures::StreamExt;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -93,6 +95,60 @@ fn parse_onion_relay_url(relay_url: &str) -> Result<Url, String> {
 #[wasm_bindgen]
 pub struct AnonymousSignalingClient {
     client: Arc<TorClient>,
+    /// Set by `close`. A `connect` issued afterwards fails at once instead of
+    /// bootstrapping the Tor client all over again for a socket nobody wants.
+    closed: Rc<Cell<bool>>,
+    /// `connect` calls still building their onion circuit, keyed so each can
+    /// remove itself. `close` aborts them; a rendezvous that nothing will use
+    /// should not run on to completion after the caller is gone.
+    pending: Rc<RefCell<HashMap<u64, AbortHandle>>>,
+    next_pending: Rc<Cell<u64>>,
+}
+
+/// Open a WebSocket to a Nostr relay over a fresh onion stream.
+async fn open_relay_socket(
+    client: &TorClient,
+    relay_url: &str,
+) -> Result<AnonymousSignalingSocket, JsValue> {
+    let url = parse_onion_relay_url(relay_url).map_err(|error| JsValue::from_str(&error))?;
+    log_tor_progress(
+        &format!("Opening an onion stream to {relay_url}..."),
+        LogType::Info,
+    );
+    let stream = webtor::with_timeout(
+        RELAY_STREAM_TIMEOUT,
+        "Nostr relay onion stream",
+        client.open_stream(&url),
+    )
+    .await
+    .map_err(|error| js_error("Failed to open onion stream", error))?;
+
+    log_tor_progress(
+        &format!("Upgrading the onion stream to WebSocket for {relay_url}..."),
+        LogType::Info,
+    );
+    let (socket, _) = webtor::with_timeout(
+        RELAY_WEBSOCKET_TIMEOUT,
+        "Nostr relay WebSocket handshake",
+        async {
+            async_tungstenite::client_async(url.as_str(), stream)
+                .await
+                .map_err(|error| TorError::websocket_connection(error.to_string()))
+        },
+    )
+    .await
+    .map_err(|error| js_error("Nostr WebSocket handshake failed", error))?;
+    log_tor_progress(
+        &format!("Connected to Nostr relay {relay_url} through Tor."),
+        LogType::Success,
+    );
+
+    let (writer, reader) = socket.split();
+    Ok(AnonymousSignalingSocket {
+        writer: Rc::new(Mutex::new(writer)),
+        reader: Rc::new(Mutex::new(reader)),
+        closed: Rc::new(Cell::new(false)),
+    })
 }
 
 #[wasm_bindgen]
@@ -138,6 +194,9 @@ impl AnonymousSignalingClient {
 
             Ok(JsValue::from(Self {
                 client: Arc::new(client),
+                closed: Rc::new(Cell::new(false)),
+                pending: Rc::new(RefCell::new(HashMap::new())),
+                next_pending: Rc::new(Cell::new(0)),
             }))
         })
     }
@@ -156,53 +215,40 @@ impl AnonymousSignalingClient {
     }
 
     /// Open a WebSocket to a Nostr relay at `ws://<address>.onion[/path]`.
+    ///
+    /// Rejects once `close` has been called, and a call still in flight when
+    /// `close` happens is aborted rather than left to finish its rendezvous.
     #[wasm_bindgen(js_name = connect)]
     pub fn connect(&self, relay_url: String) -> js_sys::Promise {
         let client = self.client.clone();
+        let closed = self.closed.clone();
+        let pending = self.pending.clone();
+        let id = self.next_pending.get();
+        self.next_pending.set(id.wrapping_add(1));
+        let (handle, registration) = AbortHandle::new_pair();
         future_to_promise(async move {
-            let url = parse_onion_relay_url(&relay_url).map_err(|error| JsValue::from_str(&error))?;
-            log_tor_progress(
-                &format!("Opening an onion stream to {relay_url}..."),
-                LogType::Info,
-            );
-            let stream = webtor::with_timeout(
-                RELAY_STREAM_TIMEOUT,
-                "Nostr relay onion stream",
-                client.open_stream(&url),
-            )
-            .await
-            .map_err(|error| js_error("Failed to open onion stream", error))?;
-
-            log_tor_progress(
-                &format!("Upgrading the onion stream to WebSocket for {relay_url}..."),
-                LogType::Info,
-            );
-            let (socket, _) = webtor::with_timeout(
-                RELAY_WEBSOCKET_TIMEOUT,
-                "Nostr relay WebSocket handshake",
-                async {
-                    async_tungstenite::client_async(url.as_str(), stream)
-                        .await
-                        .map_err(|error| TorError::websocket_connection(error.to_string()))
-                },
-            )
-            .await
-            .map_err(|error| js_error("Nostr WebSocket handshake failed", error))?;
-            log_tor_progress(
-                &format!("Connected to Nostr relay {relay_url} through Tor."),
-                LogType::Success,
-            );
-
-            let (writer, reader) = socket.split();
-            Ok(JsValue::from(AnonymousSignalingSocket {
-                writer: Rc::new(Mutex::new(writer)),
-                reader: Rc::new(Mutex::new(reader)),
-                closed: Rc::new(Cell::new(false)),
-            }))
+            if closed.get() {
+                return Err(JsValue::from_str("Anonymous signaling client is closed"));
+            }
+            pending.borrow_mut().insert(id, handle);
+            let outcome = Abortable::new(open_relay_socket(&client, &relay_url), registration).await;
+            pending.borrow_mut().remove(&id);
+            match outcome {
+                Ok(socket) => socket.map(JsValue::from),
+                Err(_aborted) => Err(JsValue::from_str(
+                    "Anonymous signaling client closed while connecting",
+                )),
+            }
         })
     }
 
+    /// Abort every `connect` still in flight, refuse new ones, and tear the
+    /// Tor client down.
     pub fn close(&self) -> js_sys::Promise {
+        self.closed.set(true);
+        for (_, handle) in self.pending.borrow_mut().drain() {
+            handle.abort();
+        }
         let client = self.client.clone();
         future_to_promise(async move {
             client.close().await;

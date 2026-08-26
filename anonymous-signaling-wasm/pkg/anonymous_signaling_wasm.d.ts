@@ -6,6 +6,10 @@ export class AnonymousSignalingClient {
   free(): void;
   [Symbol.dispose](): void;
   directoryCache(): Promise<any>;
+  /**
+   * Abort every `connect` still in flight, refuse new ones, and tear the
+   * Tor client down.
+   */
   close(): Promise<any>;
   /**
    * Bootstrap a Tor client and prove it can reach an onion service.
@@ -17,6 +21,9 @@ export class AnonymousSignalingClient {
   static create(directory_seed: string | null | undefined, stun_urls: Array<any>, websocket_bridge: boolean): Promise<any>;
   /**
    * Open a WebSocket to a Nostr relay at `ws://<address>.onion[/path]`.
+   *
+   * Rejects once `close` has been called, and a call still in flight when
+   * `close` happens is aborted rather than left to finish its rendezvous.
    */
   connect(relay_url: string): Promise<any>;
 }
@@ -43,10 +50,10 @@ export interface InitOutput {
   readonly anonymoussignalingsocket_close: (a: number) => any;
   readonly anonymoussignalingsocket_receive: (a: number) => any;
   readonly anonymoussignalingsocket_send: (a: number, b: number, c: number) => any;
-  readonly wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___wasm_bindgen_80478907236fa2b9___JsValue_____: (a: number, b: number, c: any) => void;
-  readonly wasm_bindgen_80478907236fa2b9___closure__destroy___dyn_core_e4e32f5ae772ed90___ops__function__FnMut__wasm_bindgen_80478907236fa2b9___JsValue____Output_______: (a: number, b: number) => void;
   readonly wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___web_sys_91ba62fe70348d71___features__gen_CloseEvent__CloseEvent_____: (a: number, b: number, c: any) => void;
   readonly wasm_bindgen_80478907236fa2b9___closure__destroy___dyn_core_e4e32f5ae772ed90___ops__function__FnMut__web_sys_91ba62fe70348d71___features__gen_CloseEvent__CloseEvent____Output_______: (a: number, b: number) => void;
+  readonly wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___wasm_bindgen_80478907236fa2b9___JsValue_____: (a: number, b: number, c: any) => void;
+  readonly wasm_bindgen_80478907236fa2b9___closure__destroy___dyn_core_e4e32f5ae772ed90___ops__function__FnMut__wasm_bindgen_80478907236fa2b9___JsValue____Output_______: (a: number, b: number) => void;
   readonly wasm_bindgen_80478907236fa2b9___convert__closures_____invoke______: (a: number, b: number) => void;
   readonly wasm_bindgen_80478907236fa2b9___closure__destroy___dyn_core_e4e32f5ae772ed90___ops__function__FnMut_____Output_______: (a: number, b: number) => void;
   readonly wasm_bindgen_80478907236fa2b9___convert__closures_____invoke___wasm_bindgen_80478907236fa2b9___JsValue__wasm_bindgen_80478907236fa2b9___JsValue_____: (a: number, b: number, c: any, d: any) => void;
