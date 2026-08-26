@@ -1,12 +1,10 @@
-//! Minimal Tor HTTP/1.1 client. It backs exit verification and any other
-//! request a caller needs to issue from inside the circuit.
+//! Minimal HTTP/1.1 codec for plain requests over an onion stream. It backs
+//! the onion-service check and any other request a caller issues to an
+//! onion site; the onion circuit already authenticates and encrypts it.
 
-use crate::circuit::CircuitManager;
 use crate::error::{Result, TorError};
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use std::collections::HashMap;
-use std::sync::Arc;
-use subtle_tls::{TlsConfig, TlsConnector, TlsVersion};
 use tracing::debug;
 use url::Url;
 
@@ -37,55 +35,13 @@ impl HttpRequest {
         Self {
             method: "GET".to_string(),
             url,
-            headers: vec![("Accept".to_string(), "application/json".to_string())],
+            headers: vec![("Accept".to_string(), "*/*".to_string())],
             body: None,
         }
     }
 }
 
-pub(crate) struct TorHttpClient {
-    circuit_manager: Arc<CircuitManager>,
-}
-
-impl TorHttpClient {
-    pub(crate) fn new(circuit_manager: Arc<CircuitManager>) -> Self {
-        Self { circuit_manager }
-    }
-
-    pub(crate) async fn send(&self, request: HttpRequest) -> Result<HttpResponse> {
-        let host = request
-            .url
-            .host_str()
-            .ok_or_else(|| TorError::http_request("Invalid URL: no host"))?
-            .to_string();
-        let port = request
-            .url
-            .port_or_known_default()
-            .ok_or_else(|| TorError::http_request("Invalid URL: no port"))?;
-        if request.url.scheme() != "https" {
-            return Err(TorError::http_request("Tor HTTP requests require HTTPS"));
-        }
-        let wire = build_request(&request, &host)?;
-
-        let circuit = self.circuit_manager.ready_circuit().await?;
-        let stream = circuit.begin_stream(&host, port).await?;
-        let connector = TlsConnector::with_config(TlsConfig {
-            skip_verification: false,
-            alpn_protocols: vec!["http/1.1".to_string()],
-            // subtle-tls carries TLS 1.2 again, but nothing here negotiates
-            // it: every retained path requires TLS 1.3.
-            version: TlsVersion::Tls13,
-        });
-        let mut stream = connector
-            .connect(stream, &host)
-            .await
-            .map_err(|error| TorError::tls(format!("TLS handshake failed: {error}")))?;
-
-        execute_request(&mut stream, &wire).await
-    }
-}
-
-fn build_request(request: &HttpRequest, host: &str) -> Result<Vec<u8>> {
+pub(crate) fn build_request(request: &HttpRequest, host: &str) -> Result<Vec<u8>> {
     let method = request.method.to_ascii_uppercase();
     if method.is_empty() || method.bytes().any(|byte| !byte.is_ascii_alphabetic()) {
         return Err(TorError::http_request(format!(
@@ -134,7 +90,7 @@ fn build_request(request: &HttpRequest, host: &str) -> Result<Vec<u8>> {
     Ok(wire)
 }
 
-async fn execute_request<S>(stream: &mut S, request: &[u8]) -> Result<HttpResponse>
+pub(crate) async fn execute_request<S>(stream: &mut S, request: &[u8]) -> Result<HttpResponse>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {

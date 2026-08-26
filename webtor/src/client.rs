@@ -1,20 +1,21 @@
 //! Browser Tor client used by anonymous Nostr signaling.
+//!
+//! Bootstrapping means opening the Snowflake bridge channel and installing a
+//! directory. Every stream after that goes to an onion service on a circuit
+//! built for it; nothing this client does reaches a Tor exit.
 
 use crate::circuit::CircuitManager;
 use crate::config::{BridgeType, LogType, TorClientOptions, SNOWFLAKE_FINGERPRINT};
 use crate::directory::DirectoryManager;
 use crate::error::{Result, TorError};
-use crate::http::{HttpRequest, HttpResponse, TorHttpClient};
+use crate::http::{build_request, execute_request, HttpRequest, HttpResponse};
+use crate::onion::OnionConnector;
 use crate::relay::RelayManager;
 use crate::retry::with_timeout;
 use crate::snowflake_webrtc::{SnowflakeWebRtcConfig, SnowflakeWebRtcStream};
 use crate::snowflake_ws::SnowflakeWsStream;
 use crate::time::system_time_now;
 use crate::wasm_runtime::WasmRuntime;
-
-/// Mozilla's CA bundle, republished by the curl project. Its own certificate
-/// chains to an embedded root, so fetching it needs no additional trust.
-const CA_BUNDLE_URL: &str = "https://curl.se/ca/cacert.pem";
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tor_linkspec::OwnedChanTargetBuilder;
@@ -28,9 +29,8 @@ use url::Url;
 
 pub struct TorClient {
     options: TorClientOptions,
-    circuit_manager: Arc<CircuitManager>,
     directory_manager: Arc<DirectoryManager>,
-    http_client: TorHttpClient,
+    onion: OnionConnector,
     initialized: RwLock<bool>,
     bootstrap_lock: Mutex<()>,
     channel: Arc<RwLock<Option<Arc<tor_proto::channel::Channel>>>>,
@@ -49,13 +49,21 @@ impl TorClient {
             relay_manager.clone(),
             options.on_log.clone(),
         ));
-        let circuit_manager = Arc::new(CircuitManager::new(relay_manager, channel.clone()));
+        let circuit_manager = Arc::new(CircuitManager::new(
+            relay_manager.clone(),
+            channel.clone(),
+        ));
+        let onion = OnionConnector::new(
+            circuit_manager,
+            directory_manager.clone(),
+            relay_manager,
+            options.on_log.clone(),
+        );
 
         Ok(Self {
             options,
-            http_client: TorHttpClient::new(circuit_manager.clone()),
-            circuit_manager,
             directory_manager,
+            onion,
             initialized: RwLock::new(false),
             bootstrap_lock: Mutex::new(()),
             channel,
@@ -63,45 +71,31 @@ impl TorClient {
         })
     }
 
-    /// Fetch the Mozilla CA bundle over Tor and trust its roots.
-    ///
-    /// subtle-tls embeds only ISRG Root X1/X2 and DigiCert Global Root G2,
-    /// which covers Tor Check but rejects entire authorities — a relay behind
-    /// Google Trust Services fails verification the moment TLS starts. The
-    /// bundle host itself verifies against the embedded roots, so this
-    /// bootstraps without a trust cycle.
-    ///
-    /// Call it after the exit is verified and before any relay connection.
-    /// Errors are the caller's to weigh: the embedded roots still work, so a
-    /// failed fetch narrows what can be reached rather than breaking Tor.
-    pub async fn load_ca_bundle(&self) -> Result<usize> {
-        self.log("Downloading the CA bundle over Tor", LogType::Info);
-        let response = self.get(CA_BUNDLE_URL).await?;
-        if !response.is_success() {
-            return Err(TorError::Network(format!(
-                "CA bundle request returned HTTP {}",
-                response.status
-            )));
-        }
-
-        let count = subtle_tls::load_extended_roots(&response.text()?)
-            .map_err(|error| TorError::tls(format!("CA bundle was unusable: {error}")))?;
-        self.log(
-            &format!("Trusting {count} additional root CAs"),
-            LogType::Success,
-        );
-        Ok(count)
-    }
-
+    /// GET an `http://` URL on an onion service and buffer the response.
     pub async fn get(&self, url: &str) -> Result<HttpResponse> {
         self.send(HttpRequest::get(Url::parse(url)?)).await
     }
 
+    /// Issue one plain HTTP/1.1 request to an onion service. The onion
+    /// circuit authenticates the service and encrypts the exchange, which is
+    /// why only `http://` is accepted: a TLS layer would add nothing.
     pub async fn send(&self, request: HttpRequest) -> Result<HttpResponse> {
-        self.ensure_ready().await?;
-        self.http_client.send(request).await
+        if request.url.scheme() != "http" {
+            return Err(TorError::http_request(
+                "Onion HTTP requests use http://; the circuit already encrypts them",
+            ));
+        }
+        let host = request
+            .url
+            .host_str()
+            .ok_or_else(|| TorError::http_request("Invalid URL: no host"))?
+            .to_string();
+        let wire = build_request(&request, &host)?;
+        let mut stream = self.open_stream(&request.url).await?;
+        execute_request(&mut stream, &wire).await
     }
 
+    /// Open a raw stream to the URL's onion service and port.
     pub async fn open_stream(&self, url: &Url) -> Result<DataStream> {
         self.ensure_ready().await?;
         let host = url
@@ -110,11 +104,12 @@ impl TorClient {
         let port = url
             .port_or_known_default()
             .ok_or_else(|| TorError::Configuration("URL has no port".to_string()))?;
-        self.circuit_manager
-            .ready_circuit()
-            .await?
-            .begin_stream(host, port)
-            .await
+        if !is_onion_host(host) {
+            return Err(TorError::Configuration(format!(
+                "{host} is not an onion service; this client only reaches .onion hosts"
+            )));
+        }
+        self.onion.connect(host, port).await
     }
 
     pub async fn ensure_ready(&self) -> Result<()> {
@@ -147,7 +142,7 @@ impl TorClient {
     }
 
     pub async fn close(&self) {
-        self.circuit_manager.close().await;
+        self.onion.close().await;
         *self.channel.write().await = None;
         *self.initialized.write().await = false;
     }
@@ -187,16 +182,6 @@ impl TorClient {
                 .await?;
         }
 
-        let circuit = self.circuit_manager.create_circuit().await?;
-        let relay_names: Vec<&str> = circuit
-            .relays
-            .iter()
-            .map(|relay| relay.nickname.as_str())
-            .collect();
-        self.log(
-            &format!("Tor circuit created: Snowflake → {}", relay_names.join(" → ")),
-            LogType::Success,
-        );
         *self.initialized.write().await = true;
         Ok(())
     }
@@ -288,6 +273,11 @@ impl TorClient {
     }
 }
 
+/// Whether `host` names a v3 onion service rather than a clearnet host.
+pub fn is_onion_host(host: &str) -> bool {
+    host.to_ascii_lowercase().ends_with(".onion")
+}
+
 fn parse_snowflake_identity() -> Result<RsaIdentity> {
     let bytes = hex::decode(SNOWFLAKE_FINGERPRINT)
         .map_err(|error| TorError::Configuration(format!("Invalid bridge identity: {error}")))?;
@@ -302,5 +292,17 @@ mod tests {
     #[test]
     fn snowflake_identity_is_valid() {
         assert!(parse_snowflake_identity().is_ok());
+    }
+
+    #[test]
+    fn onion_hosts_are_recognized() {
+        assert!(is_onion_host(
+            "nerostrrgb5fhj6dnzhjbgmnkpy2berdlczh6tuh2jsqrjok3j4zoxid.onion"
+        ));
+        assert!(is_onion_host(
+            "2GZYXA5IHM7NSGGFXNU52RCK2VV4RVMDLKIU3ZZUI5DU4XYCLEN53WID.ONION"
+        ));
+        assert!(!is_onion_host("relay.example"));
+        assert!(!is_onion_host("onion"));
     }
 }

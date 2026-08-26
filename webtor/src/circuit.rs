@@ -1,11 +1,15 @@
-//! Single-circuit management for one anonymous signaling session.
+//! Circuit construction for one anonymous signaling session.
+//!
+//! Every circuit starts at the Snowflake bridge and passes through one middle
+//! relay before its final hop: an HSDir, a rendezvous point or an
+//! introduction point. Nothing here ever reaches an exit.
 
 use crate::error::{Result, TorError};
 use crate::relay::{Relay, RelayManager};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tor_linkspec::HasRelayIds;
+use tor_linkspec::{CircTarget, HasRelayIds};
 use tor_proto::ccparams::{
     Algorithm, CongestionControlParamsBuilder, CongestionWindowParamsBuilder,
     FixedWindowParamsBuilder, RoundTripEstimatorParamsBuilder,
@@ -13,30 +17,9 @@ use tor_proto::ccparams::{
 use tor_proto::channel::Channel;
 use tor_proto::circuit::CircParameters;
 use tor_proto::client::circuit::TimeoutEstimator;
-use tor_proto::client::stream::DataStream;
 use tor_proto::{CellCount, ClientTunnel, FlowCtrlParameters};
 use tor_units::Percentage;
-use tracing::{debug, error, info};
-
-pub(crate) struct Circuit {
-    pub(crate) relays: Vec<Relay>,
-    tunnel: Arc<ClientTunnel>,
-}
-
-impl Circuit {
-    pub(crate) async fn begin_stream(&self, host: &str, port: u16) -> Result<DataStream> {
-        debug!("Beginning stream to {}:{}", host, port);
-        let stream = self
-            .tunnel
-            .begin_stream(host, port, None)
-            .await
-            .map_err(|error| {
-                TorError::Internal(format!("Failed to begin stream to {host}:{port}: {error}"))
-            })?;
-        info!("Stream established to {}:{}", host, port);
-        Ok(stream)
-    }
-}
+use tracing::{error, info};
 
 pub(crate) fn make_circ_params() -> Result<CircParameters> {
     let fixed_window_params = FixedWindowParamsBuilder::default()
@@ -106,7 +89,6 @@ impl TimeoutEstimator for SimpleTimeoutEstimator {
 
 #[derive(Clone)]
 pub(crate) struct CircuitManager {
-    circuit: Arc<RwLock<Option<Arc<Circuit>>>>,
     relay_manager: Arc<RwLock<RelayManager>>,
     channel: Arc<RwLock<Option<Arc<Channel>>>>,
 }
@@ -117,24 +99,31 @@ impl CircuitManager {
         channel: Arc<RwLock<Option<Arc<Channel>>>>,
     ) -> Self {
         Self {
-            circuit: Arc::new(RwLock::new(None)),
             relay_manager,
             channel,
         }
     }
 
-    pub(crate) async fn create_circuit(&self) -> Result<Arc<Circuit>> {
-        if let Some(circuit) = self.circuit.read().await.as_ref() {
-            return Ok(circuit.clone());
-        }
+    /// Build a fresh three-hop tunnel Snowflake → middle → `target`, choosing
+    /// a middle relay that is neither the bridge nor the target. Returns the
+    /// tunnel and the middle relay it went through.
+    pub(crate) async fn build_tunnel_to<T: CircTarget>(
+        &self,
+        target: &T,
+    ) -> Result<(ClientTunnel, Relay)> {
+        let channel = self.channel().await?;
+        let bridge_fingerprint = self.bridge_fingerprint().await?;
 
-        let channel = self
-            .channel
-            .read()
-            .await
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| TorError::Internal("Channel not established".to_string()))?;
+        let middle = {
+            let relay_manager = self.relay_manager.read().await;
+            let mut criteria =
+                crate::relay::selection::middle_relays().without_fingerprint(&bridge_fingerprint);
+            if let Some(identity) = target.rsa_identity() {
+                criteria = criteria.without_fingerprint(&hex::encode(identity.as_bytes()));
+            }
+            relay_manager.select_relay(&criteria)?
+        };
+        let middle_target = middle.as_circ_target()?;
 
         let (pending_tunnel, reactor) = channel
             .new_tunnel(Arc::new(SimpleTimeoutEstimator) as Arc<dyn TimeoutEstimator>)
@@ -154,22 +143,6 @@ impl CircuitManager {
             .await
             .map_err(|error| TorError::Internal(format!("Failed to create first hop: {error}")))?;
 
-        let bridge_fingerprint = channel
-            .target()
-            .rsa_identity()
-            .map(|identity| hex::encode(identity.as_bytes()))
-            .unwrap_or_else(|| "0000000000000000000000000000000000000000".to_string());
-
-        let relay_manager = self.relay_manager.read().await;
-        if relay_manager.relays.is_empty() {
-            return Err(TorError::Internal("No relays available".to_string()));
-        }
-
-        let middle = relay_manager.select_relay(
-            &crate::relay::selection::middle_relays()
-                .without_fingerprint(&bridge_fingerprint),
-        )?;
-        let middle_target = middle.as_circ_target()?;
         info!("Extending to middle relay {}", middle.nickname);
         tunnel
             .as_single_circ()
@@ -182,42 +155,38 @@ impl CircuitManager {
                 TorError::Internal(format!("Failed to extend to middle relay: {error}"))
             })?;
 
-        let exit = relay_manager.select_relay(
-            &crate::relay::selection::exit_relays()
-                .without_fingerprint(&bridge_fingerprint)
-                .without_fingerprint(&middle.fingerprint),
-        )?;
-        let exit_target = exit.as_circ_target()?;
-        info!("Extending to exit relay {}", exit.nickname);
+        info!("Extending to the final hop");
         tunnel
             .as_single_circ()
             .map_err(|error| {
-                TorError::Internal(format!("Failed to access exit circuit: {error}"))
+                TorError::Internal(format!("Failed to access final circuit: {error}"))
             })?
-            .extend(&exit_target, make_circ_params()?)
+            .extend(target, make_circ_params()?)
             .await
             .map_err(|error| {
-                TorError::Internal(format!("Failed to extend to exit relay: {error}"))
+                TorError::Internal(format!("Failed to extend to the final hop: {error}"))
             })?;
-        drop(relay_manager);
 
-        let circuit = Arc::new(Circuit {
-            relays: vec![middle, exit],
-            tunnel: Arc::new(tunnel),
-        });
-        *self.circuit.write().await = Some(circuit.clone());
-        Ok(circuit)
+        Ok((tunnel, middle))
     }
 
-    pub(crate) async fn ready_circuit(&self) -> Result<Arc<Circuit>> {
-        match self.circuit.read().await.as_ref() {
-            Some(circuit) => Ok(circuit.clone()),
-            None => self.create_circuit().await,
-        }
+    async fn channel(&self) -> Result<Arc<Channel>> {
+        self.channel
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| TorError::Internal("Channel not established".to_string()))
     }
 
-    pub(crate) async fn close(&self) {
-        *self.circuit.write().await = None;
+    async fn bridge_fingerprint(&self) -> Result<String> {
+        Ok(self
+            .channel()
+            .await?
+            .target()
+            .rsa_identity()
+            .map(|identity| hex::encode(identity.as_bytes()))
+            .unwrap_or_else(|| "0000000000000000000000000000000000000000".to_string()))
     }
 }
 
@@ -226,11 +195,12 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn circuit_requires_a_channel() {
+    async fn circuits_require_a_channel() {
         let manager = CircuitManager::new(
             Arc::new(RwLock::new(RelayManager::new(Vec::new()))),
             Arc::new(RwLock::new(None)),
         );
-        assert!(manager.create_circuit().await.is_err());
+        assert!(manager.channel().await.is_err());
+        assert!(manager.bridge_fingerprint().await.is_err());
     }
 }
