@@ -47,13 +47,14 @@ certificate bytes. The crates still compile for the host so `cargo check`,
 `cargo clippy`, and `cargo test` work there, but browser APIs only run in a
 browser.
 
-The vendored Arti tree contains only crates present in this workspace's resolved
-Cargo graph, with their sources pruned to what this workspace compiles.
-Onion-service support restores the pruned `hs` modules of `tor-cell`,
-`tor-netdoc`, `tor-proto` and `tor-linkspec`, and vendors `tor-hscrypto` with
-its `tor-key-forge` key-encoding impls removed, since that crate drags in
-`ssh-key` and nothing here stores keys. Optional and development-only crates
-that the project does not resolve are not copied into the repository.
+Most Arti dependencies come directly from crates.io. The vendored Arti tree is
+limited to seven crates that carry browser-specific behavior: the reduced
+runtime and memory-quota layers, the protocol implementation and its logging
+adapter, the WebAssembly filesystem-error fix, and the onion-service crypto and
+link-spec crates with their native configuration and key-storage dependencies
+removed. Retained local manifests use versioned dependencies, so their
+unmodified Arti dependencies continue to resolve from crates.io instead of
+requiring sibling source copies.
 
 The upstream code is MIT-licensed. Vendored Arti crates retain their own
 `MIT OR Apache-2.0` licensing metadata.

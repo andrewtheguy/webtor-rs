@@ -20,9 +20,9 @@ itertools = "0.14.0"
 paste = "1"
 pin-project = "1"
 thiserror = "2"
-tor-async-utils = { path = "../tor-async-utils", version = "0.37.0" }
-tor-error = { path = "../tor-error", version = "0.37.0", features = ["tracing"] }
-tor-rtcompat = { version = "0.37.0", path = "../tor-rtcompat" }
+tor-async-utils = { version = "0.37.0" }
+tor-error = { version = "0.37.0", features = ["tracing"] }
+tor-rtcompat = { version = "0.37.0" }
 
 [features]
 full = []
