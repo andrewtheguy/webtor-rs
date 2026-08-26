@@ -12,6 +12,8 @@ pub enum TorError {
     RelaySelection(String),
     #[error("Consensus fetch failed: {0}")]
     ConsensusFetch(String),
+    #[error("Directory request returned HTTP {0}")]
+    DirectoryStatus(u16),
     #[error("HTTP request failed: {0}")]
     HttpRequest(String),
     #[error("TLS setup failed: {0}")]
@@ -28,14 +30,15 @@ pub enum TorError {
     Serialization(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("URL parse error: {0}")]
-    UrlParse(#[from] url::ParseError),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("Internal error: {0}")]
     Internal(String),
     #[error("NetDoc error: {0}")]
     NetDoc(#[from] tor_netdoc::Error),
+
+    #[error("Onion service error: {0}")]
+    Onion(String),
 }
 
 impl TorError {

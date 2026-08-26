@@ -10,7 +10,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use subtle_tls::{TlsConfig, TlsConnector, TlsStream, TlsVersion};
+use subtle_tls::TlsStream;
 use tracing::{info, warn};
 
 const MAX_WEBRTC_ATTEMPTS: u32 = 3;
@@ -75,16 +75,9 @@ impl SnowflakeWebRtcStream {
         let mut smux = SmuxStream::with_stream_id(kcp, 3);
         smux.initialize().await?;
 
-        let connector = TlsConnector::with_config(TlsConfig {
-            // Tor authenticates the bridge through its CERTS cells.
-            skip_verification: true,
-            alpn_protocols: vec![],
-            // subtle-tls carries TLS 1.2 again, but nothing here negotiates
-            // it: every retained path requires TLS 1.3.
-            version: TlsVersion::Tls13,
-        });
-        let inner = connector
-            .connect(smux, "www.example.com")
+        // Tor authenticates the bridge through its CERTS cells, so the TLS
+        // layer only has to exist; the SNI is filler.
+        let inner = TlsStream::connect(smux, "www.example.com")
             .await
             .map_err(|error| TorError::tls(format!("Snowflake TLS handshake failed: {error}")))?;
         info!("Snowflake connection established: WebRTC → Turbo → KCP → SMUX → TLS");

@@ -1,14 +1,11 @@
 //! TLS 1.3 Record Layer
 //!
 //! Handles reading and writing TLS records with encryption/decryption.
-//! TLS 1.3 uses AEAD (AES-GCM or ChaCha20-Poly1305) for all encryption.
+//! Records are protected with ChaCha20-Poly1305, the one suite negotiated.
 
 use crate::crypto::Cipher;
 use crate::error::{Result, TlsError};
-use crate::handshake::{
-    CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_HANDSHAKE, TLS_AES_128_GCM_SHA256,
-    TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256, TLS_VERSION_1_2,
-};
+use crate::handshake::{CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_HANDSHAKE, TLS_VERSION_1_2};
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, trace};
 
@@ -23,8 +20,6 @@ pub struct RecordLayer {
     read_cipher: Option<RecordCipher>,
     /// Write cipher (for encrypting outgoing records)
     write_cipher: Option<RecordCipher>,
-    /// Negotiated cipher suite
-    cipher_suite: u16,
 }
 
 /// Encryption state for one direction
@@ -65,48 +60,20 @@ impl RecordLayer {
         Self {
             read_cipher: None,
             write_cipher: None,
-            cipher_suite: TLS_AES_128_GCM_SHA256,
-        }
-    }
-
-    /// Set the negotiated cipher suite
-    pub fn set_cipher_suite(&mut self, cipher_suite: u16) {
-        self.cipher_suite = cipher_suite;
-        debug!("Record layer using cipher suite: 0x{:04x}", cipher_suite);
-    }
-
-    /// Create a cipher based on the negotiated cipher suite
-    async fn create_cipher(&self, key: &[u8]) -> Result<Cipher> {
-        match self.cipher_suite {
-            TLS_AES_128_GCM_SHA256 => Cipher::aes_128_gcm(key).await,
-            TLS_AES_256_GCM_SHA384 => Cipher::aes_256_gcm(key).await,
-            TLS_CHACHA20_POLY1305_SHA256 => Cipher::chacha20_poly1305(key),
-            _ => Err(TlsError::protocol(format!(
-                "Unsupported cipher suite: 0x{:04x}",
-                self.cipher_suite
-            ))),
         }
     }
 
     /// Set the read cipher for decrypting incoming records
-    pub async fn set_read_cipher(&mut self, key: &[u8], iv: &[u8]) -> Result<()> {
-        let aead = self.create_cipher(key).await?;
-        self.read_cipher = Some(RecordCipher::new(aead, iv.to_vec()));
-        debug!(
-            "Read cipher activated (cipher suite: 0x{:04x})",
-            self.cipher_suite
-        );
+    pub fn set_read_cipher(&mut self, key: &[u8], iv: &[u8]) -> Result<()> {
+        self.read_cipher = Some(RecordCipher::new(Cipher::new(key)?, iv.to_vec()));
+        debug!("Read cipher activated");
         Ok(())
     }
 
     /// Set the write cipher for encrypting outgoing records
-    pub async fn set_write_cipher(&mut self, key: &[u8], iv: &[u8]) -> Result<()> {
-        let aead = self.create_cipher(key).await?;
-        self.write_cipher = Some(RecordCipher::new(aead, iv.to_vec()));
-        debug!(
-            "Write cipher activated (cipher suite: 0x{:04x})",
-            self.cipher_suite
-        );
+    pub fn set_write_cipher(&mut self, key: &[u8], iv: &[u8]) -> Result<()> {
+        self.write_cipher = Some(RecordCipher::new(Cipher::new(key)?, iv.to_vec()));
+        debug!("Write cipher activated");
         Ok(())
     }
 
@@ -163,12 +130,7 @@ impl RecordLayer {
                 // Additional data is the record header with encrypted length
                 let aad = &header;
 
-                tracing::debug!(
-                    "read_record: calling aead.decrypt (key_size={}, aad={:02x?})",
-                    cipher.aead.key_size(),
-                    aad
-                );
-                let plaintext = cipher.aead.decrypt(&nonce, aad, &body).await?;
+                let plaintext = cipher.aead.decrypt(&nonce, aad, &body)?;
                 cipher.increment_sequence();
 
                 // TLS 1.3: plaintext format is [content][content_type][zeros...]
@@ -237,7 +199,7 @@ impl RecordLayer {
                 ciphertext_len as u8,
             ];
 
-            let ciphertext = cipher.aead.encrypt(&nonce, &aad, &plaintext).await?;
+            let ciphertext = cipher.aead.encrypt(&nonce, &aad, &plaintext)?;
             cipher.increment_sequence();
 
             (CONTENT_TYPE_APPLICATION_DATA, ciphertext)
@@ -324,7 +286,7 @@ impl RecordLayer {
             let nonce = cipher.compute_nonce();
 
             // Decrypt using synchronous API
-            let plaintext = cipher.aead.decrypt_sync(&nonce, header, body)?;
+            let plaintext = cipher.aead.decrypt(&nonce, header, body)?;
             cipher.increment_sequence();
 
             // TLS 1.3 inner plaintext: last byte is content type
@@ -361,7 +323,7 @@ impl RecordLayer {
                 ciphertext_len as u8,
             ];
 
-            let ciphertext = cipher.aead.encrypt_sync(&nonce, &header, &plaintext)?;
+            let ciphertext = cipher.aead.encrypt(&nonce, &header, &plaintext)?;
             cipher.increment_sequence();
 
             // Build full record

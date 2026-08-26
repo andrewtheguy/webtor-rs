@@ -8,6 +8,13 @@ nothing but the standard library and a running Tor.
 
     ./scripts/onion_ws_probe.py ws://<addr>.onion
     ./scripts/onion_ws_probe.py --proxy '[fdb8:...:102]:32050' ws://<addr>.onion
+    ./scripts/onion_ws_probe.py --publish events.json ws://<addr>.onion
+
+`--publish` sends every signed event in the JSON array (sign them elsewhere;
+pTransfer's nostr-tools will do) and prints each relay `OK`, then asks for the
+first event back by id to catch relays that acknowledge a write and drop it.
+Serving a REQ says nothing about whether a relay accepts writes from a key it
+has never seen, which is what signaling needs.
 
 A ws:// URL carries no TLS: the onion protocol authenticates the service
 against its own address and encrypts the circuit end to end, which is the
@@ -249,6 +256,53 @@ def probe(url, proxy, timeout, limit):
         sock.close()
 
 
+def publish(url, proxy, timeout, events):
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+    path = parsed.path or "/"
+    sock = socks5_connect(proxy, host, port, timeout)
+    try:
+        if parsed.scheme == "wss":
+            sock = ssl._create_unverified_context().wrap_socket(sock, server_hostname=host)
+        _, leftover = ws_handshake(sock, host, port, path, parsed.scheme)
+        reader = FrameReader(sock, leftover)
+        for event in events:
+            send_text(sock, json.dumps(["EVENT", event]))
+        accepted = {}
+        deadline = time.monotonic() + timeout
+        while len(accepted) < len(events) and time.monotonic() < deadline:
+            opcode, payload = reader.frame()
+            if opcode == 0x8:
+                raise ProbeError("relay closed the connection after %d OKs" % len(accepted))
+            if opcode != 0x1:
+                continue
+            message = json.loads(payload)
+            if message[0] == "OK":
+                accepted[message[1]] = message[2]
+                print("  OK     kind=%s accepted=%s %s"
+                      % (next(e["kind"] for e in events if e["id"] == message[1]),
+                         message[2], message[3][:100]))
+            else:
+                print("  %s %s" % (message[0], json.dumps(message[1:])[:120]))
+        first = events[0]
+        send_text(sock, json.dumps(["REQ", "readback", {"ids": [first["id"]]}]))
+        while time.monotonic() < deadline:
+            opcode, payload = reader.frame()
+            if opcode != 0x1:
+                continue
+            message = json.loads(payload)
+            if message[0] == "EVENT":
+                print("  stored kind=%s served back by id" % first["kind"])
+                return all(accepted.values())
+            if message[0] in ("EOSE", "CLOSED", "NOTICE"):
+                print("  NOT stored: kind=%s not served back by id" % first["kind"])
+                return False
+        raise ProbeError("no EOSE for the read-back within %gs" % timeout)
+    finally:
+        sock.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("url", help="ws:// or wss:// URL of the relay onion service")
@@ -260,18 +314,29 @@ def main():
     )
     parser.add_argument("--timeout", type=float, default=90.0, help="seconds per step")
     parser.add_argument("--limit", type=int, default=2, help="events to ask the relay for")
+    parser.add_argument(
+        "--publish",
+        metavar="EVENTS_JSON",
+        help="JSON array of signed events to send instead of a REQ; "
+        "the first one is asked back by id afterwards",
+    )
     args = parser.parse_args()
 
     proxy = split_hostport(args.proxy, 9050)
     shown = "[%s]" % proxy[0] if ":" in proxy[0] else proxy[0]
     print("%s via %s:%d" % (args.url, shown, proxy[1]))
     try:
-        probe(args.url, proxy, args.timeout, args.limit)
+        if args.publish:
+            with open(args.publish) as handle:
+                ok = publish(args.url, proxy, args.timeout, json.load(handle))
+        else:
+            probe(args.url, proxy, args.timeout, args.limit)
+            ok = True
     except (ProbeError, OSError, ssl.SSLError) as error:
         print("  FAILED: %s" % error)
         return 1
-    print("  OK")
-    return 0
+    print("  OK" if ok else "  REJECTED")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
