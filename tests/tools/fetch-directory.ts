@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 /**
  * Build a Tor directory snapshot for the WASM client to bootstrap from.
  *
@@ -14,7 +14,7 @@
  * valid for three hours and the client rejects an expired one, so a snapshot
  * has to be rebuilt to stay useful.
  *
- *   node tests/tools/fetch-directory.mjs [output-path]
+ *   bun tests/tools/fetch-directory.ts [output-path]
  */
 
 import { writeFileSync } from 'node:fs';
@@ -50,11 +50,17 @@ const keepAliveAgent = new http.Agent({
   maxSockets: PARALLEL_REQUESTS,
 });
 
+interface RouterEntry {
+  microdescDigest: string;
+  flags: Set<string>;
+  bandwidth: number;
+}
+
 /**
  * Directory authorities answer with bare HTTP/1.0 responses that Node's
  * `fetch` refuses to frame, so talk to them with the raw HTTP client.
  */
-function httpGet(url) {
+function httpGet(url: string): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const request = http.get(
       url,
@@ -69,8 +75,8 @@ function httpGet(url) {
           reject(new Error(`HTTP ${response.statusCode}`));
           return;
         }
-        const chunks = [];
-        response.on('data', (chunk) => chunks.push(chunk));
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer) => chunks.push(chunk));
         response.on('end', () => resolve(Buffer.concat(chunks)));
         response.on('error', reject);
       },
@@ -80,15 +86,17 @@ function httpGet(url) {
   });
 }
 
-async function fetchFromAuthority(documentPath) {
-  const failures = [];
+async function fetchFromAuthority(documentPath: string): Promise<Buffer> {
+  const failures: string[] = [];
   for (const authority of AUTHORITIES) {
     try {
       const body = await httpGet(`${authority}${documentPath}`);
       // A `.z` suffix means zlib-compressed, per dir-spec.
       return documentPath.endsWith('.z') ? zlib.inflateSync(body) : body;
-    } catch (error) {
-      failures.push(`${authority}: ${error.message}`);
+    } catch (error: unknown) {
+      failures.push(
+        `${authority}: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
   throw new Error(
@@ -101,9 +109,9 @@ async function fetchFromAuthority(documentPath) {
  * line and carries its microdescriptor digest (`m`), flags (`s`) and consensus
  * weight (`w`).
  */
-function parseRouterEntries(consensus) {
-  const entries = [];
-  let current = null;
+function parseRouterEntries(consensus: string): RouterEntry[] {
+  const entries: RouterEntry[] = [];
+  let current: Partial<RouterEntry> | null = null;
 
   const push = () => {
     if (current?.microdescDigest && current.flags) {
@@ -139,7 +147,10 @@ function parseRouterEntries(consensus) {
   return entries;
 }
 
-function consensusLifetime(consensus) {
+function consensusLifetime(consensus: string): {
+  after: string;
+  until: string;
+} {
   const after = /^valid-after (.+)$/m.exec(consensus)?.[1] ?? 'unknown';
   const until = /^valid-until (.+)$/m.exec(consensus)?.[1] ?? 'unknown';
   return { after: after.trim(), until: until.trim() };
@@ -151,7 +162,7 @@ function consensusLifetime(consensus) {
  * fetching from an authority is fast enough to carry the whole network, which
  * leaves path selection weighted across all of it.
  */
-function collectDigests(entries) {
+function collectDigests(entries: RouterEntry[]): string[] {
   const usable = entries.filter(
     (entry) =>
       entry.bandwidth > 0 && entry.flags.has('Fast') && entry.flags.has('Stable'),
@@ -167,17 +178,17 @@ function collectDigests(entries) {
   return [...new Set(entries.map((entry) => entry.microdescDigest))];
 }
 
-async function fetchMicrodescriptors(digests) {
-  const chunks = [];
+async function fetchMicrodescriptors(digests: string[]): Promise<string> {
+  const chunks: string[][] = [];
   for (let index = 0; index < digests.length; index += DIGESTS_PER_REQUEST) {
     chunks.push(digests.slice(index, index + DIGESTS_PER_REQUEST));
   }
 
-  const documents = new Array(chunks.length).fill('');
+  const documents: string[] = new Array(chunks.length).fill('');
   let next = 0;
   let done = 0;
 
-  const worker = async () => {
+  const worker = async (): Promise<void> => {
     while (next < chunks.length) {
       const index = next++;
       const body = await fetchFromAuthority(
@@ -197,7 +208,7 @@ async function fetchMicrodescriptors(digests) {
   return documents.join('');
 }
 
-async function main() {
+async function main(): Promise<void> {
   const outputPath = path.resolve(
     process.argv[2] ??
       path.join(import.meta.dirname, '..', '.directory-seed.json'),
@@ -231,7 +242,7 @@ async function main() {
   );
 }
 
-main().catch((error) => {
-  console.error(error.message ?? error);
+main().catch((error: unknown) => {
+  console.error(error instanceof Error ? error.message : error);
   process.exit(1);
 });

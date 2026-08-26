@@ -18,15 +18,19 @@ import { access } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { relative } from 'node:path';
 import { afterAll as after, beforeAll as before, describe, it } from 'bun:test';
-import { openHarness } from './support/browser.mjs';
-import { REPO_ROOT } from './support/server.mjs';
+import {
+  openHarness,
+  type BrowserHarness,
+  type CreateOptions,
+} from './support/browser.ts';
+import { REPO_ROOT } from './support/server.ts';
 import {
   ATTEMPT_TIMEOUT_MS,
   HTTP_TARGETS,
   NIP11_TARGETS,
   WS_TARGETS,
   firstReachable,
-} from './support/targets.mjs';
+} from './support/targets.ts';
 
 const SEED_PATH = process.env.DIRECTORY_SEED ?? `${REPO_ROOT}/tests/.directory-seed.json`;
 const BRIDGE = process.env.BRIDGE ?? 'websocket';
@@ -42,7 +46,7 @@ const REQUEST = JSON.stringify(['REQ', 'webtor-test', { kinds: [1], limit: 2 }])
 const CASE_TIMEOUT = 5 * 60_000;
 
 describe('webtor-wasm over Tor', () => {
-  let harness;
+  let harness: BrowserHarness;
   const started = Date.now();
   const elapsed = () => `${((Date.now() - started) / 1000).toFixed(1)}s`;
 
@@ -62,7 +66,7 @@ describe('webtor-wasm over Tor', () => {
       );
     }
 
-    const options = { bridge: BRIDGE, logPrefix: '[tor]' };
+    const options: CreateOptions = { bridge: BRIDGE, logPrefix: '[tor]' };
     if (BRIDGE === 'webrtc') {
       assert.ok(STUN_URLS.length, 'BRIDGE=webrtc needs STUN_URLS');
       options.stunUrls = STUN_URLS;
@@ -97,6 +101,7 @@ describe('webtor-wasm over Tor', () => {
     assert.equal(result.ok, true);
     assert.match(result.headers['content-type'] ?? '', /text\/html/);
     assert.ok(result.byteLength > 0, 'body is empty');
+    assert.ok(result.text, 'body is not UTF-8 text');
     assert.match(result.text, /<html/i);
   }, CASE_TIMEOUT);
 
@@ -124,12 +129,20 @@ describe('webtor-wasm over Tor', () => {
       if (response.status !== 200) {
         throw new Error(`answered HTTP ${response.status}`);
       }
+      if (response.text === null) {
+        throw new Error('answered with a body that is not UTF-8 text');
+      }
       JSON.parse(response.text);
       return response;
     });
-    const document = JSON.parse(result.text);
-    console.log(`  ${target} is ${document.name ?? 'unnamed'}`);
-    assert.equal(typeof document, 'object');
+    assert.ok(result.text, 'response body is empty');
+    const document: unknown = JSON.parse(result.text);
+    assert.ok(typeof document === 'object' && document !== null);
+    const name =
+      'name' in document && typeof document.name === 'string'
+        ? document.name
+        : 'unnamed';
+    console.log(`  ${target} is ${name}`);
   }, CASE_TIMEOUT);
 
   it('refuses a scheme it cannot carry', async () => {
@@ -205,7 +218,8 @@ describe('webtor-wasm over Tor', () => {
           let message;
           try {
             message = await harness.call('wsReceive', id);
-          } catch (error) {
+          } catch (error: unknown) {
+            assert.ok(error instanceof Error);
             assert.match(error.message, /exceeds the size limit/);
             return 'refused';
           }

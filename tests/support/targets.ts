@@ -39,17 +39,21 @@ export const ATTEMPT_TIMEOUT_MS = 90_000;
  * should — and the error then carries what each one said, since "the client is
  * broken" and "these four services are down" look identical from one failure.
  */
-export async function firstReachable(candidates, attempt) {
-  const failures = [];
+export async function firstReachable<Result>(
+  candidates: string[],
+  attempt: (candidate: string) => Promise<Result>,
+): Promise<{ target: string; result: Result }> {
+  const failures: string[] = [];
   for (const candidate of candidates) {
     const started = Date.now();
     try {
       const result = await attempt(candidate);
       return { target: candidate, result };
-    } catch (error) {
+    } catch (error: unknown) {
       const seconds = ((Date.now() - started) / 1000).toFixed(1);
-      console.log(`  ✗ ${candidate} after ${seconds}s: ${error.message}`);
-      failures.push(`${candidate}: ${error.message}`);
+      const message = error instanceof Error ? error.message : String(error);
+      console.log(`  ✗ ${candidate} after ${seconds}s: ${message}`);
+      failures.push(`${candidate}: ${message}`);
     }
   }
   throw new Error(`No candidate answered:\n  ${failures.join('\n  ')}`);

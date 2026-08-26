@@ -7,12 +7,12 @@
 
 import assert from 'node:assert/strict';
 import { afterAll as after, beforeAll as before, describe, it } from 'bun:test';
-import { openHarness } from './support/browser.mjs';
+import { openHarness, type BrowserHarness } from './support/browser.ts';
 
 const ONION = '2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion';
 
 describe('webtor-wasm API', () => {
-  let harness;
+  let harness: BrowserHarness;
 
   before(async () => {
     harness = await openHarness();

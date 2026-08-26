@@ -9,10 +9,11 @@ this directory.
 
 ```bash
 bun install        # install dependencies from bun.lock
+bun run typecheck  # check all TypeScript without emitting JavaScript
 bun run build      # required first: the harness imports webtor-wasm/pkg/
-bun run test       # tests/api.test.mjs   — no network, ~1s
+bun run test       # tests/api.test.ts    — no network, ~1s
 bun run seed       # a directory snapshot, ~40 MiB, valid three hours
-bun run test:live  # tests/live.test.mjs  — real onion services, ~1 minute
+bun run test:live  # tests/live.test.ts   — real onion services, ~1 minute
 ```
 
 `CHROME_PATH` points at a Chrome-family binary (default
@@ -21,12 +22,12 @@ is why it needs one already installed.
 
 ## The two suites
 
-**`api.test.mjs`** covers what answers without a circuit: `isOnionHost`,
+**`api.test.ts`** covers what answers without a circuit: `isOnionHost`,
 `parseOnionUrl`, and the option validation `WebtorClient.create` runs before it
 touches the network — unknown keys, wrong types, a bridge that needs STUN. It
 needs no Tor and no directory, so it is the one to run while editing.
 
-**`live.test.mjs`** bootstraps one client and reuses it for every case:
+**`live.test.ts`** bootstraps one client and reuses it for every case:
 directory cache export, an HTTP GET, a server-chosen 4xx, caller-supplied
 headers, the schemes the client refuses, a WebSocket exchange, the
 `maxMessageBytes` limit, and finally that a closed client refuses work. Each
@@ -53,7 +54,7 @@ missing.
 
 ## Targets
 
-`support/targets.mjs` holds the public onion services the live suite uses: the
+`support/targets.ts` holds the public onion services the live suite uses: the
 Tor Project's own site for HTTP, and onion Nostr relays for WebSocket and for
 NIP-11 over HTTP. None of them is under our control, so each is a list and a
 case takes the first that answers, giving each candidate 90 seconds before
@@ -69,7 +70,7 @@ over the whole list.
 
 WASM objects cannot cross the CDP boundary, so `harness/index.html` keeps the
 client and its sockets in the page, keyed by id, and exposes methods that
-return plain JSON. `support/browser.mjs` gives the Bun side a `call(method,
+return plain JSON. `support/browser.ts` gives the Bun side a `call(method,
 ...args)` that runs one of them. The harness re-throws WASM rejections — which
 are plain strings — as `Error`s, which is what lets a test assert on the
 message.

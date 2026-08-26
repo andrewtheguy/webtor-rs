@@ -6,12 +6,15 @@
   "packageManager": "bun@1.4.0",
   "scripts": {
     "build": "wasm-pack build webtor-wasm --release --target web --scope andrewtheguy",
-    "test": "bun test --timeout 60000 ./tests/api.test.mjs",
-    "test:live": "bun test --timeout 600000 ./tests/live.test.mjs",
-    "seed": "bun run ./tests/tools/fetch-directory.mjs"
+    "test": "bun test --timeout 60000 ./tests/api.test.ts",
+    "test:live": "bun test --timeout 600000 ./tests/live.test.ts",
+    "seed": "bun run ./tests/tools/fetch-directory.ts",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "@types/bun": "^1.3.9",
     "playwright-core": "^1.50.0",
+    "typescript": "~5.9.3",
     "wasm-pack": "0.15.0"
   },
   "trustedDependencies": [
