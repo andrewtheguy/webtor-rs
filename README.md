@@ -120,6 +120,14 @@ the client being wrong:
 TOR_SOCKS_PROXY='[fdb8::1]:32050' ./scripts/onion_ws_probe.py ws://<addr>.onion
 ```
 
+## Browser Nostr proof
+
+[`examples/nostr-onion-poc`](examples/nostr-onion-poc) is a small Vite/React
+project that loads the local WASM build and performs a live Nostr round trip
+through an onion relay. It uses separate subscriber and publisher streams,
+requires the relay's positive publication acknowledgement, and verifies the
+signed event received by the subscriber.
+
 ## Releases
 
 The wasm-pack output is published as a `.tgz` asset on a GitHub release:
@@ -145,5 +153,6 @@ webtor/       the Tor client: directory, circuits, onion rendezvous, HTTP, WebSo
 webtor-wasm/  the wasm-bindgen surface packed for distribution
 subtle-tls/   the TLS 1.3 session the bridge channel runs inside (see its README)
 tests/        the browser test project
+examples/     standalone browser integrations
 scripts/      onion_ws_probe.py, a SOCKS-based cross-check
 ```
