@@ -1,6 +1,6 @@
-//! Minimal HTTP/1.1 codec for plain requests over an onion stream. It backs
-//! the onion-service check and any other request a caller issues to an
-//! onion site; the onion circuit already authenticates and encrypts it.
+//! Minimal HTTP/1.1 codec for plain requests over an onion stream. The onion
+//! circuit already authenticates the service and encrypts the exchange, so
+//! what goes over it is ordinary cleartext HTTP.
 
 use crate::error::{Result, TorError};
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -12,6 +12,9 @@ use tracing::debug;
 /// bounds what one request can cost. Callers streaming anything larger have to
 /// range-request it in pieces.
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Sent when the caller supplies no `User-Agent` of its own.
+const DEFAULT_USER_AGENT: &str = concat!("webtor/", env!("CARGO_PKG_VERSION"));
 
 /// Headers the client sets from the request itself. A caller-supplied copy
 /// would either be ignored or contradict the framing actually on the wire, so
@@ -51,7 +54,17 @@ pub(crate) fn build_request(request: &HttpRequest, host: &str) -> Result<Vec<u8>
     }
     let target = request.url.path_and_query();
 
-    let mut head = format!("{method} {target} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: pTransfer\r\nConnection: close\r\n");
+    let mut head =
+        format!("{method} {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
+    // A caller who names no User-Agent still gets one: a server that varies on
+    // it should see a stable, honest value rather than none at all.
+    if !request
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+    {
+        head.push_str(&format!("User-Agent: {DEFAULT_USER_AGENT}\r\n"));
+    }
     for (name, value) in &request.headers {
         // A newline in either half would let a caller inject headers, or a
         // whole second request, into the stream.
@@ -241,7 +254,25 @@ mod tests {
                 .unwrap();
         assert!(request.starts_with("GET /api/ip?format=json HTTP/1.1\r\n"));
         assert!(request.contains("Connection: close\r\n"));
+        assert!(request.contains(&format!("User-Agent: {DEFAULT_USER_AGENT}\r\n")));
         assert!(!request.contains("Content-Length"));
+    }
+
+    #[test]
+    fn a_caller_supplied_user_agent_replaces_the_default() {
+        let url = OnionUrl::parse(
+            "http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/",
+        )
+        .unwrap();
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            url,
+            headers: vec![("user-agent".to_string(), "curl/8".to_string())],
+            body: None,
+        };
+        let wire = String::from_utf8(build_request(&request, "example.onion").unwrap()).unwrap();
+        assert!(wire.contains("user-agent: curl/8\r\n"));
+        assert!(!wire.contains(DEFAULT_USER_AGENT));
     }
 
     #[test]

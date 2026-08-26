@@ -1,7 +1,15 @@
-//! Browser WASM Tor transport for pTransfer's anonymous Nostr signaling.
+//! A browser Tor client for v3 onion services, without TLS.
 //!
-//! The active entry path uses Snowflake WebRTC. A direct browser Snowflake
-//! WebSocket entry path is retained for a future explicit transport policy.
+//! The client enters the network through a Snowflake bridge and only ever
+//! builds circuits to onion services: it never uses an exit, so there is no
+//! clearnet TLS to terminate inside WASM and no server certificate to check.
+//! The onion address commits to the service key and the circuit is encrypted
+//! end to end, which is why `http://` and `ws://` are the two schemes it
+//! carries and `https://`/`wss://` are refused rather than tolerated.
+//!
+//! [`TorClient`] issues HTTP requests ([`TorClient::send`]), opens raw onion
+//! streams ([`TorClient::open_stream`]) and, through [`onion_websocket`],
+//! speaks RFC 6455 over one.
 
 mod circuit;
 mod client;
@@ -12,8 +20,8 @@ mod http;
 mod kcp_stream;
 mod onion;
 mod onion_url;
+pub mod onion_websocket;
 mod relay;
-pub mod relay_socket;
 mod retry;
 mod smux;
 mod snowflake_broker;
@@ -28,7 +36,7 @@ mod websocket;
 
 pub use client::TorClient;
 pub use onion_url::{is_onion_host, OnionUrl};
-pub use relay_socket::{RelayMessage, RelaySocketReader, RelaySocketWriter};
+pub use onion_websocket::{WebSocketMessage, WebSocketReader, WebSocketWriter};
 pub use config::{BridgeType, LogType, TorClientOptions};
 pub use error::{Result, TorError};
 pub use http::{HttpRequest, HttpResponse};

@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Read version from anonymous-signaling-wasm
+      - name: Read version from webtor-wasm
         id: version
         run: |
           set -euo pipefail
@@ -25,7 +25,7 @@ jobs:
             exit 1
           fi
           metadata=$(cargo metadata --no-deps --format-version 1)
-          version=$(printf '%s' "$metadata" | jq -r '.packages[] | select(.name=="anonymous-signaling-wasm") | .version')
+          version=$(printf '%s' "$metadata" | jq -r '.packages[] | select(.name=="webtor-wasm") | .version')
           if [ -z "$version" ] || [ "$version" = "null" ]; then
             echo "Failed to extract version from cargo metadata" >&2
             exit 1
@@ -69,12 +69,12 @@ jobs:
       - run: npm run build
 
       - run: npm pack
-        working-directory: anonymous-signaling-wasm/pkg
+        working-directory: webtor-wasm/pkg
 
       - uses: actions/upload-artifact@v4
         with:
           name: wasm-pkg
-          path: anonymous-signaling-wasm/pkg/*.tgz
+          path: webtor-wasm/pkg/*.tgz
           if-no-files-found: error
 
   publish:

@@ -1,11 +1,12 @@
 /node_modules/
 /target/
 *.tgz
-/anonymous-signaling-wasm/LICENSE
+/webtor-wasm/LICENSE
 tmp/
+/tests/.directory-seed.json
 
 # Python bytecode
 __pycache__/
 *.py[cod]
 *$py.class
-anonymous-signaling-wasm/pkg/
+webtor-wasm/pkg/

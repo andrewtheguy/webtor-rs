@@ -1,9 +1,9 @@
 [package]
-name = "anonymous-signaling-wasm"
-version = "0.0.1-alpha.6"
+name = "webtor-wasm"
+version = "0.0.1-alpha.7"
 edition.workspace = true
 license-file = "../LICENSE"
-description = "Tor-backed WebSocket transport for pTransfer Nostr signaling"
+description = "Browser Tor client for http:// and ws:// onion services"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

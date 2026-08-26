@@ -95,22 +95,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anonymous-signaling-wasm"
-version = "0.0.1-alpha.6"
-dependencies = [
- "console_error_panic_hook",
- "futures",
- "getrandom 0.4.3",
- "js-sys",
- "serde",
- "tracing",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
- "webtor",
-]
-
-[[package]]
 name = "ascii"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4006,7 +3990,7 @@ dependencies = [
 
 [[package]]
 name = "webtor"
-version = "0.5.13"
+version = "0.5.14"
 dependencies = [
  "async-lock",
  "async-trait",
@@ -4043,6 +4027,22 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "webtor-wasm"
+version = "0.0.1-alpha.7"
+dependencies = [
+ "console_error_panic_hook",
+ "futures",
+ "getrandom 0.4.3",
+ "js-sys",
+ "serde",
+ "tracing",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "webtor",
 ]
 
 [[package]]
