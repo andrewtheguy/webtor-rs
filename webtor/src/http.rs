@@ -1,4 +1,5 @@
-//! Minimal Tor HTTP GET client used to verify the exit address.
+//! Minimal Tor HTTP/1.1 client. It backs exit verification and any other
+//! request a caller needs to issue from inside the circuit.
 
 use crate::circuit::CircuitManager;
 use crate::error::{Result, TorError};
@@ -9,7 +10,38 @@ use subtle_tls::{TlsConfig, TlsConnector, TlsVersion};
 use tracing::debug;
 use url::Url;
 
-const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+/// A whole response is buffered in memory before the caller sees it, so this
+/// bounds what one request can cost. Callers streaming anything larger have to
+/// range-request it in pieces.
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Headers the client sets from the request itself. A caller-supplied copy
+/// would either be ignored or contradict the framing actually on the wire, so
+/// supplying one is an error rather than a silent override.
+const RESERVED_HEADERS: [&str; 4] = [
+    "host",
+    "content-length",
+    "connection",
+    "transfer-encoding",
+];
+
+pub struct HttpRequest {
+    pub method: String,
+    pub url: Url,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Vec<u8>>,
+}
+
+impl HttpRequest {
+    pub fn get(url: Url) -> Self {
+        Self {
+            method: "GET".to_string(),
+            url,
+            headers: vec![("Accept".to_string(), "application/json".to_string())],
+            body: None,
+        }
+    }
+}
 
 pub(crate) struct TorHttpClient {
     circuit_manager: Arc<CircuitManager>,
@@ -20,19 +52,20 @@ impl TorHttpClient {
         Self { circuit_manager }
     }
 
-    pub(crate) async fn get(&self, url: Url) -> Result<HttpResponse> {
-        let host = url
+    pub(crate) async fn send(&self, request: HttpRequest) -> Result<HttpResponse> {
+        let host = request
+            .url
             .host_str()
             .ok_or_else(|| TorError::http_request("Invalid URL: no host"))?
             .to_string();
-        let port = url
+        let port = request
+            .url
             .port_or_known_default()
             .ok_or_else(|| TorError::http_request("Invalid URL: no port"))?;
-        if url.scheme() != "https" {
-            return Err(TorError::http_request(
-                "Exit verification requires HTTPS",
-            ));
+        if request.url.scheme() != "https" {
+            return Err(TorError::http_request("Tor HTTP requests require HTTPS"));
         }
+        let wire = build_request(&request, &host)?;
 
         let circuit = self.circuit_manager.ready_circuit().await?;
         let stream = circuit.begin_stream(&host, port).await?;
@@ -48,25 +81,57 @@ impl TorHttpClient {
             .await
             .map_err(|error| TorError::tls(format!("TLS handshake failed: {error}")))?;
 
-        let request = build_get_request(&url, &host);
-        execute_request(&mut stream, &request).await
+        execute_request(&mut stream, &wire).await
     }
 }
 
-fn build_get_request(url: &Url, host: &str) -> Vec<u8> {
-    let path = if url.path().is_empty() {
+fn build_request(request: &HttpRequest, host: &str) -> Result<Vec<u8>> {
+    let method = request.method.to_ascii_uppercase();
+    if method.is_empty() || method.bytes().any(|byte| !byte.is_ascii_alphabetic()) {
+        return Err(TorError::http_request(format!(
+            "Invalid HTTP method: {}",
+            request.method
+        )));
+    }
+    let path = if request.url.path().is_empty() {
         "/"
     } else {
-        url.path()
+        request.url.path()
     };
-    let query = url
+    let query = request
+        .url
         .query()
         .map(|value| format!("?{value}"))
         .unwrap_or_default();
-    format!(
-        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: pTransfer\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
-    )
-    .into_bytes()
+
+    let mut head = format!("{method} {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: pTransfer\r\nConnection: close\r\n");
+    for (name, value) in &request.headers {
+        // A newline in either half would let a caller inject headers, or a
+        // whole second request, into the stream.
+        if name.contains(['\r', '\n', ':']) || value.contains(['\r', '\n']) {
+            return Err(TorError::http_request(format!(
+                "Header {name} contains a line break"
+            )));
+        }
+        if RESERVED_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+            return Err(TorError::http_request(format!(
+                "Header {name} is set by the client and cannot be supplied"
+            )));
+        }
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    // Every request carries a length, so a body-bearing method is framed and a
+    // bodyless one is unambiguous to servers that would otherwise wait.
+    if let Some(body) = &request.body {
+        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    head.push_str("\r\n");
+
+    let mut wire = head.into_bytes();
+    if let Some(body) = &request.body {
+        wire.extend_from_slice(body);
+    }
+    Ok(wire)
 }
 
 async fn execute_request<S>(stream: &mut S, request: &[u8]) -> Result<HttpResponse>
@@ -94,9 +159,7 @@ where
         }
         response.extend_from_slice(&buffer[..count]);
         if response.len() > MAX_RESPONSE_BYTES {
-            return Err(TorError::http_request(
-                "Exit verification response exceeds 1 MiB",
-            ));
+            return Err(TorError::http_request("HTTP response exceeds 8 MiB"));
         }
     }
 
@@ -142,8 +205,12 @@ fn parse_response(data: &[u8]) -> Result<HttpResponse> {
         body.truncate(length);
     }
 
-    debug!("Parsed exit verification response with status {}", status);
-    Ok(HttpResponse { status, body })
+    debug!("Parsed HTTP response with status {}", status);
+    Ok(HttpResponse {
+        status,
+        headers,
+        body,
+    })
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -177,9 +244,7 @@ fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>> {
         }
         decoded.extend_from_slice(&remaining[..size]);
         if decoded.len() > MAX_RESPONSE_BYTES {
-            return Err(TorError::http_request(
-                "Decoded exit verification response exceeds 1 MiB",
-            ));
+            return Err(TorError::http_request("Decoded HTTP response exceeds 8 MiB"));
         }
         remaining = &remaining[size + 2..];
     }
@@ -188,12 +253,22 @@ fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>> {
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
     pub status: u16,
+    headers: HashMap<String, String>,
     body: Vec<u8>,
 }
 
 impl HttpResponse {
     pub fn is_success(&self) -> bool {
         (200..300).contains(&self.status)
+    }
+
+    /// Header names are lowercased on parse, so lookups are case-insensitive.
+    pub fn headers(&self) -> &HashMap<String, String> {
+        &self.headers
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.body
     }
 
     pub fn text(&self) -> Result<String> {
@@ -212,11 +287,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builds_the_only_supported_request() {
+    fn builds_a_get_request() {
         let url = Url::parse("https://check.torproject.org/api/ip?format=json").unwrap();
-        let request = String::from_utf8(build_get_request(&url, "check.torproject.org")).unwrap();
+        let request =
+            String::from_utf8(build_request(&HttpRequest::get(url), "check.torproject.org").unwrap())
+                .unwrap();
         assert!(request.starts_with("GET /api/ip?format=json HTTP/1.1\r\n"));
         assert!(request.contains("Connection: close\r\n"));
+        assert!(!request.contains("Content-Length"));
+    }
+
+    #[test]
+    fn builds_a_body_request_with_a_length() {
+        let request = HttpRequest {
+            method: "put".to_string(),
+            url: Url::parse("https://example.org/upload").unwrap(),
+            headers: vec![("Content-Type".to_string(), "text/plain".to_string())],
+            body: Some(b"hello".to_vec()),
+        };
+        let wire = String::from_utf8(build_request(&request, "example.org").unwrap()).unwrap();
+        assert!(wire.starts_with("PUT /upload HTTP/1.1\r\n"));
+        assert!(wire.contains("Content-Type: text/plain\r\n"));
+        assert!(wire.contains("Content-Length: 5\r\n"));
+        assert!(wire.ends_with("\r\n\r\nhello"));
+    }
+
+    #[test]
+    fn rejects_header_injection() {
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            url: Url::parse("https://example.org/").unwrap(),
+            headers: vec![("X-Evil".to_string(), "a\r\nX-Injected: 1".to_string())],
+            body: None,
+        };
+        let error = build_request(&request, "example.org").unwrap_err();
+        assert!(error.to_string().contains("line break"));
+    }
+
+    #[test]
+    fn rejects_client_owned_headers() {
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            url: Url::parse("https://example.org/").unwrap(),
+            headers: vec![("content-length".to_string(), "9".to_string())],
+            body: Some(b"hello".to_vec()),
+        };
+        let error = build_request(&request, "example.org").unwrap_err();
+        assert!(error.to_string().contains("cannot be supplied"));
     }
 
     #[test]
@@ -225,6 +342,17 @@ mod tests {
         let response = parse_response(raw).unwrap();
         assert!(response.is_success());
         assert_eq!(response.json::<serde_json::Value>().unwrap()["x"], 1);
+    }
+
+    #[test]
+    fn exposes_response_headers() {
+        let raw = b"HTTP/1.1 302 Found\r\nLocation: https://example.org/a\r\nContent-Length: 0\r\n\r\n";
+        let response = parse_response(raw).unwrap();
+        assert_eq!(response.status, 302);
+        assert_eq!(
+            response.headers().get("location").map(String::as_str),
+            Some("https://example.org/a")
+        );
     }
 
     #[test]
