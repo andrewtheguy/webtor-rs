@@ -217,6 +217,11 @@ h2 {
   accent-color: #a5e995;
 }
 
+.radio-label input:focus-visible {
+  outline: 2px solid #92cf85;
+  outline-offset: 2px;
+}
+
 .action-row {
   margin-top: 38px;
   padding-top: 28px;
