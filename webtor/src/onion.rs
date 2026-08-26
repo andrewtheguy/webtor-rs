@@ -29,7 +29,7 @@ use std::ops::Range;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::sync::RwLock;
+use async_lock::RwLock;
 use tor_bytes::Writeable;
 use tor_cell::relaycell::hs::intro_payload::{IntroduceHandshakePayload, OnionKey};
 use tor_cell::relaycell::hs::{

@@ -6,19 +6,19 @@
 //! caller, so every `connect` runs on a client that has already completed
 //! one full onion rendezvous.
 
-use async_tungstenite::tungstenite::{protocol::Message, Error as WebSocketError};
 use futures::future::{AbortHandle, Abortable};
 use futures::lock::Mutex;
-use futures::StreamExt;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use url::Url;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
-use webtor::{is_onion_host, DataStream, LogType, TorClient, TorClientOptions, TorError};
+use webtor::{
+    relay_socket, LogType, OnionUrl, RelayMessage, RelaySocketReader, RelaySocketWriter, TorClient,
+    TorClientOptions,
+};
 
 const MAX_NOSTR_MESSAGE_BYTES: usize = 1024 * 1024;
 const CONNECTION_TIMEOUT_MS: u64 = 240_000;
@@ -64,9 +64,6 @@ async fn verify_onion_client(client: &TorClient) -> Result<(), JsValue> {
     Ok(())
 }
 
-type RelayWriter = async_tungstenite::WebSocketSender<DataStream>;
-type RelayReader = async_tungstenite::WebSocketReceiver<DataStream>;
-
 fn signaling_client_options(stun_urls: Vec<String>, websocket_bridge: bool) -> TorClientOptions {
     let options = if websocket_bridge {
         TorClientOptions::snowflake_websocket()
@@ -79,14 +76,11 @@ fn signaling_client_options(stun_urls: Vec<String>, websocket_bridge: bool) -> T
 }
 
 /// The relay URL an onion relay socket is allowed to have: `ws://` on a
-/// `.onion` host. `wss://` is refused rather than tolerated because a TLS
+/// v3 onion host. `wss://` is refused rather than tolerated because a TLS
 /// layer over an onion circuit is redundant and this client carries none.
-fn parse_onion_relay_url(relay_url: &str) -> Result<Url, String> {
-    let url = Url::parse(relay_url).map_err(|error| format!("Invalid relay URL: {error}"))?;
-    let host = url
-        .host_str()
-        .ok_or_else(|| "Relay URL has no host".to_string())?;
-    if url.scheme() != "ws" || !is_onion_host(host) {
+fn parse_onion_relay_url(relay_url: &str) -> Result<OnionUrl, String> {
+    let url = OnionUrl::parse(relay_url).map_err(|error| error.to_string())?;
+    if url.scheme() != "ws" {
         return Err("Anonymous signaling requires a ws:// relay on a .onion host".to_string());
     }
     Ok(url)
@@ -127,14 +121,10 @@ async fn open_relay_socket(
         &format!("Upgrading the onion stream to WebSocket for {relay_url}..."),
         LogType::Info,
     );
-    let (socket, _) = webtor::with_timeout(
+    let (writer, reader) = webtor::with_timeout(
         RELAY_WEBSOCKET_TIMEOUT,
         "Nostr relay WebSocket handshake",
-        async {
-            async_tungstenite::client_async(url.as_str(), stream)
-                .await
-                .map_err(|error| TorError::websocket_connection(error.to_string()))
-        },
+        relay_socket::connect(stream, &url, MAX_NOSTR_MESSAGE_BYTES),
     )
     .await
     .map_err(|error| js_error("Nostr WebSocket handshake failed", error))?;
@@ -143,7 +133,6 @@ async fn open_relay_socket(
         LogType::Success,
     );
 
-    let (writer, reader) = socket.split();
     Ok(AnonymousSignalingSocket {
         writer: Rc::new(Mutex::new(writer)),
         reader: Rc::new(Mutex::new(reader)),
@@ -259,8 +248,8 @@ impl AnonymousSignalingClient {
 
 #[wasm_bindgen]
 pub struct AnonymousSignalingSocket {
-    writer: Rc<Mutex<RelayWriter>>,
-    reader: Rc<Mutex<RelayReader>>,
+    writer: Rc<Mutex<RelaySocketWriter>>,
+    reader: Rc<Mutex<RelaySocketReader>>,
     closed: Rc<Cell<bool>>,
 }
 
@@ -279,7 +268,7 @@ impl AnonymousSignalingSocket {
             writer
                 .lock()
                 .await
-                .send(Message::Text(text.into()))
+                .send_text(&text)
                 .await
                 .map_err(|error| js_error("WebSocket send failed", error))?;
             Ok(JsValue::UNDEFINED)
@@ -297,37 +286,25 @@ impl AnonymousSignalingSocket {
                 }
                 let next = reader.lock().await.next().await;
                 match next {
-                    Some(Ok(Message::Text(text))) => {
-                        if text.len() > MAX_NOSTR_MESSAGE_BYTES {
-                            return Err(JsValue::from_str("Nostr message exceeds 1 MiB"));
-                        }
-                        return Ok(JsValue::from_str(text.as_str()));
-                    }
-                    Some(Ok(Message::Ping(payload))) => {
+                    Ok(Some(RelayMessage::Text(text))) => return Ok(JsValue::from_str(&text)),
+                    Ok(Some(RelayMessage::Ping(payload))) => {
                         writer
                             .lock()
                             .await
-                            .send(Message::Pong(payload))
+                            .send_pong(&payload)
                             .await
                             .map_err(|error| js_error("WebSocket pong failed", error))?;
                     }
-                    Some(Ok(Message::Pong(_))) => {}
-                    Some(Ok(Message::Close(frame))) => {
+                    Ok(Some(RelayMessage::Close)) => {
                         closed.set(true);
-                        let _ = writer.lock().await.send(Message::Close(frame)).await;
+                        let _ = writer.lock().await.send_close().await;
                         return Ok(JsValue::NULL);
                     }
-                    Some(Ok(Message::Binary(_))) | Some(Ok(Message::Frame(_))) => {
-                        return Err(JsValue::from_str(
-                            "Nostr relay sent a non-text WebSocket message",
-                        ));
-                    }
-                    Some(Err(WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed))
-                    | None => {
+                    Ok(None) => {
                         closed.set(true);
                         return Ok(JsValue::NULL);
                     }
-                    Some(Err(error)) => {
+                    Err(error) => {
                         closed.set(true);
                         return Err(js_error("WebSocket receive failed", error));
                     }
@@ -341,7 +318,7 @@ impl AnonymousSignalingSocket {
         let closed = self.closed.clone();
         future_to_promise(async move {
             if !closed.replace(true) {
-                let _ = writer.lock().await.close(None).await;
+                let _ = writer.lock().await.send_close().await;
             }
             Ok(JsValue::UNDEFINED)
         })

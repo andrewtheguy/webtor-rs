@@ -28,8 +28,6 @@ pub enum TorError {
     Serialization(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("URL parse error: {0}")]
-    UrlParse(#[from] url::ParseError),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("Internal error: {0}")]

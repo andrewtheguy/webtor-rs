@@ -7,8 +7,8 @@ license.workspace = true
 description = "Core Tor client implementation for web browsers"
 
 [dependencies]
-# Core async runtime
-tokio = { workspace = true }
+# Async locks (no runtime needed)
+async-lock = "3"
 futures = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -28,12 +28,10 @@ tor-memquota = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
 
 # Cryptography
-rsa = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
 
 # Networking
-url = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
@@ -48,7 +46,7 @@ digest = "0.10"
 web-sys = { workspace = true }
 wasm-bindgen = { workspace = true }
 js-sys = { workspace = true }
-tor-checkable = "0.37.0"
+tor-checkable = { workspace = true }
 
 # KCP reliable transport
 kcp = { workspace = true }
@@ -61,3 +59,4 @@ subtle-tls = { path = "../subtle-tls" }
 
 [dev-dependencies]
 proptest = "1"
+tokio = { version = "1", features = ["rt", "macros"] }

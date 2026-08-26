@@ -8,7 +8,7 @@ use crate::error::{Result, TorError};
 use crate::relay::{Relay, RelayManager};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use async_lock::RwLock;
 use tor_linkspec::{CircTarget, HasRelayIds};
 use tor_proto::ccparams::{
     Algorithm, CongestionControlParamsBuilder, CongestionWindowParamsBuilder,

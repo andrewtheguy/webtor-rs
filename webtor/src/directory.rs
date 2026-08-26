@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use async_lock::RwLock;
 use tor_checkable::Timebound;
 use tor_netdoc::doc::microdesc::MicrodescReader;
 use tor_netdoc::doc::netstatus::{MdConsensus, RelayWeight};

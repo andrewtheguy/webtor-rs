@@ -19,6 +19,11 @@ pTransfer adds:
   `tor-hsclient` needs `tor-circmgr`, `tor-netdir` and friends, which do not
   fit a browser;
 - `TorClient::open_stream`, a raw stream API that only reaches `.onion` hosts;
+- `webtor::relay_socket`, an RFC 6455 client for the Nostr relay socket
+  (text frames, ping/pong, close) so the wasm carries no HTTP parser or
+  general WebSocket stack, and `webtor::OnionUrl`, which parses the one URL
+  shape reached here (`scheme://<v3 onion>[:port][/path][?query]`) so the
+  `url` crate and its IDNA/Unicode tables stay out of the binary; and
 - `anonymous-signaling-wasm`, a plain WebSocket binding used only for Nostr
   signaling over onion streams.
 
