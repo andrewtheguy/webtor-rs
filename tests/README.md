@@ -14,13 +14,14 @@ bun run build      # required first: the harness imports webtor-wasm/pkg/
 bun run test       # tests/api.test.ts    — no network, ~1s
 bun run seed       # a directory snapshot, ~40 MiB, valid three hours
 bun run test:live  # tests/live.test.ts   — real onion services, ~1 minute
+bun run test:interop  # tools/interop-cli.ts — against ptransfer-cli, ~1 minute
 ```
 
 `CHROME_PATH` points at a Chrome-family binary (default
 `/usr/bin/google-chrome`). `playwright-core` ships no browser of its own, which
 is why it needs one already installed.
 
-## The two suites
+## The three suites
 
 **`api.test.ts`** covers what answers without a circuit: `isOnionHost`,
 `parseOnionUrl`, and the option validation `WebtorClient.create` runs before it
@@ -33,6 +34,16 @@ headers, the schemes the client refuses, a WebSocket exchange, the
 `maxMessageBytes` limit, and finally that a closed client refuses work. Each
 case builds its own rendezvous — around five seconds — so the cost of the file
 is the bootstrap plus roughly that per case.
+
+**`tools/interop-cli.ts`** is the only one that needs something outside this
+repository: the `tor` proof of concept in the sibling `ptransfer-cli`, which
+publishes an ephemeral onion address and echoes back every line. It runs both
+halves against that known-good implementation — the page opens a raw stream to
+a service the CLI publishes, then publishes a service of its own for
+`ptransfer tor connect` to reach — so a failure names the side that is wrong
+rather than just "onion services do not work". `PTRANSFER_BIN` overrides the
+binary (default `../ptransfer-cli/target/release/ptransfer`) and `ONLY=client`
+or `ONLY=server` runs one direction.
 
 Environment: `DIRECTORY_SEED` (default `tests/.directory-seed.json`), `BRIDGE`
 (`websocket` or `webrtc`), `STUN_URLS` (comma-separated, for `webrtc`).

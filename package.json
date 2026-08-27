@@ -8,6 +8,7 @@
     "build": "wasm-pack build webtor-wasm --release --target web --scope andrewtheguy",
     "test": "bun test --timeout 60000 ./tests/api.test.ts",
     "test:live": "bun test --timeout 600000 ./tests/live.test.ts",
+    "test:interop": "bun ./tests/tools/interop-cli.ts",
     "seed": "bun run ./tests/tools/fetch-directory.ts",
     "typecheck": "tsc --noEmit"
   },

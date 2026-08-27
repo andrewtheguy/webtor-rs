@@ -127,6 +127,11 @@ struct EstablishedIntroPoint {
 pub struct OnionService {
     address: String,
     incoming: Mutex<mpsc::Receiver<DataStream>>,
+    /// A sender kept only so that [`OnionService::close`] can close the
+    /// channel from this side. Closing it through the receiver would mean
+    /// taking `incoming`'s lock, which an `accept` that is waiting for a
+    /// client holds for as long as it waits.
+    streams: mpsc::Sender<DataStream>,
     state: Arc<ServiceState>,
 }
 
@@ -194,7 +199,8 @@ impl OnionService {
         );
 
         let (introduce_tx, introduce_rx) = mpsc::channel(CHANNEL_DEPTH);
-        let (stream_tx, stream_rx) = mpsc::channel(CHANNEL_DEPTH);
+        let (streams, stream_rx) = mpsc::channel(CHANNEL_DEPTH);
+        let stream_tx = streams.clone();
 
         let established = establish_intro_points(
             &state,
@@ -227,13 +233,13 @@ impl OnionService {
         drop(blind_keypair);
 
         let relays = relay_manager.read().await.relays.clone();
-        let hsdirs = select_hsdirs_with_spread(&relays, &blind_id, &params, HSDIR_SPREAD_STORE);
-        if hsdirs.is_empty() {
+        let replicas = select_hsdirs_with_spread(&relays, &blind_id, &params, HSDIR_SPREAD_STORE);
+        if replicas.is_empty() {
             return Err(TorError::Onion(
                 "The directory has no HSDir relays to publish the descriptor to".to_string(),
             ));
         }
-        publish_descriptor(&state, &hsdirs, &blind_id, &descriptor).await?;
+        publish_descriptor(&state, &replicas, &blind_id, &descriptor).await?;
 
         // From here on the service answers introductions on its own.
         let (abort_handle, abort_registration) = AbortHandle::new_pair();
@@ -254,6 +260,7 @@ impl OnionService {
         Ok(Self {
             address,
             incoming: Mutex::new(stream_rx),
+            streams,
             state,
         })
     }
@@ -273,11 +280,13 @@ impl OnionService {
 
     /// Stop answering introductions and drop every circuit.
     pub async fn close(&self) {
+        // First, so that an `accept` waiting for the next client wakes up and
+        // gives up the lock it is holding on the receiver.
+        self.streams.clone().close_channel();
         for abort in self.state.aborts.write().await.drain(..) {
             abort.abort();
         }
         self.state.tunnels.write().await.clear();
-        self.incoming.lock().await.close();
     }
 }
 
@@ -469,48 +478,86 @@ fn build_descriptor<R: rand::Rng + rand::CryptoRng>(
 }
 
 /// POST the descriptor to every responsible HSDir. One acceptance is enough
-/// for a client to find the service; the rest are redundancy.
+/// Store the descriptor at every HSDir responsible for it, resolving as soon
+/// as each replica holds a copy.
+///
+/// A client asks the relays of one replica after another until one serves the
+/// descriptor, so a single relay per replica is what makes the address
+/// reachable. The remaining uploads are still worth making — they are what a
+/// client falls back on when the relay it asked has dropped its copy — but
+/// nothing needs to wait for them, and one unreachable HSDir would otherwise
+/// hold publishing up for the whole of `UPLOAD_TIMEOUT`.
 async fn publish_descriptor(
     state: &Arc<ServiceState>,
-    hsdirs: &[Relay],
+    replicas: &[Vec<Relay>],
     blind_id: &HsBlindId,
     descriptor: &str,
 ) -> Result<()> {
+    let total: usize = replicas.iter().map(Vec::len).sum();
     debug!(
-        "Publishing a {} byte descriptor for {} to {} HSDirs",
+        "Publishing a {} byte descriptor for {} to {} HSDirs across {} replicas",
         descriptor.len(),
         hex::encode(blind_id.as_ref()),
-        hsdirs.len()
+        total,
+        replicas.len()
     );
 
-    // Every HSDir at once: they are independent, and a service that waited
-    // for each in turn would take minutes to become reachable.
-    let uploads = hsdirs.iter().map(|hsdir| async move {
-        let attempt = async {
-            let (tunnel, _) = state
-                .circuit_manager
-                .build_tunnel_to(&hsdir.as_circ_target()?)
-                .await?;
-            post_directory_document(&Arc::new(tunnel), "/tor/hs/3/publish", descriptor).await
-        };
-        (hsdir, with_timeout(UPLOAD_TIMEOUT, "Descriptor upload", attempt).await)
-    });
+    // Every upload on its own task, so that the ones still running when this
+    // returns carry on. `close` aborts whatever is left.
+    let (outcome_tx, mut outcomes) = mpsc::channel(total);
+    let mut aborts = Vec::with_capacity(total);
+    for (replica, hsdirs) in replicas.iter().enumerate() {
+        for hsdir in hsdirs {
+            let (abort_handle, abort_registration) = AbortHandle::new_pair();
+            aborts.push(abort_handle);
+            let state = state.clone();
+            let hsdir = hsdir.clone();
+            let descriptor = descriptor.to_string();
+            let mut outcome_tx = outcome_tx.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let upload = async {
+                    let attempt = async {
+                        let (tunnel, _) = state
+                            .circuit_manager
+                            .build_tunnel_to(&hsdir.as_circ_target()?)
+                            .await?;
+                        post_directory_document(&Arc::new(tunnel), "/tor/hs/3/publish", &descriptor)
+                            .await
+                    };
+                    let outcome = with_timeout(UPLOAD_TIMEOUT, "Descriptor upload", attempt).await;
+                    match &outcome {
+                        Ok(()) => debug!("HSDir {} stored the descriptor", hsdir.nickname),
+                        Err(error) => state.log(
+                            &format!("HSDir {} rejected the descriptor: {error}", hsdir.nickname),
+                            LogType::Error,
+                        ),
+                    }
+                    // Fails once publishing has moved on without this upload,
+                    // which is the point of running it out here.
+                    let _ = outcome_tx.send((replica, outcome)).await;
+                };
+                let _ = Abortable::new(upload, abort_registration).await;
+            });
+        }
+    }
+    // Otherwise the receiver below would never see the end of the uploads.
+    drop(outcome_tx);
+    state.aborts.write().await.append(&mut aborts);
 
+    let mut stored = vec![0_usize; replicas.len()];
     let mut accepted = 0_usize;
     let mut last_error = None;
-    for (hsdir, outcome) in futures::future::join_all(uploads).await {
+    while stored.contains(&0) {
+        let Some((replica, outcome)) = outcomes.next().await else {
+            // Every upload has reported, so nothing more is coming.
+            break;
+        };
         match outcome {
             Ok(()) => {
-                debug!("HSDir {} stored the descriptor", hsdir.nickname);
+                stored[replica] += 1;
                 accepted += 1;
             }
-            Err(error) => {
-                state.log(
-                    &format!("HSDir {} rejected the descriptor: {error}", hsdir.nickname),
-                    LogType::Error,
-                );
-                last_error = Some(error);
-            }
+            Err(error) => last_error = Some(error),
         }
     }
 
@@ -518,8 +565,12 @@ async fn publish_descriptor(
         return Err(last_error
             .unwrap_or_else(|| TorError::Onion("No HSDir accepted the descriptor".to_string())));
     }
+    let ready = stored.iter().filter(|count| **count > 0).count();
     state.log(
-        &format!("Descriptor published to {accepted} of {} HSDirs", hsdirs.len()),
+        &format!(
+            "Descriptor stored on {ready} of {} replicas ({accepted} of {total} HSDirs so far)",
+            replicas.len()
+        ),
         LogType::Success,
     );
     Ok(())

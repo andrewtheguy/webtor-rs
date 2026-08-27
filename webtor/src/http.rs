@@ -109,6 +109,10 @@ where
 
     let mut response = Vec::new();
     let mut buffer = [0_u8; 8192];
+    let mut framing = None;
+    // How much of `response` the chunked scan has already looked at, so a
+    // long body is scanned once rather than once per read.
+    let mut scanned = 0;
     loop {
         let count = stream
             .read(&mut buffer)
@@ -121,18 +125,97 @@ where
         if response.len() > MAX_RESPONSE_BYTES {
             return Err(TorError::http_request("HTTP response exceeds 8 MiB"));
         }
+        if framing.is_none() {
+            framing = split_headers(&response).map(|(header_end, headers)| {
+                body_framing(header_end, &headers)
+            });
+        }
+        if response_is_complete(&framing, &response, &mut scanned) {
+            break;
+        }
     }
 
     parse_response(&response)
 }
 
+/// How a response's body ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyFraming {
+    /// Complete once the response reaches this many bytes in total.
+    Length(usize),
+    /// Complete once the terminating zero-length chunk arrives.
+    Chunked,
+    /// Framed by the stream closing, so nothing but EOF ends it.
+    UntilClose,
+}
+
+fn body_framing(header_end: usize, headers: &HashMap<String, String>) -> BodyFraming {
+    if headers
+        .get("transfer-encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+    {
+        return BodyFraming::Chunked;
+    }
+    match headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        Some(length) => BodyFraming::Length(header_end + 4 + length),
+        None => BodyFraming::UntilClose,
+    }
+}
+
+/// Whether the response is whole, so that reading can stop without waiting
+/// for the peer to close.
+///
+/// Waiting for the close is not just slower: `tor-proto` ends every stream an
+/// application closes with `END MISC`, which arrives as an error rather than
+/// as end of stream, so a complete response would be thrown away.
+fn response_is_complete(
+    framing: &Option<BodyFraming>,
+    response: &[u8],
+    scanned: &mut usize,
+) -> bool {
+    match framing {
+        Some(BodyFraming::Length(total)) => response.len() >= *total,
+        Some(BodyFraming::Chunked) => {
+            // The terminator can appear inside chunk data, so it only decides
+            // where to look; whether the body really ends there is decided by
+            // decoding it, which happens at most once for a well-formed body.
+            const TERMINATOR: &[u8] = b"\r\n0\r\n\r\n";
+            let from = scanned.saturating_sub(TERMINATOR.len() - 1);
+            let found = find_subsequence(&response[from..], TERMINATOR).is_some();
+            *scanned = response.len();
+            found
+                && split_headers(response).is_some_and(|(header_end, _)| {
+                    decode_chunked_body(&response[header_end + 4..]).is_ok()
+                })
+        }
+        Some(BodyFraming::UntilClose) | None => false,
+    }
+}
+
+/// The end of the header block and the headers in it, once `data` holds a
+/// whole header block.
+fn split_headers(data: &[u8]) -> Option<(usize, HashMap<String, String>)> {
+    let header_end = find_subsequence(data, b"\r\n\r\n")?;
+    let header_text = std::str::from_utf8(&data[..header_end]).ok()?;
+    let headers = header_text
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        .collect();
+    Some((header_end, headers))
+}
+
 fn parse_response(data: &[u8]) -> Result<HttpResponse> {
-    let header_end = find_subsequence(data, b"\r\n\r\n")
+    let (header_end, headers) = split_headers(data)
         .ok_or_else(|| TorError::http_request("Invalid HTTP response: missing header boundary"))?;
     let header_text = std::str::from_utf8(&data[..header_end])
         .map_err(|error| TorError::http_request(format!("Invalid HTTP headers: {error}")))?;
-    let mut lines = header_text.lines();
-    let status_line = lines
+    let status_line = header_text
+        .lines()
         .next()
         .ok_or_else(|| TorError::http_request("Invalid HTTP response: missing status"))?;
     let status = status_line
@@ -142,10 +225,6 @@ fn parse_response(data: &[u8]) -> Result<HttpResponse> {
         .parse::<u16>()
         .map_err(|error| TorError::http_request(format!("Invalid HTTP status: {error}")))?;
 
-    let headers: HashMap<String, String> = lines
-        .filter_map(|line| line.split_once(':'))
-        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
-        .collect();
     let mut body = data[header_end + 4..].to_vec();
 
     if headers
@@ -337,5 +416,61 @@ mod tests {
     fn rejects_partial_chunks() {
         let error = decode_chunked_body(b"5\r\nHi").unwrap_err();
         assert!(error.to_string().contains("Incomplete HTTP chunk"));
+    }
+
+    /// A response with `Content-Length` is whole as soon as the body is
+    /// there. Waiting for the close instead would surface `tor-proto`'s
+    /// `END MISC` as an error and throw the response away.
+    #[test]
+    fn a_content_length_response_is_complete_without_a_close() {
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+        let mut scanned = 0;
+        let framing = split_headers(head).map(|(end, headers)| body_framing(end, &headers));
+        assert_eq!(framing, Some(BodyFraming::Length(head.len() + 5)));
+        assert!(!response_is_complete(&framing, head, &mut scanned));
+
+        let mut whole = head.to_vec();
+        whole.extend_from_slice(b"hello");
+        assert!(response_is_complete(&framing, &whole, &mut scanned));
+    }
+
+    #[test]
+    fn a_chunked_response_is_complete_at_its_terminating_chunk() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let framing = split_headers(head).map(|(end, headers)| body_framing(end, &headers));
+        assert_eq!(framing, Some(BodyFraming::Chunked));
+
+        let mut scanned = 0;
+        let mut response = head.to_vec();
+        response.extend_from_slice(b"5\r\nhello\r\n");
+        assert!(!response_is_complete(&framing, &response, &mut scanned));
+
+        response.extend_from_slice(b"0\r\n\r\n");
+        assert!(response_is_complete(&framing, &response, &mut scanned));
+    }
+
+    /// The terminator can appear inside chunk data, which is why finding it
+    /// only decides where to look and decoding decides whether it is the end.
+    #[test]
+    fn a_terminator_inside_chunk_data_does_not_end_the_response() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let framing = split_headers(head).map(|(end, headers)| body_framing(end, &headers));
+
+        let mut scanned = 0;
+        let mut response = head.to_vec();
+        response.extend_from_slice(b"7\r\n\r\n0\r\n\r\n\r\n");
+        assert!(!response_is_complete(&framing, &response, &mut scanned));
+
+        response.extend_from_slice(b"0\r\n\r\n");
+        assert!(response_is_complete(&framing, &response, &mut scanned));
+    }
+
+    /// Without either framing header only the stream closing ends the body.
+    #[test]
+    fn an_unframed_response_waits_for_the_close() {
+        let response = b"HTTP/1.1 200 OK\r\nServer: x\r\n\r\nbody";
+        let framing = split_headers(response).map(|(end, headers)| body_framing(end, &headers));
+        assert_eq!(framing, Some(BodyFraming::UntilClose));
+        assert!(!response_is_complete(&framing, response, &mut 0));
     }
 }

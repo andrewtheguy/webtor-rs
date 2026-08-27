@@ -356,4 +356,30 @@ mod tests {
         assert!(!layer.has_read_cipher());
         assert!(!layer.has_write_cipher());
     }
+
+    /// The largest payload a writer may hand the record layer is
+    /// `MAX_PLAINTEXT_SIZE - 1`: TLS 1.3 appends the content type to the
+    /// plaintext, and a peer answers a record over 2^14 with a
+    /// `record_overflow` alert and hangs up. `TlsStream::poll_write` splits
+    /// larger writes for exactly this reason.
+    #[test]
+    fn largest_allowed_payload_stays_within_the_record_limit() {
+        let mut layer = RecordLayer::new();
+        layer.set_write_cipher(&[0_u8; 32], &[0_u8; 12]).unwrap();
+
+        let payload = vec![0_u8; MAX_PLAINTEXT_SIZE - 1];
+        let record = layer
+            .encrypt_record_sync(CONTENT_TYPE_APPLICATION_DATA, &payload)
+            .unwrap();
+
+        // The plaintext the peer reconstructs is the payload plus the content
+        // type byte, which is what its 2^14 limit applies to.
+        assert_eq!(payload.len() + 1, MAX_PLAINTEXT_SIZE);
+        let declared = u16::from_be_bytes([record[3], record[4]]) as usize;
+        assert_eq!(declared, record.len() - 5);
+        assert!(
+            declared <= MAX_RECORD_SIZE,
+            "record of {declared} bytes is over the {MAX_RECORD_SIZE} byte limit"
+        );
+    }
 }

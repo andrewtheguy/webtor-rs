@@ -29,7 +29,7 @@ use tor_proto::client::channel::ClientChannelBuilder;
 use tor_proto::client::stream::DataStream;
 use tor_proto::memquota::{ChannelAccount, SpecificAccount};
 use tor_proto::peer::PeerAddr;
-use tracing::{debug, error, info};
+use tracing::{error, info, warn};
 
 pub struct TorClient {
     options: TorClientOptions,
@@ -102,8 +102,15 @@ impl TorClient {
 
     /// Open a raw stream to the URL's onion service and port.
     pub async fn open_stream(&self, url: &OnionUrl) -> Result<DataStream> {
+        self.connect_stream(url.host(), url.port()).await
+    }
+
+    /// Open a raw stream to an onion address and virtual port, with no
+    /// protocol layered on top. This is what talks to a service that speaks
+    /// something other than HTTP.
+    pub async fn connect_stream(&self, host: &str, port: u16) -> Result<DataStream> {
         self.ensure_ready().await?;
-        self.onion.connect(url.host(), url.port()).await
+        self.onion.connect(host, port).await
     }
 
     /// Publish a v3 onion service from this client and start answering
@@ -297,7 +304,13 @@ impl TorClient {
 
         wasm_bindgen_futures::spawn_local(async move {
             if let Err(error) = reactor.run().await {
-                debug!("Tor channel reactor stopped: {}", error);
+                // Every circuit rides this one channel, so losing it takes the
+                // whole client down. `debug!` is compiled out of a release
+                // build, which made that the quietest possible failure.
+                warn!(
+                    "Tor channel reactor stopped: {}",
+                    crate::error::error_chain(&error)
+                );
             }
         });
         Ok(channel)

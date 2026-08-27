@@ -189,6 +189,34 @@
         return { closed: false, seen };
       }),
 
+    // --- raw onion streams ------------------------------------------------
+    /**
+     * Open a raw stream to an onion address, send one line and return the
+     * line that comes back. This is what talks to a service that speaks
+     * something other than HTTP.
+     */
+    streamExchange: (address, port, message) =>
+      rethrowing(async () => {
+        const started = performance.now();
+        const stream = await client().connectStream(address, port);
+        try {
+          await stream.send(`${message}\n`);
+          const decoder = new TextDecoder();
+          let reply = '';
+          while (!reply.includes('\n')) {
+            const chunk = await stream.receive();
+            if (chunk == null) break;
+            reply += decoder.decode(chunk, { stream: true });
+          }
+          return {
+            reply: reply.replace(/\r?\n$/, ''),
+            seconds: Number(((performance.now() - started) / 1000).toFixed(1)),
+          };
+        } finally {
+          await stream.close().catch(() => {});
+        }
+      }),
+
     // --- onion service ----------------------------------------------------
     /** Publish a service from this page and return its address. */
     servicePublish: (options) =>
@@ -240,6 +268,46 @@
           }
         })();
         return 'serving';
+      }),
+
+    /**
+     * Echo every line back, the way `ptransfer tor serve` does, so a CLI
+     * client can talk to a service this page runs. Runs until the service is
+     * closed.
+     */
+    serviceServeEcho: () =>
+      rethrowing(async () => {
+        const decoder = new TextDecoder();
+        const running = service();
+        (async () => {
+          for (;;) {
+            const stream = await running.accept();
+            if (stream == null) return;
+            (async () => {
+              try {
+                let pending = '';
+                for (;;) {
+                  const chunk = await stream.receive();
+                  if (chunk == null) break;
+                  pending += decoder.decode(chunk, { stream: true });
+                  let split;
+                  while ((split = pending.indexOf('\n')) >= 0) {
+                    const line = pending.slice(0, split);
+                    pending = pending.slice(split + 1);
+                    state.served.push(line);
+                    show(`echoing ${line.length} byte(s)`);
+                    await stream.send(`${line}\n`);
+                  }
+                }
+              } catch (error) {
+                show(`echo failed: ${error}`);
+              } finally {
+                await stream.close().catch(() => {});
+              }
+            })();
+          }
+        })();
+        return 'echoing';
       }),
 
     /** The request lines the service has answered so far. */

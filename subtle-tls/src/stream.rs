@@ -9,7 +9,7 @@ use crate::handshake::{
     HANDSHAKE_CERTIFICATE_VERIFY, HANDSHAKE_ENCRYPTED_EXTENSIONS, HANDSHAKE_FINISHED,
     HANDSHAKE_SERVER_HELLO,
 };
-use crate::record::RecordLayer;
+use crate::record::{RecordLayer, MAX_PLAINTEXT_SIZE};
 use futures::io::{AsyncRead, AsyncWrite};
 use std::borrow::Cow;
 use std::io;
@@ -588,6 +588,14 @@ where
                 }
             }
         }
+
+        // One record carries at most 2^14 bytes of plaintext (RFC 8446 5.1),
+        // and TLS 1.3 counts the content type byte the record layer appends
+        // against that. A peer answers a larger record with a
+        // `record_overflow` alert and drops the connection, so a bigger write
+        // becomes several records: take what fits, report that, and let the
+        // caller come back for the rest.
+        let buf = &buf[..buf.len().min(MAX_PLAINTEXT_SIZE - 1)];
 
         // Encrypt the new data and write it
         // Encrypt using the record layer

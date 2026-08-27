@@ -111,6 +111,11 @@ export interface HarnessCalls {
     result: { address: string; seconds: number };
   };
   serviceServeHttp: { args: [body: string]; result: string };
+  serviceServeEcho: { args: []; result: string };
+  streamExchange: {
+    args: [address: string, port: number, message: string];
+    result: { reply: string; seconds: number };
+  };
   serviceRequests: { args: []; result: string[] };
   serviceStop: { args: []; result: string };
 }

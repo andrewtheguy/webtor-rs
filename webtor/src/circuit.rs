@@ -134,7 +134,10 @@ impl CircuitManager {
 
         wasm_bindgen_futures::spawn_local(async move {
             if let Err(error) = reactor.run().await {
-                error!("Circuit reactor finished with error: {}", error);
+                error!(
+                    "Circuit reactor finished with error: {}",
+                    crate::error::error_chain(&error)
+                );
             }
         });
 

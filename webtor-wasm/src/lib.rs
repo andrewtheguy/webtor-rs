@@ -364,6 +364,28 @@ impl WebtorClient {
         })
     }
 
+    /// Open a raw stream to an onion address and virtual port.
+    ///
+    /// Nothing is layered on top: the caller reads and writes the bytes the
+    /// service speaks. Use `fetch` for HTTP and `connectWebSocket` for
+    /// WebSocket; this is for everything else.
+    #[wasm_bindgen(js_name = connectStream)]
+    pub fn connect_stream(&self, address: String, port: u16) -> js_sys::Promise {
+        let client = self.client.clone();
+        self.run(async move {
+            let stream = client
+                .connect_stream(&address, port)
+                .await
+                .map_err(|error| js_error("Failed to open the onion stream", error))?;
+            let (reader, writer) = stream.split();
+            Ok(JsValue::from(OnionStream {
+                reader: Rc::new(Mutex::new(reader)),
+                writer: Rc::new(Mutex::new(writer)),
+                closed: Rc::new(Cell::new(false)),
+            }))
+        })
+    }
+
     /// Publish a v3 onion service from this client.
     ///
     /// The identity key is generated in the page and never stored, so every
@@ -656,7 +678,7 @@ impl WebtorOnionService {
             match service.accept().await {
                 Some(stream) => {
                     let (reader, writer) = stream.split();
-                    Ok(JsValue::from(OnionServiceStream {
+                    Ok(JsValue::from(OnionStream {
                         reader: Rc::new(Mutex::new(reader)),
                         writer: Rc::new(Mutex::new(writer)),
                         closed: Rc::new(Cell::new(false)),
@@ -679,18 +701,19 @@ impl WebtorOnionService {
     }
 }
 
-/// One client's stream to a service this page runs.
+/// A raw onion stream: either a client's stream into a service this page
+/// runs, or this page's stream out to somebody else's service.
 #[wasm_bindgen]
-pub struct OnionServiceStream {
+pub struct OnionStream {
     reader: Rc<Mutex<DataReader>>,
     writer: Rc<Mutex<DataWriter>>,
     closed: Rc<Cell<bool>>,
 }
 
 #[wasm_bindgen]
-impl OnionServiceStream {
-    /// Await the next bytes the client sent, or `null` at end of stream.
-    /// Reads and writes are independent, so a reply can go out while this is
+impl OnionStream {
+    /// Await the next bytes the peer sent, or `null` at end of stream.
+    /// Reads and writes are independent, so a write can go out while this is
     /// still pending.
     pub fn receive(&self) -> js_sys::Promise {
         let reader = self.reader.clone();
@@ -705,7 +728,7 @@ impl OnionServiceStream {
                 .await
                 .read(&mut buffer)
                 .await
-                .map_err(|error| js_error("Onion service read failed", error))?;
+                .map_err(|error| js_error("Onion stream read failed", error))?;
             if read == 0 {
                 return Ok(JsValue::NULL);
             }
@@ -714,18 +737,18 @@ impl OnionServiceStream {
         })
     }
 
-    /// Send text back to the client.
+    /// Send text to the peer.
     pub fn send(&self, text: String) -> js_sys::Promise {
         self.write(text.into_bytes())
     }
 
-    /// Send bytes back to the client.
+    /// Send bytes to the peer.
     #[wasm_bindgen(js_name = sendBytes)]
     pub fn send_bytes(&self, payload: Vec<u8>) -> js_sys::Promise {
         self.write(payload)
     }
 
-    /// Close this client's stream. The service keeps running.
+    /// Close this stream. Any service this page runs keeps running.
     pub fn close(&self) -> js_sys::Promise {
         let writer = self.writer.clone();
         let closed = self.closed.clone();
@@ -738,23 +761,23 @@ impl OnionServiceStream {
     }
 }
 
-impl OnionServiceStream {
+impl OnionStream {
     fn write(&self, payload: Vec<u8>) -> js_sys::Promise {
         let writer = self.writer.clone();
         let closed = self.closed.clone();
         future_to_promise(async move {
             if closed.get() {
-                return Err(JsValue::from_str("The onion service stream is closed"));
+                return Err(JsValue::from_str("The onion stream is closed"));
             }
             let mut writer = writer.lock().await;
             writer
                 .write_all(&payload)
                 .await
-                .map_err(|error| js_error("Onion service write failed", error))?;
+                .map_err(|error| js_error("Onion stream write failed", error))?;
             writer
                 .flush()
                 .await
-                .map_err(|error| js_error("Onion service write failed", error))?;
+                .map_err(|error| js_error("Onion stream write failed", error))?;
             Ok(JsValue::UNDEFINED)
         })
     }
