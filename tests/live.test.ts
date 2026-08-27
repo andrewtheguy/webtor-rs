@@ -241,6 +241,34 @@ describe('webtor-wasm over Tor', () => {
     assert.equal(result, 'refused');
   }, CASE_TIMEOUT);
 
+  // The other direction: this page runs the service, and the same client
+  // reaches it over the network. Everything in between — introduction points,
+  // the descriptor on the HSDirs, the rendezvous — is real Tor.
+  it('publishes an onion service and answers a request on it', async () => {
+    const body = `webtor onion service ${Date.now()}`;
+    const published = await harness.call('servicePublish', { introPoints: 3 });
+    console.log(`  published ${published.address} in ${published.seconds}s`);
+    assert.match(published.address, /^[a-z2-7]{56}\.onion$/);
+
+    try {
+      assert.equal(await harness.call('serviceServeHttp', body), 'serving');
+      const path = `/webtor-${Date.now()}`;
+      const response = await harness.call(
+        'fetch',
+        `http://${published.address}${path}`,
+        { timeoutMs: ATTEMPT_TIMEOUT_MS },
+      );
+      console.log(`  round trip in ${response.seconds}s`);
+      assert.equal(response.status, 200);
+      assert.equal(response.text, body);
+
+      const served = await harness.call('serviceRequests');
+      assert.deepEqual(served, [`GET ${path} HTTP/1.1`]);
+    } finally {
+      await harness.call('serviceStop').catch(() => {});
+    }
+  }, CASE_TIMEOUT);
+
   // Last: it takes the client away.
   it('refuses work once closed', async () => {
     assert.equal(await harness.call('close'), 'closed');

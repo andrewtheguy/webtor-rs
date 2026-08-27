@@ -201,6 +201,19 @@ pub(crate) fn select_hsdirs(
     blind_id: &HsBlindId,
     params: &HsDirParams,
 ) -> Vec<Relay> {
+    select_hsdirs_with_spread(relays, blind_id, params, HSDIR_SPREAD_FETCH)
+}
+
+/// The HSDirs responsible for `blind_id`, taking `spread` of them per
+/// replica: a service stores to `hsdir_spread_store` of them, one more than
+/// the `hsdir_spread_fetch` a client reads from, so that a client still finds
+/// the descriptor when one of the relays it asks has dropped it.
+pub(crate) fn select_hsdirs_with_spread(
+    relays: &[Relay],
+    blind_id: &HsBlindId,
+    params: &HsDirParams,
+    spread: usize,
+) -> Vec<Relay> {
     let mut ring: Vec<([u8; 32], &Relay)> = relays
         .iter()
         .filter(|relay| relay.flags.contains("HSDir"))
@@ -224,7 +237,7 @@ pub(crate) fn select_hsdirs(
             .iter()
             .chain(&ring[..position])
             .filter(|(index, _)| !chosen.contains(index))
-            .take(HSDIR_SPREAD_FETCH)
+            .take(spread)
             .copied()
             .collect();
         for (index, relay) in picked {
@@ -653,20 +666,35 @@ impl OnionConnector {
 fn intro_point_target(
     intro_point: &IntroPointDesc,
 ) -> Result<VerbatimLinkSpecCircTarget<OwnedCircTarget>> {
-    let link_specifiers = intro_point.link_specifiers();
+    verbatim_target(
+        intro_point.link_specifiers(),
+        intro_point.ipt_ntor_key(),
+        "Introduction point",
+    )
+}
+
+/// Build a circuit target from link specifiers that came from a peer, which
+/// the middle relay is asked to forward verbatim. A client does this for a
+/// descriptor's introduction points; a service does it for the rendezvous
+/// point an INTRODUCE2 names.
+pub(crate) fn verbatim_target(
+    link_specifiers: &[tor_linkspec::EncodedLinkSpec],
+    ntor_onion_key: &tor_llcrypto::pk::curve25519::PublicKey,
+    what: &str,
+) -> Result<VerbatimLinkSpecCircTarget<OwnedCircTarget>> {
     let chan_target =
         OwnedChanTargetBuilder::from_encoded_linkspecs(Strictness::Standard, link_specifiers)
             .map_err(|error| {
-                TorError::Onion(format!("Introduction point is not a valid target: {error}"))
+                TorError::Onion(format!("{what} is not a valid target: {error}"))
             })?;
     let mut builder = OwnedCircTarget::builder();
     *builder.chan_target() = chan_target;
     builder
-        .ntor_onion_key(*intro_point.ipt_ntor_key())
+        .ntor_onion_key(*ntor_onion_key)
         .protocols(Protocols::default());
-    let target = builder.build().map_err(|error| {
-        TorError::Onion(format!("Introduction point is not a valid target: {error}"))
-    })?;
+    let target = builder
+        .build()
+        .map_err(|error| TorError::Onion(format!("{what} is not a valid target: {error}")))?;
     Ok(VerbatimLinkSpecCircTarget::new(
         target,
         link_specifiers.to_vec(),

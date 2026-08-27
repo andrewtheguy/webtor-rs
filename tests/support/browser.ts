@@ -52,6 +52,10 @@ export interface WebSocketOptions {
   timeoutMs?: number;
 }
 
+export interface OnionServiceOptions {
+  introPoints?: number;
+}
+
 export interface HarnessFetchResult {
   status: number;
   ok: boolean;
@@ -102,6 +106,13 @@ export interface HarnessCalls {
     result: { closed: boolean; matched?: string; seen: string[] };
   };
   wsClose: { args: [id: number]; result: string };
+  servicePublish: {
+    args: [options?: OnionServiceOptions];
+    result: { address: string; seconds: number };
+  };
+  serviceServeHttp: { args: [body: string]; result: string };
+  serviceRequests: { args: []; result: string[] };
+  serviceStop: { args: []; result: string };
 }
 
 type HarnessMethod = keyof HarnessCalls;

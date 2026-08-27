@@ -11,6 +11,7 @@ use crate::error::{Result, TorError};
 use crate::http::{build_request, execute_request, HttpRequest, HttpResponse};
 use crate::onion_url::OnionUrl;
 use crate::onion::OnionConnector;
+use crate::onion_service::{OnionService, OnionServiceOptions};
 use crate::relay::RelayManager;
 use crate::retry::with_timeout;
 use crate::snowflake_webrtc::{SnowflakeWebRtcConfig, SnowflakeWebRtcStream};
@@ -33,6 +34,10 @@ use tracing::{debug, error, info};
 pub struct TorClient {
     options: TorClientOptions,
     directory_manager: Arc<DirectoryManager>,
+    /// Circuit and relay state, shared with the onion client and with any
+    /// service this client publishes.
+    circuit_manager: Arc<CircuitManager>,
+    relay_manager: Arc<RwLock<RelayManager>>,
     onion: OnionConnector,
     initialized: RwLock<bool>,
     bootstrap_lock: Mutex<()>,
@@ -57,15 +62,17 @@ impl TorClient {
             channel.clone(),
         ));
         let onion = OnionConnector::new(
-            circuit_manager,
+            circuit_manager.clone(),
             directory_manager.clone(),
-            relay_manager,
+            relay_manager.clone(),
             options.on_log.clone(),
         );
 
         Ok(Self {
             options,
             directory_manager,
+            circuit_manager,
+            relay_manager,
             onion,
             initialized: RwLock::new(false),
             bootstrap_lock: Mutex::new(()),
@@ -97,6 +104,25 @@ impl TorClient {
     pub async fn open_stream(&self, url: &OnionUrl) -> Result<DataStream> {
         self.ensure_ready().await?;
         self.onion.connect(url.host(), url.port()).await
+    }
+
+    /// Publish a v3 onion service from this client and start answering
+    /// introductions. The identity key is generated here and never stored, so
+    /// every call yields a new address that lives as long as the returned
+    /// service.
+    pub async fn publish_onion_service(
+        &self,
+        options: OnionServiceOptions,
+    ) -> Result<OnionService> {
+        self.ensure_ready().await?;
+        OnionService::launch(
+            self.circuit_manager.clone(),
+            self.directory_manager.clone(),
+            self.relay_manager.clone(),
+            options,
+            self.options.on_log.clone(),
+        )
+        .await
     }
 
     pub async fn ensure_ready(&self) -> Result<()> {

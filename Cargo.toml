@@ -54,8 +54,8 @@ tracing = { version = "0.1", features = ["release_max_level_info"] }
 # Tor-related dependencies (Arti 2.5.1)
 tor-rtcompat = { version = "0.45.0", default-features = false }
 tor-general-addr = "0.45.0"
-tor-proto = { version = "0.45.0", default-features = false, features = ["hs-client", "send-control-msg"] }
-tor-netdoc = { version = "0.45.0", default-features = false, features = ["hs-client"] }
+tor-proto = { version = "0.45.0", default-features = false, features = ["hs-client", "hs-service", "send-control-msg"] }
+tor-netdoc = { version = "0.45.0", default-features = false, features = ["hs-client", "hs-service"] }
 tor-linkspec = { version = "0.45.0", features = ["decode", "verbatim"] }
 tor-cell = { version = "0.45.0", features = ["hs"] }
 tor-hscrypto = "0.45.0"

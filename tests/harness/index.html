@@ -13,7 +13,13 @@
   } from '/webtor-wasm/pkg/webtor_wasm.js';
 
   const logElement = document.getElementById('log');
-  const state = { client: null, sockets: new Map(), nextSocket: 0 };
+  const state = {
+    client: null,
+    sockets: new Map(),
+    nextSocket: 0,
+    service: null,
+    served: [],
+  };
 
   function show(line) {
     logElement.textContent += `${line}\n`;
@@ -38,6 +44,11 @@
     const found = state.sockets.get(id);
     if (!found) throw new Error(`No socket ${id}; it may already be closed`);
     return found;
+  }
+
+  function service() {
+    if (!state.service) throw new Error('No onion service; call servicePublish first');
+    return state.service;
   }
 
   function client() {
@@ -176,6 +187,69 @@
           }
         }
         return { closed: false, seen };
+      }),
+
+    // --- onion service ----------------------------------------------------
+    /** Publish a service from this page and return its address. */
+    servicePublish: (options) =>
+      rethrowing(async () => {
+        const started = performance.now();
+        state.service = await client().publishOnionService(options);
+        return {
+          address: state.service.onionAddress,
+          seconds: Number(((performance.now() - started) / 1000).toFixed(1)),
+        };
+      }),
+
+    /**
+     * Answer every stream the service receives with one HTTP/1.1 response,
+     * recording the request line. Runs until the service is closed, so it is
+     * started and left alone rather than awaited.
+     */
+    serviceServeHttp: (body) =>
+      rethrowing(async () => {
+        const decoder = new TextDecoder();
+        const running = service();
+        (async () => {
+          for (;;) {
+            const stream = await running.accept();
+            if (stream == null) return;
+            (async () => {
+              try {
+                let request = '';
+                while (!request.includes('\r\n\r\n')) {
+                  const chunk = await stream.receive();
+                  if (chunk == null) break;
+                  request += decoder.decode(chunk, { stream: true });
+                }
+                const line = request.split('\r\n', 1)[0] ?? '';
+                state.served.push(line);
+                show(`served ${line}`);
+                await stream.send(
+                  `HTTP/1.1 200 OK\r\n` +
+                    `Content-Type: text/plain\r\n` +
+                    `Content-Length: ${body.length}\r\n` +
+                    `Connection: close\r\n\r\n${body}`,
+                );
+              } catch (error) {
+                show(`serve failed: ${error}`);
+              } finally {
+                await stream.close().catch(() => {});
+              }
+            })();
+          }
+        })();
+        return 'serving';
+      }),
+
+    /** The request lines the service has answered so far. */
+    serviceRequests: () => state.served.slice(),
+
+    serviceStop: () =>
+      rethrowing(async () => {
+        await service().close();
+        state.service = null;
+        return 'closed';
       }),
 
     wsClose: (id) =>
