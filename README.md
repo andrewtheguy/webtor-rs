@@ -38,7 +38,12 @@ them. Connecting to a `.onion` then runs the onion client in
 Publishing a service runs the same machinery from the other end, in
 `webtor/src/onion_service.rs`: generate an identity keypair and derive the
 address from it, establish introduction points with `ESTABLISH_INTRO`, sign a
-descriptor naming them and upload it to the responsible HSDirs. Every
+descriptor naming them and upload it to the responsible HSDirs — for the
+current time period and for the ones either side of it, so that a client whose
+consensus places it in a neighbouring period still finds the service. That is
+then repeated every 60 to 120 minutes, against a freshly downloaded consensus,
+which is what keeps the address alive past the descriptor's own lifetime and
+across the rotation that moves every ring. Every
 `INTRODUCE2` that arrives afterwards is answered by building a circuit to the
 client's rendezvous point, completing the hs-ntor handshake as the responder,
 and sending `RENDEZVOUS1`; the streams the client then begins are handed to the
@@ -118,7 +123,8 @@ caller's question, and no third-party address is compiled into the wasm.
   stored the descriptor, which is when clients can reach the address, to a
   service with `onionAddress`, `accept()` and `close()`. `accept()` resolves to
   the next client's `OnionStream`, or `null` once the service is closed;
-  `close()` withdraws the introduction points and every client circuit. The
+  `close()` withdraws the introduction points and every client circuit, and so
+  does freeing the service. The
   identity key is generated in the page and never stored, so every call yields
   a new address that lives as long as the service.
 - `directoryCache()` — the consensus, the authority certificates that check its

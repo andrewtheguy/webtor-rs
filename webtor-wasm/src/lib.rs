@@ -371,7 +371,9 @@ impl WebtorClient {
     /// The identity key is generated in the page and never stored, so every
     /// call yields a new `.onion` address that lives as long as the returned
     /// service. Resolves once an HSDir has accepted the descriptor, which is
-    /// when clients can reach it.
+    /// when clients can reach it; the descriptor is then republished in the
+    /// background, so the address keeps working past its expiry and across the
+    /// time period rotation that moves every HSDir ring.
     ///
     /// Options: `introPoints` (default 3, at most 6).
     #[wasm_bindgen(js_name = publishOnionService)]
@@ -678,6 +680,19 @@ impl WebtorOnionService {
             service.close().await;
             Ok(JsValue::UNDEFINED)
         })
+    }
+}
+
+impl Drop for WebtorOnionService {
+    /// Freeing the service from JavaScript withdraws it, the same as
+    /// `close()` without the promise to await.
+    ///
+    /// A pending `accept` holds the service too, so this is what has to end
+    /// it: without it, a page that let go of the object while waiting for a
+    /// client would leave the service published, the timer republishing it
+    /// and the introduction points answering, until the tab closed.
+    fn drop(&mut self) {
+        self.service.shutdown();
     }
 }
 

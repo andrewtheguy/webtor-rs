@@ -118,9 +118,11 @@ impl TorClient {
     /// every call yields a new address that lives as long as the returned
     /// service.
     ///
-    /// The descriptor is uploaded once and not renewed: the address stops
-    /// being reachable a few hours later, when the descriptor expires or the
-    /// onion service time period turns over.
+    /// The descriptor is uploaded for the current onion service time period
+    /// and the ones either side of it, and republished every hour or two —
+    /// and again shortly after a period turns over, whenever that comes
+    /// first. So the address stays reachable until the service is closed or
+    /// dropped, including across the turnover that moves every HSDir ring.
     pub async fn publish_onion_service(
         &self,
         options: OnionServiceOptions,

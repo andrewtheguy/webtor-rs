@@ -3,7 +3,7 @@
 use crate::authority::{authority_certs_path, parse_authority_certs, UncheckedConsensus};
 use crate::config::{LogCallback, LogType};
 use crate::error::{Result, TorError};
-use crate::onion::HsDirParams;
+use crate::onion::{HsDirParams, HsDirRings};
 use crate::relay::{Relay, RelayManager};
 use crate::time::system_time_now;
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
@@ -91,7 +91,7 @@ struct ProcessedDirectory {
     relays: Vec<Relay>,
     middle_count: usize,
     hsdir_count: usize,
-    hsdir_params: HsDirParams,
+    hsdir_params: HsDirRings,
 }
 
 /// Directory manager for handling network documents
@@ -99,7 +99,7 @@ pub struct DirectoryManager {
     pub relay_manager: Arc<RwLock<RelayManager>>,
     on_log: Option<LogCallback>,
     cache: Arc<RwLock<Option<DirectoryCache>>>,
-    hsdir_params: Arc<RwLock<Option<HsDirParams>>>,
+    hsdir_params: Arc<RwLock<Option<HsDirRings>>>,
     /// Microdescriptors from a supplied directory whose consensus was
     /// rejected, keyed by digest. Microdescriptors carry no lifetime of
     /// their own — the consensus names each one by digest — so a download
@@ -129,6 +129,23 @@ impl DirectoryManager {
     }
 
     pub async fn fetch_and_process_consensus(&self, channel: Arc<Channel>) -> Result<()> {
+        // Relays turn over slowly, so nearly every microdescriptor a new
+        // consensus names is one this client already holds. Keeping them turns
+        // a refresh from thousands of downloads over a single bridge circuit
+        // into a handful, which is what makes refreshing affordable at all.
+        let retained_is_empty = self.retained_microdescriptors.read().await.is_empty();
+        if retained_is_empty {
+            let installed = self
+                .cache
+                .read()
+                .await
+                .as_ref()
+                .map(|cache| index_microdescriptors(&cache.microdescriptors));
+            if let Some(installed) = installed {
+                *self.retained_microdescriptors.write().await = installed;
+            }
+        }
+
         self.log("Creating a Tor directory circuit...", LogType::Info);
         let tunnel = self.create_directory_tunnel(channel.clone()).await?;
         self.log("Tor directory circuit established", LogType::Success);
@@ -214,7 +231,7 @@ impl DirectoryManager {
     }
 
     /// The onion-service placement parameters of the installed consensus.
-    pub(crate) async fn hsdir_params(&self) -> Result<HsDirParams> {
+    pub(crate) async fn hsdir_params(&self) -> Result<HsDirRings> {
         self.hsdir_params
             .read()
             .await
@@ -633,7 +650,7 @@ fn process_directory_documents(
     consensus: &MdConsensus,
     microdescriptors_body: &str,
 ) -> Result<ProcessedDirectory> {
-    let hsdir_params = HsDirParams::from_consensus(consensus)?;
+    let hsdir_params = HsDirParams::compute(consensus)?;
 
     let mut router_statuses = HashMap::new();
     for router in consensus.relays() {
