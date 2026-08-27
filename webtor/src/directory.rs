@@ -3,7 +3,7 @@
 use crate::authority::{authority_certs_path, parse_authority_certs, UncheckedConsensus};
 use crate::config::{LogCallback, LogType};
 use crate::error::{Result, TorError};
-use crate::onion::HsDirParams;
+use crate::onion::{HsDirParams, HsDirRings};
 use crate::relay::{Relay, RelayManager};
 use crate::time::system_time_now;
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
@@ -91,7 +91,7 @@ struct ProcessedDirectory {
     relays: Vec<Relay>,
     middle_count: usize,
     hsdir_count: usize,
-    hsdir_params: HsDirParams,
+    hsdir_params: HsDirRings,
 }
 
 /// Directory manager for handling network documents
@@ -99,7 +99,7 @@ pub struct DirectoryManager {
     pub relay_manager: Arc<RwLock<RelayManager>>,
     on_log: Option<LogCallback>,
     cache: Arc<RwLock<Option<DirectoryCache>>>,
-    hsdir_params: Arc<RwLock<Option<HsDirParams>>>,
+    hsdir_params: Arc<RwLock<Option<HsDirRings>>>,
     /// Microdescriptors from a supplied directory whose consensus was
     /// rejected, keyed by digest. Microdescriptors carry no lifetime of
     /// their own — the consensus names each one by digest — so a download
@@ -214,7 +214,7 @@ impl DirectoryManager {
     }
 
     /// The onion-service placement parameters of the installed consensus.
-    pub(crate) async fn hsdir_params(&self) -> Result<HsDirParams> {
+    pub(crate) async fn hsdir_params(&self) -> Result<HsDirRings> {
         self.hsdir_params
             .read()
             .await
@@ -633,7 +633,7 @@ fn process_directory_documents(
     consensus: &MdConsensus,
     microdescriptors_body: &str,
 ) -> Result<ProcessedDirectory> {
-    let hsdir_params = HsDirParams::from_consensus(consensus)?;
+    let hsdir_params = HsDirParams::compute(consensus)?;
 
     let mut router_statuses = HashMap::new();
     for router in consensus.relays() {

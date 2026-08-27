@@ -5,7 +5,7 @@
 //! runs one:
 //!
 //! 1. generate an identity keypair, whose public half *is* the `.onion`
-//!    address, and blind it for the current time period;
+//!    address, and blind it for the current time period and its neighbours;
 //! 2. build a circuit to each of a few middle relays and send `ESTABLISH_INTRO`
 //!    there, so they become introduction points for this service;
 //! 3. sign a descriptor naming those introduction points and POST it to the
@@ -47,6 +47,7 @@ use tor_hscrypto::pk::{
     HsBlindId, HsId, HsIdKey, HsIdKeypair, HsIntroPtSessionIdKey, HsIntroPtSessionIdKeypair,
     HsSvcNtorKeypair,
 };
+use tor_hscrypto::time::TimePeriod;
 use tor_hscrypto::{RevisionCounter, Subcredential};
 use tor_linkspec::CircTarget;
 use tor_llcrypto::pk::ed25519;
@@ -112,6 +113,19 @@ struct IntroPointKeys {
     ntor: HsSvcNtorKeypair,
 }
 
+/// One signed descriptor, and where it belongs.
+///
+/// A service publishes the same introduction points under a different blinded
+/// identity in each time period it covers, so each period has a descriptor and
+/// a set of HSDirs of its own.
+struct Publication {
+    period: TimePeriod,
+    blind_id: HsBlindId,
+    descriptor: String,
+    /// The HSDirs to store it at, grouped by replica.
+    replicas: Vec<Vec<Relay>>,
+}
+
 /// An introduction point that has acknowledged our ESTABLISH_INTRO.
 struct EstablishedIntroPoint {
     /// Held so the circuit's reactor keeps running; INTRODUCE2 arrives here.
@@ -125,11 +139,10 @@ struct EstablishedIntroPoint {
 /// Dropping it, or calling [`OnionService::close`], tears down the
 /// introduction points; the descriptor then expires on its own.
 ///
-/// The descriptor is published once and never renewed, so the address stops
-/// being reachable after `DESCRIPTOR_LIFETIME`, or sooner if the onion
-/// service time period turns over before that. A service meant to outlive
-/// that would have to rebuild and re-upload the descriptor in the
-/// background.
+/// The descriptor is published once, for the current time period and the ones
+/// either side of it, and never renewed. The address therefore stops being
+/// reachable after `DESCRIPTOR_LIFETIME`; a service meant to outlive that
+/// would have to rebuild and re-upload the descriptor in the background.
 pub struct OnionService {
     address: String,
     incoming: Mutex<mpsc::Receiver<DataStream>>,
@@ -144,7 +157,10 @@ pub struct OnionService {
 /// The parts of a running service that its background tasks share.
 struct ServiceState {
     circuit_manager: Arc<CircuitManager>,
-    subcredential: Subcredential,
+    /// One per time period the descriptor was published for. A client
+    /// encrypts its INTRODUCE2 to the subcredential of the period it found
+    /// the descriptor under, so every one of them has to be tried.
+    subcredentials: Vec<Subcredential>,
     on_log: Option<LogCallback>,
     /// Introduction circuits and live client circuits. A tunnel's reactor
     /// stops when its last handle is dropped, so they are held here.
@@ -186,15 +202,27 @@ impl OnionService {
             .display_unredacted()
             .to_string();
 
-        let params = directory_manager.hsdir_params().await?;
-        let (blind_key, blind_keypair, subcredential) = identity
-            .compute_blinded_key(params.time_period())
-            .map_err(|error| TorError::Onion(format!("Key blinding failed: {error}")))?;
-        let blind_id: HsBlindId = blind_key.id();
+        // The descriptor goes to the ring of the period this consensus is in
+        // and to the rings either side of it. A peer whose own consensus has
+        // not turned over yet — or has turned over already — computes one of
+        // those neighbouring rings, and publishing to the current one alone
+        // would leave it looking at HSDirs that hold nothing.
+        let rings = directory_manager.hsdir_params().await?;
+        let mut blinded = Vec::with_capacity(1 + rings.secondary.len());
+        for params in std::iter::once(&rings.current).chain(rings.secondary.iter()) {
+            let (blind_key, blind_keypair, subcredential) = identity
+                .compute_blinded_key(params.time_period())
+                .map_err(|error| TorError::Onion(format!("Key blinding failed: {error}")))?;
+            blinded.push((params.clone(), blind_key, blind_keypair, subcredential));
+        }
+        let subcredentials = blinded
+            .iter()
+            .map(|(_, _, _, subcredential)| *subcredential)
+            .collect();
 
         let state = Arc::new(ServiceState {
             circuit_manager,
-            subcredential,
+            subcredentials,
             on_log,
             tunnels: RwLock::new(Vec::new()),
             aborts: RwLock::new(Vec::new()),
@@ -227,25 +255,64 @@ impl OnionService {
         }
 
         let now = system_time_now();
-        let descriptor = build_descriptor(
-            &blind_key,
-            &blind_keypair,
-            &subcredential,
-            &descriptors,
-            &params.time_period(),
-            now,
-            &mut rng,
-        )?;
-        drop(blind_keypair);
-
         let relays = relay_manager.read().await.relays.clone();
-        let replicas = select_hsdirs_with_spread(&relays, &blind_id, &params, HSDIR_SPREAD_STORE);
-        if replicas.is_empty() {
-            return Err(TorError::Onion(
-                "The directory has no HSDir relays to publish the descriptor to".to_string(),
-            ));
+        let mut publications = Vec::with_capacity(blinded.len());
+        for (params, blind_key, blind_keypair, subcredential) in &blinded {
+            let descriptor = build_descriptor(
+                blind_key,
+                blind_keypair,
+                subcredential,
+                &descriptors,
+                &params.time_period(),
+                now,
+                &mut rng,
+            )?;
+            let blind_id: HsBlindId = blind_key.id();
+            let replicas =
+                select_hsdirs_with_spread(&relays, &blind_id, params, HSDIR_SPREAD_STORE);
+            if replicas.is_empty() {
+                return Err(TorError::Onion(
+                    "The directory has no HSDir relays to publish the descriptor to".to_string(),
+                ));
+            }
+            publications.push(Publication {
+                period: params.time_period(),
+                blind_id,
+                descriptor,
+                replicas,
+            });
         }
-        publish_descriptor(&state, &replicas, &blind_id, &descriptor).await?;
+        // The blinding keypairs have done their work in the signatures.
+        drop(blinded);
+
+        // The current period decides whether the address works at all, since
+        // that is where a peer reading this same consensus looks; the
+        // neighbours only widen who else can find it, so one of them failing
+        // is not a reason to refuse to serve.
+        let (current, neighbours) = publications
+            .split_first()
+            .expect("the current period is always published");
+        let (current_outcome, neighbour_outcomes) = futures::join!(
+            publish_descriptor(&state, current),
+            futures::future::join_all(
+                neighbours
+                    .iter()
+                    .map(|publication| publish_descriptor(&state, publication))
+            )
+        );
+        current_outcome?;
+        for (publication, outcome) in neighbours.iter().zip(neighbour_outcomes) {
+            if let Err(error) = outcome {
+                state.log(
+                    &format!(
+                        "The descriptor for time period {} was not published, so a client an \
+                         interval out of step will not find this service: {error}",
+                        publication.period.interval_num()
+                    ),
+                    LogType::Error,
+                );
+            }
+        }
 
         // From here on the service answers introductions on its own.
         let (abort_handle, abort_registration) = AbortHandle::new_pair();
@@ -492,12 +559,13 @@ fn build_descriptor<R: rand::Rng + rand::CryptoRng>(
 /// client falls back on when the relay it asked has dropped its copy — but
 /// nothing needs to wait for them, and one unreachable HSDir would otherwise
 /// hold publishing up for the whole of `UPLOAD_TIMEOUT`.
-async fn publish_descriptor(
-    state: &Arc<ServiceState>,
-    replicas: &[Vec<Relay>],
-    blind_id: &HsBlindId,
-    descriptor: &str,
-) -> Result<()> {
+async fn publish_descriptor(state: &Arc<ServiceState>, publication: &Publication) -> Result<()> {
+    let Publication {
+        period,
+        blind_id,
+        descriptor,
+        replicas,
+    } = publication;
     let total: usize = replicas.iter().map(Vec::len).sum();
     debug!(
         "Publishing a {} byte descriptor for {} to {} HSDirs across {} replicas",
@@ -573,7 +641,9 @@ async fn publish_descriptor(
     let ready = stored.iter().filter(|count| **count > 0).count();
     state.log(
         &format!(
-            "Descriptor stored on {ready} of {} replicas ({accepted} of {total} HSDirs so far)",
+            "Descriptor for time period {} stored on {ready} of {} replicas ({accepted} of \
+             {total} HSDirs so far)",
+            period.interval_num(),
             replicas.len()
         ),
         LogType::Success,
@@ -614,7 +684,7 @@ async fn serve_introduction(
         &mut rand::rng(),
         &keys.ntor,
         &keys.session_id_key,
-        &[state.subcredential],
+        &state.subcredentials,
         message.encoded_header(),
         message.encrypted_body(),
     )

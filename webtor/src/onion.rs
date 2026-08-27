@@ -73,20 +73,41 @@ const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(90);
 const INTRODUCE_TIMEOUT: Duration = Duration::from_secs(90);
 const RENDEZVOUS_COMPLETION_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// What the consensus says about where descriptors live right now.
+/// What the consensus says about where descriptors live in one time period.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HsDirParams {
     time_period: TimePeriod,
     shared_rand: [u8; 32],
 }
 
+/// The rings one consensus defines: the period it is itself in, and the
+/// periods either side of it.
+///
+/// A client uses `current` and nothing else, since that is the period every
+/// party reading the same consensus computes. A *service* publishes to the
+/// neighbours as well, and that is what keeps it reachable by a peer whose
+/// consensus sits on the other side of a period boundary: consensuses stay
+/// valid for three hours, so two peers can legitimately disagree about which
+/// period is current for that long, and a descriptor placed on one ring alone
+/// is invisible to every peer on the other. C tor and Arti both publish to
+/// the neighbouring periods for exactly this reason.
+#[derive(Clone, Debug)]
+pub(crate) struct HsDirRings {
+    /// The period the consensus is in.
+    pub(crate) current: HsDirParams,
+    /// The previous and next periods, for those the consensus names a shared
+    /// random value covering. No disaster fallback is used here: a ring no
+    /// other party would compute the same way is worth nothing.
+    pub(crate) secondary: Vec<HsDirParams>,
+}
+
 impl HsDirParams {
-    /// Derive the current time period and its shared random value.
+    /// Derive the rings this consensus defines.
     ///
-    /// Mirrors `tor-netdir`'s `HsDirParams::compute` for the current period
-    /// only: a client needs the period the consensus is in, not the
-    /// neighbouring ones a service also publishes to.
-    pub(crate) fn from_consensus(consensus: &MdConsensus) -> Result<Self> {
+    /// Mirrors `tor-netdir`'s `HsDirParams::compute`, including its treatment
+    /// of a missing shared random value: a disaster value for the current
+    /// period, and nothing at all for the neighbours.
+    pub(crate) fn compute(consensus: &MdConsensus) -> Result<HsDirRings> {
         let minutes = consensus
             .params()
             .get("hsdir_interval")
@@ -99,57 +120,89 @@ impl HsDirParams {
         let valid_after = lifetime.valid_after();
         let voting_period = lifetime.voting_period();
         let offset = voting_period * VOTING_PERIODS_IN_OFFSET;
-        let time_period = TimePeriod::new(length, valid_after, offset).map_err(|error| {
+        let period = TimePeriod::new(length, valid_after, offset).map_err(|error| {
             TorError::Onion(format!(
                 "Consensus valid-after does not fall in a time period: {error}"
             ))
         })?;
-        let period_start = time_period
-            .range()
-            .map_err(|error| TorError::Onion(format!("Time period is unrepresentable: {error}")))?
-            .start;
 
-        let current = consensus.shared_rand_cur();
-        let previous = consensus.shared_rand_prev();
-        let srv_interval = match (current, previous) {
-            (Some(current), Some(previous)) => match (current.timestamp(), previous.timestamp()) {
-                (Some(current_at), Some(previous_at)) => current_at
-                    .duration_since(previous_at)
-                    .unwrap_or(voting_period * VOTING_PERIODS_IN_SRV_ROUND),
-                _ => voting_period * VOTING_PERIODS_IN_SRV_ROUND,
-            },
-            _ => voting_period * VOTING_PERIODS_IN_SRV_ROUND,
-        };
-
-        let mut values: Vec<([u8; 32], Range<SystemTime>)> = Vec::new();
-        if let Some(current) = current {
-            let begin = current
-                .timestamp()
-                .unwrap_or_else(|| start_of_day_containing(valid_after));
-            values.push(((*current.value()).into(), begin..begin + srv_interval));
-        }
-        if let Some(previous) = previous {
-            let begin = previous
-                .timestamp()
-                .unwrap_or_else(|| start_of_day_containing(valid_after) - ONE_DAY);
-            values.push(((*previous.value()).into(), begin..begin + srv_interval));
-        }
-
-        let shared_rand = values
-            .iter()
-            .find(|(_, lifespan)| lifespan.contains(&period_start))
-            .map(|(value, _)| *value)
-            .unwrap_or_else(|| disaster_shared_rand(time_period));
-
-        Ok(Self {
-            time_period,
-            shared_rand,
-        })
+        let values = shared_random_values(consensus, valid_after, voting_period);
+        Ok(rings_for(period, &values))
     }
 
     pub(crate) fn time_period(&self) -> TimePeriod {
         self.time_period
     }
+}
+
+/// Every shared random value the consensus carries, each with the span over
+/// which it is the most recent one.
+fn shared_random_values(
+    consensus: &MdConsensus,
+    valid_after: SystemTime,
+    voting_period: Duration,
+) -> Vec<([u8; 32], Range<SystemTime>)> {
+    let current = consensus.shared_rand_cur();
+    let previous = consensus.shared_rand_prev();
+    let srv_interval = match (current, previous) {
+        (Some(current), Some(previous)) => match (current.timestamp(), previous.timestamp()) {
+            (Some(current_at), Some(previous_at)) => current_at
+                .duration_since(previous_at)
+                .unwrap_or(voting_period * VOTING_PERIODS_IN_SRV_ROUND),
+            _ => voting_period * VOTING_PERIODS_IN_SRV_ROUND,
+        },
+        _ => voting_period * VOTING_PERIODS_IN_SRV_ROUND,
+    };
+
+    let mut values: Vec<([u8; 32], Range<SystemTime>)> = Vec::new();
+    if let Some(current) = current {
+        let begin = current
+            .timestamp()
+            .unwrap_or_else(|| start_of_day_containing(valid_after));
+        values.push(((*current.value()).into(), begin..begin + srv_interval));
+    }
+    if let Some(previous) = previous {
+        let begin = previous
+            .timestamp()
+            .unwrap_or_else(|| start_of_day_containing(valid_after) - ONE_DAY);
+        values.push(((*previous.value()).into(), begin..begin + srv_interval));
+    }
+    values
+}
+
+/// The rings around `period`, given every shared random value on offer.
+///
+/// The current period always gets a ring, falling back to the disaster value
+/// the whole network would agree on. Its neighbours only get one when a shared
+/// random value covers them, since a ring nobody else computes the same way
+/// would place the descriptor where no client will look.
+fn rings_for(period: TimePeriod, values: &[([u8; 32], Range<SystemTime>)]) -> HsDirRings {
+    let current = params_for_period(values, period).unwrap_or(HsDirParams {
+        time_period: period,
+        shared_rand: disaster_shared_rand(period),
+    });
+    let secondary = [period.prev(), period.next()]
+        .into_iter()
+        .flatten()
+        .filter_map(|neighbour| params_for_period(values, neighbour))
+        .collect();
+    HsDirRings { current, secondary }
+}
+
+/// The ring parameters for `period`, when the consensus names a shared random
+/// value covering the moment that period begins.
+fn params_for_period(
+    values: &[([u8; 32], Range<SystemTime>)],
+    period: TimePeriod,
+) -> Option<HsDirParams> {
+    let start = period.range().ok()?.start;
+    values
+        .iter()
+        .find(|(_, lifespan)| lifespan.contains(&start))
+        .map(|(value, _)| HsDirParams {
+            time_period: period,
+            shared_rand: *value,
+        })
 }
 
 fn start_of_day_containing(when: SystemTime) -> SystemTime {
@@ -382,7 +435,9 @@ impl OnionConnector {
         let id_key = HsIdKey::try_from(hsid)
             .map_err(|error| TorError::Onion(format!("Invalid onion address {host}: {error}")))?;
 
-        let params = self.directory_manager.hsdir_params().await?;
+        // A client looks in the period its own consensus is in, and nowhere
+        // else: the service is the side that covers the neighbouring periods.
+        let params = self.directory_manager.hsdir_params().await?.current;
         let (blind_key, subcredential) = id_key
             .compute_blinded_key(params.time_period())
             .map_err(|error| TorError::Onion(format!("Key blinding failed: {error}")))?;
@@ -733,6 +788,64 @@ mod tests {
             time_period,
             shared_rand: [0x43; 32],
         }
+    }
+
+    /// The day-long period numbered `interval`, as `params()` builds its own.
+    fn period_at(interval: u64) -> TimePeriod {
+        let period = TimePeriod::new(
+            Duration::from_secs(24 * 3600),
+            SystemTime::UNIX_EPOCH + Duration::from_secs((interval + 1) * 24 * 3600 + 3600),
+            Duration::from_secs(12 * 3600),
+        )
+        .unwrap();
+        assert_eq!(period.interval_num(), interval);
+        period
+    }
+
+    /// A shared random value covering `days` of periods from `from` onwards.
+    fn srv(value: u8, from: u64, days: u64) -> ([u8; 32], Range<SystemTime>) {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(from * 24 * 3600 + 12 * 3600);
+        ([value; 32], start..start + Duration::from_secs(days * 24 * 3600))
+    }
+
+    /// What keeps a service reachable across a period boundary: a peer whose
+    /// consensus has not turned over yet computes the previous ring, and one
+    /// whose consensus turned over early computes the next.
+    #[test]
+    fn publishes_to_both_neighbouring_periods() {
+        let period = period_at(42);
+        let rings = rings_for(period, &[srv(0x43, 40, 5)]);
+        assert_eq!(rings.current.time_period(), period);
+        assert_eq!(rings.current.shared_rand, [0x43; 32]);
+        let periods: Vec<u64> = rings
+            .secondary
+            .iter()
+            .map(|params| params.time_period().interval_num())
+            .collect();
+        assert_eq!(periods, vec![41, 43]);
+    }
+
+    /// A neighbour no shared random value covers is left out rather than
+    /// given a value of this client's own invention.
+    #[test]
+    fn omits_a_neighbour_with_no_shared_random_value() {
+        let rings = rings_for(period_at(42), &[srv(0x43, 41, 2)]);
+        let periods: Vec<u64> = rings
+            .secondary
+            .iter()
+            .map(|params| params.time_period().interval_num())
+            .collect();
+        assert_eq!(periods, vec![41]);
+    }
+
+    /// The current period always has a ring, even with nothing to build it
+    /// from: the disaster value is what every party falls back to together.
+    #[test]
+    fn falls_back_to_the_disaster_value_for_the_current_period() {
+        let period = period_at(42);
+        let rings = rings_for(period, &[]);
+        assert_eq!(rings.current.shared_rand, disaster_shared_rand(period));
+        assert!(rings.secondary.is_empty());
     }
 
     /// The index vectors `tor-netdir` checks its ring against.

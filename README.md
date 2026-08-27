@@ -38,7 +38,9 @@ them. Connecting to a `.onion` then runs the onion client in
 Publishing a service runs the same machinery from the other end, in
 `webtor/src/onion_service.rs`: generate an identity keypair and derive the
 address from it, establish introduction points with `ESTABLISH_INTRO`, sign a
-descriptor naming them and upload it to the responsible HSDirs. Every
+descriptor naming them and upload it to the responsible HSDirs — for the
+current time period and for the ones either side of it, so that a client whose
+consensus places it in a neighbouring period still finds the service. Every
 `INTRODUCE2` that arrives afterwards is answered by building a circuit to the
 client's rendezvous point, completing the hs-ntor handshake as the responder,
 and sending `RENDEZVOUS1`; the streams the client then begins are handed to the
