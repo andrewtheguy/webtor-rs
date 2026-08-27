@@ -73,6 +73,23 @@ describe('webtor-wasm over Tor', () => {
     }
     const { seconds } = await harness.call('create', options, seedUrl);
     console.log(`  client ready in ${seconds}s`);
+
+    // What the binding's `verifyOnion` option used to do before `create`
+    // resolved, now that no third-party address is compiled into the wasm:
+    // prove the client completes a rendezvous before any case depends on it,
+    // so a broken bootstrap fails here with one message naming what it tried
+    // instead of as whichever case happened to run first.
+    const verified = await firstReachable(HTTP_TARGETS, (url) =>
+      harness.call('fetch', url, { timeoutMs: ATTEMPT_TIMEOUT_MS }),
+    );
+    assert.equal(
+      verified.result.status,
+      200,
+      `${verified.target} answered HTTP ${verified.result.status}`,
+    );
+    console.log(
+      `  client verified against ${verified.target} in ${verified.result.seconds}s`,
+    );
   });
 
   after(async () => {
@@ -239,6 +256,34 @@ describe('webtor-wasm over Tor', () => {
       }
     });
     assert.equal(result, 'refused');
+  }, CASE_TIMEOUT);
+
+  // The other direction: this page runs the service, and the same client
+  // reaches it over the network. Everything in between — introduction points,
+  // the descriptor on the HSDirs, the rendezvous — is real Tor.
+  it('publishes an onion service and answers a request on it', async () => {
+    const body = `webtor onion service ${Date.now()}`;
+    const published = await harness.call('servicePublish', { introPoints: 3 });
+    console.log(`  published ${published.address} in ${published.seconds}s`);
+
+    try {
+      assert.match(published.address, /^[a-z2-7]{56}\.onion$/);
+      assert.equal(await harness.call('serviceServeHttp', body), 'serving');
+      const path = `/webtor-${Date.now()}`;
+      const response = await harness.call(
+        'fetch',
+        `http://${published.address}${path}`,
+        { timeoutMs: ATTEMPT_TIMEOUT_MS },
+      );
+      console.log(`  round trip in ${response.seconds}s`);
+      assert.equal(response.status, 200);
+      assert.equal(response.text, body);
+
+      const served = await harness.call('serviceRequests');
+      assert.deepEqual(served, [`GET ${path} HTTP/1.1`]);
+    } finally {
+      await harness.call('serviceStop').catch(() => {});
+    }
   }, CASE_TIMEOUT);
 
   // Last: it takes the client away.

@@ -39,6 +39,8 @@ const MIN_HSDIR_RELAYS: usize = 100;
 /// serving it is untrusted, so this caps an endless stream and a decompression
 /// bomb; it does not bound directory data supplied by the embedding page.
 const MAX_DIRECTORY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+/// A response whose headers run past this is not one a directory sent.
+const MAX_DIRECTORY_HEADER_BYTES: usize = 8 * 1024;
 const DIRECTORY_CACHE_VERSION: u32 = 3;
 /// Bounds on the bridge's directory service. `tor-proto` has none of its
 /// own, and an instance behind the Snowflake fingerprint sometimes takes a
@@ -478,6 +480,96 @@ pub(crate) async fn fetch_directory_document(
         .map_err(|e| TorError::serialization(format!("Directory document is not UTF-8: {}", e)))
 }
 
+/// POST one document to the directory cache at the end of `tunnel`, with the
+/// request shape a Tor onion service uses to publish its descriptor. The
+/// response body is empty; only its status matters.
+pub(crate) async fn post_directory_document(
+    tunnel: &Arc<ClientTunnel>,
+    path: &str,
+    document: &str,
+) -> Result<()> {
+    let mut stream = tunnel
+        .clone()
+        .begin_dir_stream()
+        .await
+        .map_err(|e| TorError::Internal(format!("Failed to begin dir stream: {}", e)))?;
+    // The same request shape Arti sends: no Host, no Content-Type, and the
+    // encodings every Tor speaks.
+    let request = format!(
+        "POST {} HTTP/1.0\r\n\
+         Accept-Encoding: deflate, identity\r\n\
+         Content-Length: {}\r\n\
+         \r\n{}",
+        path,
+        document.len(),
+        document
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| TorError::Network(format!("Failed to write dir request: {}", e)))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| TorError::Network(format!("Failed to flush dir request: {}", e)))?;
+    // A stored descriptor is answered with a status line and nothing else, and
+    // the relay may hold the stream open afterwards — so this reads to the end
+    // of the headers rather than to end of stream.
+    let status = read_directory_status(&mut stream).await?;
+    if status != 200 {
+        return Err(TorError::DirectoryStatus(status));
+    }
+    Ok(())
+}
+
+/// Read one directory response's headers and return its HTTP status.
+async fn read_directory_status<R>(stream: &mut R) -> Result<u16>
+where
+    R: futures::AsyncRead + Unpin,
+{
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        if let Some((body_start, _)) = directory_response_metadata(&response)? {
+            let header_text = std::str::from_utf8(&response[..body_start - 4]).map_err(|e| {
+                TorError::ConsensusFetch(format!("Directory response headers are not UTF-8: {e}"))
+            })?;
+            return parse_directory_status(header_text);
+        }
+        if response.len() > MAX_DIRECTORY_HEADER_BYTES {
+            return Err(TorError::ConsensusFetch(
+                "Directory response headers were too long".to_string(),
+            ));
+        }
+        let read = stream.read(&mut buffer).await.map_err(|e| {
+            TorError::Network(format!("Failed to read directory response: {e}"))
+        })?;
+        if read == 0 {
+            return Err(TorError::ConsensusFetch(
+                "Directory closed the stream before answering".to_string(),
+            ));
+        }
+        response.extend_from_slice(&buffer[..read]);
+    }
+}
+
+/// The status code out of a response's header block.
+fn parse_directory_status(header_text: &str) -> Result<u16> {
+    let status_line = header_text.lines().next().ok_or_else(|| {
+        TorError::ConsensusFetch("Directory response had no HTTP status".to_string())
+    })?;
+    status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| {
+            TorError::ConsensusFetch("Directory response had an invalid HTTP status".to_string())
+        })?
+        .parse::<u16>()
+        .map_err(|e| {
+            TorError::ConsensusFetch(format!("Directory response status was invalid: {e}"))
+        })
+}
+
 fn select_microdescriptor_digests(consensus: &MdConsensus) -> Result<Vec<[u8; 32]>> {
     let mut middle_digests: Vec<[u8; 32]> = consensus
         .relays()
@@ -752,23 +844,12 @@ fn decode_directory_response(response: &[u8]) -> Result<Vec<u8>> {
     let header_text = std::str::from_utf8(&response[..body_start - 4]).map_err(|e| {
         TorError::ConsensusFetch(format!("Directory response headers are not UTF-8: {}", e))
     })?;
-    let mut lines = header_text.lines();
-    let status_line = lines.next().ok_or_else(|| {
-        TorError::ConsensusFetch("Directory response had no HTTP status".to_string())
-    })?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| {
-            TorError::ConsensusFetch("Directory response had an invalid HTTP status".to_string())
-        })?
-        .parse::<u16>()
-        .map_err(|e| {
-            TorError::ConsensusFetch(format!("Directory response status was invalid: {}", e))
-        })?;
+    let status = parse_directory_status(header_text)?;
     if status != 200 {
         return Err(TorError::DirectoryStatus(status));
     }
+    let mut lines = header_text.lines();
+    lines.next();
 
     let mut content_encoding = None;
     for line in lines {

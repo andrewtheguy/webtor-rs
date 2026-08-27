@@ -11,36 +11,55 @@
 
 use crate::time::Instant;
 use futures::{AsyncRead, AsyncWrite};
+use gloo_timers::future::TimeoutFuture;
 use kcp::Kcp;
+use std::collections::VecDeque;
+use std::future::Future;
 use std::io::{self, Write};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tracing::debug;
 
-/// Output buffer that collects data from KCP for sending
+/// How often KCP's own clock runs while the transport is quiet.
+///
+/// Retransmissions, window probes and any segment the send window would not
+/// take when it was queued leave KCP only from `update()`. Nothing else calls
+/// it once both ends fall silent, so without this a burst that fills the
+/// window — several circuits created at once, or a descriptor upload — wedges
+/// the connection permanently.
+const TICK_MIN_MS: u32 = 10;
+const TICK_MAX_MS: u32 = 100;
+
+/// Where KCP puts the packets it wants sent.
+///
+/// KCP is a datagram protocol: it calls `write` once per packet, each no
+/// larger than its MTU, and the peer's KCP expects to receive them the same
+/// way. So each one is kept separate here and handed to the transport on its
+/// own, which is what turns it into one Turbo frame. Concatenating them into
+/// a single write would hand the bridge one oversized packet instead of the
+/// dozen it is waiting for.
 #[derive(Clone)]
 struct OutputBuffer {
-    data: Arc<Mutex<Vec<u8>>>,
+    packets: Arc<Mutex<VecDeque<Vec<u8>>>>,
 }
 
 impl OutputBuffer {
     fn new() -> Self {
         Self {
-            data: Arc::new(Mutex::new(Vec::new())),
+            packets: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
-    fn take(&self) -> Vec<u8> {
-        let mut data = self.data.lock().unwrap();
-        std::mem::take(&mut *data)
+    fn take(&self) -> VecDeque<Vec<u8>> {
+        let mut packets = self.packets.lock().unwrap();
+        std::mem::take(&mut *packets)
     }
-
 }
 
 impl Write for OutputBuffer {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.data.lock().unwrap().extend_from_slice(buf);
+        self.packets.lock().unwrap().push_back(buf.to_vec());
         Ok(buf.len())
     }
 
@@ -91,8 +110,10 @@ pub struct KcpStream<S> {
     output: OutputBuffer,
     transport: S,
     start_time: Instant,
-    /// Pending output data that needs to be written to transport
-    pending_write: Vec<u8>,
+    /// Packets KCP has produced that the transport has not taken yet.
+    pending_write: VecDeque<Vec<u8>>,
+    /// Wakes the reader when KCP's clock next needs to run.
+    tick: Option<TimeoutFuture>,
 }
 
 impl<S> KcpStream<S> {
@@ -110,12 +131,62 @@ impl<S> KcpStream<S> {
             output,
             transport,
             start_time: Instant::now(),
-            pending_write: Vec::new(),
+            pending_write: VecDeque::new(),
+            tick: None,
         }
     }
 
     fn current_ms(&self) -> u32 {
         self.start_time.elapsed().as_millis() as u32
+    }
+}
+
+impl<S: AsyncWrite + Unpin> KcpStream<S> {
+    /// Hand KCP's packets to the transport one at a time, so each becomes its
+    /// own frame, and keep whatever the transport would not take yet.
+    fn drain_output(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.pending_write.append(&mut self.output.take());
+        while let Some(packet) = self.pending_write.pop_front() {
+            match Pin::new(&mut self.transport).poll_write(cx, &packet) {
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {
+                    self.pending_write.push_front(packet);
+                    return Poll::Pending;
+                }
+            }
+        }
+        Pin::new(&mut self.transport).poll_flush(cx)
+    }
+
+    /// Run KCP's clock while the transport has nothing to deliver, and arm
+    /// the next run. Always returns `Pending`: it produces protocol traffic,
+    /// never application bytes.
+    fn poll_tick(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        if let Some(tick) = self.tick.as_mut() {
+            match Pin::new(tick).poll(cx) {
+                // The timer is still running, and holds the waker.
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(()) => self.tick = None,
+            }
+        }
+
+        let current = self.current_ms();
+        if let Err(error) = self.kcp.update(current) {
+            return Poll::Ready(Err(io::Error::other(format!(
+                "KCP update error: {error:?}"
+            ))));
+        }
+        if let Poll::Ready(Err(error)) = self.drain_output(cx) {
+            return Poll::Ready(Err(error));
+        }
+
+        let delay = self.kcp.check(current).clamp(TICK_MIN_MS, TICK_MAX_MS);
+        let mut tick = TimeoutFuture::new(delay);
+        // Poll once so the timer holds this task's waker.
+        let _ = Pin::new(&mut tick).poll(cx);
+        self.tick = Some(tick);
+        Poll::Pending
     }
 }
 
@@ -167,22 +238,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for KcpStream<S> {
                     ))));
                 }
 
-                // Write any output that update generated (ACKs, etc.)
-                // We need to send ACKs immediately or the sender will retransmit
-                let output_data = self.output.take();
-                if !output_data.is_empty() {
-                    debug!(
-                        "KCP read: sending {} bytes of KCP output (ACKs)",
-                        output_data.len()
-                    );
-                    // Try to write ACKs immediately
-                    if let Poll::Ready(Err(e)) =
-                        Pin::new(&mut self.transport).poll_write(cx, &output_data)
-                    {
-                        return Poll::Ready(Err(e));
-                    }
-                    // Also try to flush
-                    let _ = Pin::new(&mut self.transport).poll_flush(cx);
+                // Send whatever that produced — ACKs above all, or the peer
+                // retransmits.
+                if let Poll::Ready(Err(e)) = self.drain_output(cx) {
+                    return Poll::Ready(Err(e));
                 }
 
                 // Try recv again
@@ -206,7 +265,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for KcpStream<S> {
                 debug!("KCP read: transport error: {}", e);
                 Poll::Ready(Err(e))
             }
-            Poll::Pending => Poll::Pending,
+            // Nothing to read is when KCP's own clock has to run: see
+            // `poll_tick`.
+            Poll::Pending => self.poll_tick(cx),
         }
     }
 }
@@ -241,30 +302,16 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for KcpStream<S> {
                     ))));
                 }
 
-                // Flush output
-                let output_data = self.output.take();
-                if !output_data.is_empty() {
-                    debug!(
-                        "KCP write: flushing {} bytes to transport",
-                        output_data.len()
-                    );
-                    match Pin::new(&mut self.transport).poll_write(cx, &output_data) {
-                        Poll::Ready(Ok(written)) => {
-                            debug!("KCP write: wrote {} bytes to transport", written);
-                            Poll::Ready(Ok(n))
-                        }
-                        Poll::Ready(Err(e)) => {
-                            debug!("KCP write: transport error: {}", e);
-                            Poll::Ready(Err(e))
-                        }
-                        Poll::Pending => {
-                            debug!("KCP write: transport pending");
-                            Poll::Pending
-                        }
+                // KCP owns the bytes now, so this always reports them
+                // written: answering `Pending` here would have the caller
+                // offer the same buffer again and queue it twice. Anything
+                // the transport would not take stays for the tick to send.
+                match self.drain_output(cx) {
+                    Poll::Ready(Err(e)) => {
+                        debug!("KCP write: transport error: {}", e);
+                        Poll::Ready(Err(e))
                     }
-                } else {
-                    debug!("KCP write: no output to flush");
-                    Poll::Ready(Ok(n))
+                    _ => Poll::Ready(Ok(n)),
                 }
             }
             Err(e) => Poll::Ready(Err(io::Error::other(format!(
@@ -275,46 +322,18 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for KcpStream<S> {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // First, write any pending data (ACKs from poll_read)
-        if !self.pending_write.is_empty() {
-            let data = std::mem::take(&mut self.pending_write);
-            debug!("KCP flush: writing {} bytes of pending data", data.len());
-            match Pin::new(&mut self.transport).poll_write(cx, &data) {
-                Poll::Ready(Ok(n)) if n == data.len() => {}
-                Poll::Ready(Ok(n)) => {
-                    // Partial write - save remaining
-                    self.pending_write = data[n..].to_vec();
-                    return Poll::Pending;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {
-                    self.pending_write = data;
-                    return Poll::Pending;
-                }
-            }
-        }
-
-        // Flush KCP output
-        let _current = self.current_ms();
-        if let Err(e) = self.kcp.flush() {
+        let current = self.current_ms();
+        if let Err(e) = self.kcp.update(current) {
             return Poll::Ready(Err(io::Error::other(format!(
-                "KCP flush error: {:?}",
-                e
+                "KCP update error: {e:?}"
             ))));
         }
-
-        // Flush output buffer from KCP flush
-        let output_data = self.output.take();
-        if !output_data.is_empty() {
-            debug!("KCP flush: writing {} bytes from KCP", output_data.len());
-            match Pin::new(&mut self.transport).poll_write(cx, &output_data) {
-                Poll::Ready(Ok(_)) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
+        if let Err(e) = self.kcp.flush() {
+            return Poll::Ready(Err(io::Error::other(format!(
+                "KCP flush error: {e:?}"
+            ))));
         }
-
-        Pin::new(&mut self.transport).poll_flush(cx)
+        self.drain_output(cx)
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -342,14 +361,18 @@ mod tests {
         assert!(config.nc);
     }
 
+    /// Every packet KCP writes stays its own packet: merging them would hand
+    /// the bridge one oversized datagram instead of the several it expects.
     #[test]
-    fn test_output_buffer() {
+    fn output_buffer_keeps_packet_boundaries() {
         let mut buf = OutputBuffer::new();
-        buf.write_all(b"hello").unwrap();
-        buf.write_all(b" world").unwrap();
+        buf.write_all(b"first").unwrap();
+        buf.write_all(b"second").unwrap();
 
-        let data = buf.take();
-        assert_eq!(data, b"hello world");
+        let packets = buf.take();
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0], b"first");
+        assert_eq!(packets[1], b"second");
         assert!(buf.take().is_empty());
     }
 }

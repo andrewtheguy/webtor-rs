@@ -36,7 +36,6 @@ export interface CreateOptions {
   logPrefix?: string;
   maxMessageBytes?: number;
   stunUrls?: string[];
-  verifyOnion?: boolean | string;
   [option: string]: unknown;
 }
 
@@ -50,6 +49,10 @@ export interface FetchOptions {
 export interface WebSocketOptions {
   maxMessageBytes?: number;
   timeoutMs?: number;
+}
+
+export interface OnionServiceOptions {
+  introPoints?: number;
 }
 
 export interface HarnessFetchResult {
@@ -102,6 +105,18 @@ export interface HarnessCalls {
     result: { closed: boolean; matched?: string; seen: string[] };
   };
   wsClose: { args: [id: number]; result: string };
+  servicePublish: {
+    args: [options?: OnionServiceOptions];
+    result: { address: string; seconds: number };
+  };
+  serviceServeHttp: { args: [body: string]; result: string };
+  serviceServeEcho: { args: []; result: string };
+  streamExchange: {
+    args: [address: string, port: number, message: string];
+    result: { reply: string; seconds: number };
+  };
+  serviceRequests: { args: []; result: string[] };
+  serviceStop: { args: []; result: string };
 }
 
 type HarnessMethod = keyof HarnessCalls;

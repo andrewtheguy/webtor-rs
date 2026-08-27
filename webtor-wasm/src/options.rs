@@ -44,9 +44,8 @@ pub(crate) fn reject_unknown_keys(
     Ok(())
 }
 
-/// The raw value of a field; `undefined` when absent. Public because a couple
-/// of options accept more than one type and read it directly.
-pub(crate) fn raw(bag: &Option<js_sys::Object>, key: &str) -> JsValue {
+/// The raw value of a field; `undefined` when absent.
+fn raw(bag: &Option<js_sys::Object>, key: &str) -> JsValue {
     let Some(bag) = bag else {
         return JsValue::UNDEFINED;
     };

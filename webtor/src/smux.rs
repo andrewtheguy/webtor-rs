@@ -14,7 +14,7 @@ use crate::error::{Result, TorError};
 use futures::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use std::io;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use tracing::{debug, trace, warn};
 
 /// SMUX protocol version
@@ -192,6 +192,8 @@ struct SmuxState {
     syn_sent: bool,
     /// Whether we've received SYN
     syn_received: bool,
+    /// Woken when a peer window update makes room to write again.
+    write_waker: Option<Waker>,
 }
 
 impl SmuxState {
@@ -206,13 +208,18 @@ impl SmuxState {
             peer_window: DEFAULT_WINDOW,
             syn_sent: false,
             syn_received: false,
+            write_waker: None,
         }
     }
 
-    /// Check if we can send more data
-    fn can_send(&self, len: usize) -> bool {
-        let inflight = self.self_write.saturating_sub(self.peer_consumed);
-        inflight + (len as u32) <= self.peer_window
+    /// How many more bytes the peer's window has room for.
+    ///
+    /// smux is not advisory here: a peer stops reading a stream that runs
+    /// past its window and only opens it again with an UPD, so sending
+    /// anyway wedges the whole connection rather than just this stream.
+    fn available_window(&self) -> usize {
+        let inflight = self.self_write.wrapping_sub(self.peer_consumed);
+        self.peer_window.saturating_sub(inflight) as usize
     }
 
     /// Check if we should send a window update
@@ -401,6 +408,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for SmuxStream<S> {
                                 );
                                 self.state.peer_consumed = update.consumed;
                                 self.state.peer_window = update.window;
+                                if let Some(waker) = self.state.write_waker.take() {
+                                    waker.wake();
+                                }
                             }
                             continue;
                         }
@@ -459,10 +469,15 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for SmuxStream<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // Check flow control
-        if !self.state.can_send(buf.len()) {
-            // For now, just try anyway - proper impl would wait
+        // Respect the peer's receive window: write what fits, and wait for an
+        // UPD when nothing does.
+        let available = self.state.available_window();
+        if available == 0 {
+            debug!("SMUX poll_write: peer window is full, waiting for an update");
+            self.state.write_waker = Some(cx.waker().clone());
+            return Poll::Pending;
         }
+        let buf = &buf[..std::cmp::min(buf.len(), available)];
 
         // NOTE: We encode the entire frame and expect it to be written atomically.
         // Partial writes will return WriteZero error. This is acceptable because:

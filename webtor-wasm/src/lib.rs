@@ -19,20 +19,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
+use futures::{AsyncReadExt, AsyncWriteExt};
 use webtor::{
-    onion_websocket, HttpRequest, HttpResponse, LogType, OnionUrl, TorClient, TorClientOptions,
-    WebSocketMessage, WebSocketReader, WebSocketWriter,
+    onion_websocket, DataReader, DataWriter, HttpRequest, HttpResponse, LogType, OnionService,
+    OnionServiceOptions, OnionUrl, TorClient, TorClientOptions, WebSocketMessage,
+    WebSocketReader, WebSocketWriter,
 };
-
-/// The Tor Project's own onion site. Fetching it exercises the whole client —
-/// HSDir lookup, introduction, rendezvous and a stream — which is what the
-/// `verifyOnion` option asks for when it is set to `true`.
-const DEFAULT_VERIFY_URL: &str =
-    "http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/";
 
 const DEFAULT_CONNECTION_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 240_000;
-const DEFAULT_VERIFY_TIMEOUT_MS: u64 = 240_000;
 /// Time for the onion stream plus the RFC 6455 upgrade on it.
 const DEFAULT_WEBSOCKET_TIMEOUT_MS: u64 = 240_000;
 const DEFAULT_MAX_MESSAGE_BYTES: u64 = 1024 * 1024;
@@ -43,12 +38,20 @@ const CLIENT_OPTIONS: &[&str] = &[
     "stunUrls",
     "directorySeed",
     "connectionTimeoutMs",
-    "verifyOnion",
     "log",
     "logPrefix",
 ];
 const REQUEST_OPTIONS: &[&str] = &["method", "headers", "body", "timeoutMs"];
 const WEBSOCKET_OPTIONS: &[&str] = &["maxMessageBytes", "timeoutMs"];
+const SERVICE_OPTIONS: &[&str] = &["introPoints"];
+
+/// Introduction points a published service establishes, and the most it will
+/// accept being asked for: past a handful they cost circuits without making
+/// the service easier to reach.
+const DEFAULT_INTRO_POINTS: u64 = 3;
+const MAX_INTRO_POINTS: u64 = 6;
+/// How much of one client's stream a single `receive()` returns.
+const SERVICE_READ_BYTES: usize = 8192;
 
 fn js_error(context: &str, error: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&format!("{context}: {error}"))
@@ -72,7 +75,6 @@ type Logger = Arc<dyn Fn(&str, LogType) + Send + Sync>;
 struct ClientConfig {
     options: TorClientOptions,
     directory_seed: Option<String>,
-    verify_url: Option<String>,
     log: Logger,
 }
 
@@ -126,63 +128,12 @@ fn read_client_config(raw: Option<js_sys::Object>) -> Result<ClientConfig, JsVal
     let for_client = log.clone();
     options = options.with_on_log(move |message, log_type| for_client(message, log_type));
 
-    // `verifyOnion` is either a flag choosing the default target or the URL.
-    let verify = options::raw(&bag, "verifyOnion");
-    let verify_url = if verify.is_undefined() || verify.is_null() {
-        None
-    } else if let Some(flag) = verify.as_bool() {
-        flag.then(|| DEFAULT_VERIFY_URL.to_string())
-    } else if let Some(url) = verify.as_string() {
-        Some(url)
-    } else {
-        return Err(option_error(
-            "WebtorClient.create option \"verifyOnion\" must be a boolean or a URL string",
-        ));
-    };
-
     Ok(ClientConfig {
         options,
         directory_seed: options::string(&bag, "directorySeed", what)?
             .filter(|seed| !seed.is_empty()),
-        verify_url,
         log,
     })
-}
-
-/// Prove the client can complete a rendezvous before it is handed over, so a
-/// caller that only watches the log channel gets a verdict either way.
-async fn verify_onion_client(client: &TorClient, url: &str, log: &Logger) -> Result<(), JsValue> {
-    log(
-        &format!("Verifying the onion client against {url} ..."),
-        LogType::Info,
-    );
-    let outcome = webtor::with_timeout(
-        Duration::from_millis(DEFAULT_VERIFY_TIMEOUT_MS),
-        "Onion client verification",
-        client.get(url),
-    )
-    .await;
-    let status = match outcome {
-        Ok(response) if response.is_success() => response.status,
-        Ok(response) => {
-            let message = format!(
-                "Onion client verification against {url} failed: answered HTTP {}",
-                response.status
-            );
-            log(&message, LogType::Error);
-            return Err(JsValue::from_str(&message));
-        }
-        Err(error) => {
-            let message = format!("Onion client verification against {url} failed: {error}");
-            log(&message, LogType::Error);
-            return Err(JsValue::from_str(&message));
-        }
-    };
-    log(
-        &format!("Onion client verified: {url} answered HTTP {status}."),
-        LogType::Success,
-    );
-    Ok(())
 }
 
 /// Whether `host` is a v3 onion address.
@@ -238,10 +189,13 @@ impl WebtorClient {
     /// - `directorySeed`: a previous `directoryCache()`, to skip downloading
     ///   the directory over the bridge.
     /// - `connectionTimeoutMs`: bootstrap budget, default 300000.
-    /// - `verifyOnion`: `true`, or a `http://…onion/` URL, to prove the client
-    ///   can complete a rendezvous before `create` resolves. Default `false`.
     /// - `log`: write progress to the console, default `true`.
     /// - `logPrefix`: default `"[webtor]"`.
+    ///
+    /// A caller that wants proof the client can complete a rendezvous before
+    /// it uses it does that itself, with a `fetch` against a service it
+    /// chooses: which onion is worth reaching is the caller's question, and
+    /// no answer to it belongs in this binding.
     #[wasm_bindgen(js_name = create)]
     pub fn create(options: Option<js_sys::Object>) -> js_sys::Promise {
         future_to_promise(async move {
@@ -260,10 +214,6 @@ impl WebtorClient {
                 .ensure_ready()
                 .await
                 .map_err(|error| js_error("Failed to establish Tor connection", error))?;
-            if let Some(url) = &config.verify_url {
-                verify_onion_client(&client, url, &log).await?;
-            }
-
             Ok(JsValue::from(Self {
                 client: Arc::new(client),
                 log,
@@ -349,6 +299,67 @@ impl WebtorClient {
                 reader: Rc::new(Mutex::new(reader)),
                 max_message_bytes,
                 closed: Rc::new(Cell::new(false)),
+            }))
+        })
+    }
+
+    /// Open a raw stream to an onion address and virtual port.
+    ///
+    /// Nothing is layered on top: the caller reads and writes the bytes the
+    /// service speaks. Use `fetch` for HTTP and `connectWebSocket` for
+    /// WebSocket; this is for everything else.
+    #[wasm_bindgen(js_name = connectStream)]
+    pub fn connect_stream(&self, address: String, port: u16) -> js_sys::Promise {
+        let client = self.client.clone();
+        self.run(async move {
+            let stream = client
+                .connect_stream(&address, port)
+                .await
+                .map_err(|error| js_error("Failed to open the onion stream", error))?;
+            let (reader, writer) = stream.split();
+            Ok(JsValue::from(OnionStream {
+                reader: Rc::new(Mutex::new(reader)),
+                writer: Rc::new(Mutex::new(writer)),
+                closed: Rc::new(Cell::new(false)),
+            }))
+        })
+    }
+
+    /// Publish a v3 onion service from this client.
+    ///
+    /// The identity key is generated in the page and never stored, so every
+    /// call yields a new `.onion` address that lives as long as the returned
+    /// service. Resolves once an HSDir has accepted the descriptor, which is
+    /// when clients can reach it.
+    ///
+    /// Options: `introPoints` (default 3, at most 6).
+    #[wasm_bindgen(js_name = publishOnionService)]
+    pub fn publish_onion_service(&self, options: Option<js_sys::Object>) -> js_sys::Promise {
+        let client = self.client.clone();
+        let log = self.log.clone();
+        self.run(async move {
+            let bag = options::bag(options, "publishOnionService")?;
+            options::reject_unknown_keys(&bag, "publishOnionService", SERVICE_OPTIONS)?;
+            let intro_points = options::count(&bag, "introPoints", "publishOnionService")?
+                .unwrap_or(DEFAULT_INTRO_POINTS);
+            if intro_points == 0 || intro_points > MAX_INTRO_POINTS {
+                return Err(option_error(format!(
+                    "publishOnionService option \"introPoints\" must be between 1 and {MAX_INTRO_POINTS}"
+                )));
+            }
+
+            let service = client
+                .publish_onion_service(OnionServiceOptions {
+                    intro_points: intro_points as usize,
+                })
+                .await
+                .map_err(|error| js_error("Failed to publish the onion service", error))?;
+            log(
+                &format!("Onion service published at {}", service.onion_address()),
+                LogType::Success,
+            );
+            Ok(JsValue::from(WebtorOnionService {
+                service: Arc::new(service),
             }))
         })
     }
@@ -578,6 +589,134 @@ impl OnionWebSocket {
             if !closed.replace(true) {
                 let _ = writer.lock().await.send_close().await;
             }
+            Ok(JsValue::UNDEFINED)
+        })
+    }
+}
+
+/// A v3 onion service this page is running.
+#[wasm_bindgen]
+pub struct WebtorOnionService {
+    service: Arc<OnionService>,
+}
+
+#[wasm_bindgen]
+impl WebtorOnionService {
+    /// The `<base32>.onion` address clients connect to.
+    #[wasm_bindgen(getter, js_name = onionAddress)]
+    pub fn onion_address(&self) -> String {
+        self.service.onion_address().to_string()
+    }
+
+    /// Await the next stream a client has opened, or `null` once the service
+    /// is closed. A client that asks for one address and port gets one
+    /// stream; what is spoken on it is entirely up to the caller.
+    pub fn accept(&self) -> js_sys::Promise {
+        let service = self.service.clone();
+        future_to_promise(async move {
+            match service.accept().await {
+                Some(stream) => {
+                    let (reader, writer) = stream.split();
+                    Ok(JsValue::from(OnionStream {
+                        reader: Rc::new(Mutex::new(reader)),
+                        writer: Rc::new(Mutex::new(writer)),
+                        closed: Rc::new(Cell::new(false)),
+                    }))
+                }
+                None => Ok(JsValue::NULL),
+            }
+        })
+    }
+
+    /// Withdraw the service: drop the introduction points and every client
+    /// circuit. The descriptor stays on the HSDirs until it expires, so an
+    /// address is not reusable afterwards.
+    pub fn close(&self) -> js_sys::Promise {
+        let service = self.service.clone();
+        future_to_promise(async move {
+            service.close().await;
+            Ok(JsValue::UNDEFINED)
+        })
+    }
+}
+
+/// A raw onion stream: either a client's stream into a service this page
+/// runs, or this page's stream out to somebody else's service.
+#[wasm_bindgen]
+pub struct OnionStream {
+    reader: Rc<Mutex<DataReader>>,
+    writer: Rc<Mutex<DataWriter>>,
+    closed: Rc<Cell<bool>>,
+}
+
+#[wasm_bindgen]
+impl OnionStream {
+    /// Await the next bytes the peer sent, or `null` at end of stream.
+    /// Reads and writes are independent, so a write can go out while this is
+    /// still pending.
+    pub fn receive(&self) -> js_sys::Promise {
+        let reader = self.reader.clone();
+        let closed = self.closed.clone();
+        future_to_promise(async move {
+            if closed.get() {
+                return Ok(JsValue::NULL);
+            }
+            let mut buffer = vec![0_u8; SERVICE_READ_BYTES];
+            let read = reader
+                .lock()
+                .await
+                .read(&mut buffer)
+                .await
+                .map_err(|error| js_error("Onion stream read failed", error))?;
+            if read == 0 {
+                return Ok(JsValue::NULL);
+            }
+            buffer.truncate(read);
+            Ok(js_sys::Uint8Array::from(&buffer[..]).into())
+        })
+    }
+
+    /// Send text to the peer.
+    pub fn send(&self, text: String) -> js_sys::Promise {
+        self.write(text.into_bytes())
+    }
+
+    /// Send bytes to the peer.
+    #[wasm_bindgen(js_name = sendBytes)]
+    pub fn send_bytes(&self, payload: Vec<u8>) -> js_sys::Promise {
+        self.write(payload)
+    }
+
+    /// Close this stream. Any service this page runs keeps running.
+    pub fn close(&self) -> js_sys::Promise {
+        let writer = self.writer.clone();
+        let closed = self.closed.clone();
+        future_to_promise(async move {
+            if !closed.replace(true) {
+                let _ = writer.lock().await.close().await;
+            }
+            Ok(JsValue::UNDEFINED)
+        })
+    }
+}
+
+impl OnionStream {
+    fn write(&self, payload: Vec<u8>) -> js_sys::Promise {
+        let writer = self.writer.clone();
+        let closed = self.closed.clone();
+        future_to_promise(async move {
+            if closed.get() {
+                return Err(JsValue::from_str("The onion stream is closed"));
+            }
+            let mut writer = writer.lock().await;
+            writer
+                .write_all(&payload)
+                .await
+                .map_err(|error| js_error("Onion stream write failed", error))?;
+            writer
+                .flush()
+                .await
+                .map_err(|error| js_error("Onion stream write failed", error))?;
             Ok(JsValue::UNDEFINED)
         })
     }

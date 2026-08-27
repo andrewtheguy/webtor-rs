@@ -13,7 +13,13 @@
   } from '/webtor-wasm/pkg/webtor_wasm.js';
 
   const logElement = document.getElementById('log');
-  const state = { client: null, sockets: new Map(), nextSocket: 0 };
+  const state = {
+    client: null,
+    sockets: new Map(),
+    nextSocket: 0,
+    service: null,
+    served: [],
+  };
 
   function show(line) {
     logElement.textContent += `${line}\n`;
@@ -38,6 +44,11 @@
     const found = state.sockets.get(id);
     if (!found) throw new Error(`No socket ${id}; it may already be closed`);
     return found;
+  }
+
+  function service() {
+    if (!state.service) throw new Error('No onion service; call servicePublish first');
+    return state.service;
   }
 
   function client() {
@@ -176,6 +187,139 @@
           }
         }
         return { closed: false, seen };
+      }),
+
+    // --- raw onion streams ------------------------------------------------
+    /**
+     * Open a raw stream to an onion address, send one line and return the
+     * line that comes back. This is what talks to a service that speaks
+     * something other than HTTP.
+     */
+    streamExchange: (address, port, message) =>
+      rethrowing(async () => {
+        const started = performance.now();
+        const stream = await client().connectStream(address, port);
+        try {
+          await stream.send(`${message}\n`);
+          const decoder = new TextDecoder();
+          let reply = '';
+          while (!reply.includes('\n')) {
+            const chunk = await stream.receive();
+            if (chunk == null) break;
+            reply += decoder.decode(chunk, { stream: true });
+          }
+          return {
+            reply: reply.replace(/\r?\n$/, ''),
+            seconds: Number(((performance.now() - started) / 1000).toFixed(1)),
+          };
+        } finally {
+          await stream.close().catch(() => {});
+        }
+      }),
+
+    // --- onion service ----------------------------------------------------
+    /** Publish a service from this page and return its address. */
+    servicePublish: (options) =>
+      rethrowing(async () => {
+        const started = performance.now();
+        state.service = await client().publishOnionService(options);
+        return {
+          address: state.service.onionAddress,
+          seconds: Number(((performance.now() - started) / 1000).toFixed(1)),
+        };
+      }),
+
+    /**
+     * Answer every stream the service receives with one HTTP/1.1 response,
+     * recording the request line. Runs until the service is closed, so it is
+     * started and left alone rather than awaited.
+     */
+    serviceServeHttp: (body) =>
+      rethrowing(async () => {
+        const decoder = new TextDecoder();
+        const running = service();
+        (async () => {
+          for (;;) {
+            const stream = await running.accept();
+            if (stream == null) return;
+            (async () => {
+              try {
+                let request = '';
+                while (!request.includes('\r\n\r\n')) {
+                  const chunk = await stream.receive();
+                  if (chunk == null) break;
+                  request += decoder.decode(chunk, { stream: true });
+                }
+                const line = request.split('\r\n', 1)[0] ?? '';
+                state.served.push(line);
+                show(`served ${line}`);
+                await stream.send(
+                  `HTTP/1.1 200 OK\r\n` +
+                    `Content-Type: text/plain\r\n` +
+                    // Bytes, not code units: a non-ASCII body would otherwise
+                    // be cut short by whatever read the header.
+                    `Content-Length: ${new TextEncoder().encode(body).length}\r\n` +
+                    `Connection: close\r\n\r\n${body}`,
+                );
+              } catch (error) {
+                show(`serve failed: ${error}`);
+              } finally {
+                await stream.close().catch(() => {});
+              }
+            })();
+          }
+        })();
+        return 'serving';
+      }),
+
+    /**
+     * Echo every line back, the way `ptransfer tor serve` does, so a CLI
+     * client can talk to a service this page runs. Runs until the service is
+     * closed.
+     */
+    serviceServeEcho: () =>
+      rethrowing(async () => {
+        const decoder = new TextDecoder();
+        const running = service();
+        (async () => {
+          for (;;) {
+            const stream = await running.accept();
+            if (stream == null) return;
+            (async () => {
+              try {
+                let pending = '';
+                for (;;) {
+                  const chunk = await stream.receive();
+                  if (chunk == null) break;
+                  pending += decoder.decode(chunk, { stream: true });
+                  let split;
+                  while ((split = pending.indexOf('\n')) >= 0) {
+                    const line = pending.slice(0, split);
+                    pending = pending.slice(split + 1);
+                    state.served.push(line);
+                    show(`echoing ${line.length} byte(s)`);
+                    await stream.send(`${line}\n`);
+                  }
+                }
+              } catch (error) {
+                show(`echo failed: ${error}`);
+              } finally {
+                await stream.close().catch(() => {});
+              }
+            })();
+          }
+        })();
+        return 'echoing';
+      }),
+
+    /** The request lines the service has answered so far. */
+    serviceRequests: () => state.served.slice(),
+
+    serviceStop: () =>
+      rethrowing(async () => {
+        await service().close();
+        state.service = null;
+        return 'closed';
       }),
 
     wsClose: (id) =>

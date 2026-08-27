@@ -14,6 +14,16 @@ export const ONION_RELAYS = [
 
 const EVENT_KIND = 24_243;
 const RELAY_TIMEOUT_MS = 120_000;
+/**
+ * The Tor Project's own onion site. Fetching it exercises the whole client —
+ * HSDir lookup, introduction, rendezvous and a stream — so this app knows
+ * whether a later failure is its relays or its client. Which onion is worth
+ * reaching is this app's question, not the library's, so the check lives
+ * here.
+ */
+const VERIFY_URL =
+  'http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/';
+const VERIFY_TIMEOUT_MS = 240_000;
 const MESSAGE_TIMEOUT_MS = 45_000;
 const STUN_URLS = [
   'stun:stun.l.google.com:19302',
@@ -31,11 +41,17 @@ interface OnionSocket {
   close(): Promise<unknown>;
 }
 
+interface OnionResponse {
+  status: number;
+  ok: boolean;
+}
+
 interface OnionClient {
   connectWebSocket(
     url: string,
     options?: { timeoutMs: number },
   ): Promise<OnionSocket>;
+  fetch(url: string, options?: { timeoutMs: number }): Promise<OnionResponse>;
   directoryCache(): Promise<string>;
   close(): Promise<unknown>;
 }
@@ -326,12 +342,21 @@ export async function runNostrRoundTrip(
     ...(options.bridge === 'webrtc' ? { stunUrls: STUN_URLS } : {}),
     directorySeed: directory.value,
     connectionTimeoutMs: 300_000,
-    verifyOnion: true,
     logPrefix: '[nostr-onion-poc]',
   })) as OnionClient;
 
   try {
-    onLog({ level: 'success', message: 'Tor client is verified' });
+    const verified = await client.fetch(VERIFY_URL, {
+      timeoutMs: VERIFY_TIMEOUT_MS,
+    });
+    if (!verified.ok) {
+      throw new Error(`${VERIFY_URL} answered HTTP ${verified.status}`);
+    }
+    onLog({
+      level: 'success',
+      message: 'Tor client is verified',
+      detail: `${VERIFY_URL} answered HTTP ${verified.status}`,
+    });
     const cache = await client.directoryCache();
     await saveDirectoryCache(cache);
     onLog({

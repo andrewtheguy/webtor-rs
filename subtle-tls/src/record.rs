@@ -165,8 +165,11 @@ impl RecordLayer {
     where
         S: AsyncWrite + Unpin,
     {
-        // Split into multiple records if needed
-        for chunk in data.chunks(MAX_PLAINTEXT_SIZE) {
+        // One record carries at most 2^14 bytes of plaintext (RFC 8446 5.1),
+        // and TLS 1.3 counts the content type byte appended in
+        // `write_single_record` against that. A peer answers a larger record
+        // with a `record_overflow` alert and drops the connection.
+        for chunk in data.chunks(MAX_PLAINTEXT_SIZE - 1) {
             self.write_single_record(stream, content_type, chunk)
                 .await?;
         }
@@ -355,5 +358,52 @@ mod tests {
         let layer = RecordLayer::new();
         assert!(!layer.has_read_cipher());
         assert!(!layer.has_write_cipher());
+    }
+
+    /// The largest payload a writer may hand the record layer is
+    /// `MAX_PLAINTEXT_SIZE - 1`: TLS 1.3 appends the content type to the
+    /// plaintext, and a peer answers a record over 2^14 with a
+    /// `record_overflow` alert and hangs up. `TlsStream::poll_write` splits
+    /// larger writes for exactly this reason.
+    #[test]
+    fn largest_allowed_payload_stays_within_the_record_limit() {
+        let mut layer = RecordLayer::new();
+        layer.set_write_cipher(&[0_u8; 32], &[0_u8; 12]).unwrap();
+
+        let payload = vec![0_u8; MAX_PLAINTEXT_SIZE - 1];
+        let record = layer
+            .encrypt_record_sync(CONTENT_TYPE_APPLICATION_DATA, &payload)
+            .unwrap();
+
+        // The plaintext the peer reconstructs is the payload plus the content
+        // type byte, which is what its 2^14 limit applies to.
+        assert_eq!(payload.len() + 1, MAX_PLAINTEXT_SIZE);
+        let declared = u16::from_be_bytes([record[3], record[4]]) as usize;
+        assert_eq!(declared, record.len() - 5);
+        assert!(
+            declared <= MAX_RECORD_SIZE,
+            "record of {declared} bytes is over the {MAX_RECORD_SIZE} byte limit"
+        );
+    }
+
+    /// The same limit applies to a payload the caller hands `write_record` in
+    /// one piece: it becomes several records rather than one oversized one.
+    #[test]
+    fn write_record_splits_at_the_plaintext_limit() {
+        let mut layer = RecordLayer::new();
+        let mut written: Vec<u8> = Vec::new();
+
+        futures::executor::block_on(layer.write_record(
+            &mut written,
+            CONTENT_TYPE_APPLICATION_DATA,
+            &vec![0_u8; MAX_PLAINTEXT_SIZE],
+        ))
+        .unwrap();
+
+        let first = u16::from_be_bytes([written[3], written[4]]) as usize;
+        assert_eq!(first, MAX_PLAINTEXT_SIZE - 1);
+        let rest = &written[5 + first..];
+        assert_eq!(u16::from_be_bytes([rest[3], rest[4]]) as usize, 1);
+        assert_eq!(rest.len(), 5 + 1);
     }
 }

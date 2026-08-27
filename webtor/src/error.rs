@@ -90,3 +90,18 @@ impl TorError {
         )
     }
 }
+
+/// An error and everything under it, as one line.
+///
+/// The interesting part of a failure from `tor-proto` is almost always the
+/// `#[source]` it wraps — "IO error on channel with peer" says nothing on its
+/// own — and `Display` shows only the outermost layer.
+pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(&format!(": {cause}"));
+        source = cause.source();
+    }
+    message
+}

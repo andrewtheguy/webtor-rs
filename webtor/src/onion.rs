@@ -201,6 +201,32 @@ pub(crate) fn select_hsdirs(
     blind_id: &HsBlindId,
     params: &HsDirParams,
 ) -> Vec<Relay> {
+    // Which replica a relay came from does not matter to a client: it asks
+    // them one after another until one serves the descriptor.
+    let mut flattened: Vec<Relay> =
+        select_hsdirs_with_spread(relays, blind_id, params, HSDIR_SPREAD_FETCH)
+            .into_iter()
+            .flatten()
+            .collect();
+    flattened.shuffle(&mut rand::rng());
+    flattened
+}
+
+/// The HSDirs responsible for `blind_id`, one group per replica, taking
+/// `spread` of them in each: a service stores to `hsdir_spread_store` of
+/// them, one more than the `hsdir_spread_fetch` a client reads from, so that
+/// a client still finds the descriptor when one of the relays it asks has
+/// dropped it.
+///
+/// The groups are kept apart because a service is reachable as soon as one
+/// relay in a replica holds the descriptor, and it has no reason to wait for
+/// the rest.
+pub(crate) fn select_hsdirs_with_spread(
+    relays: &[Relay],
+    blind_id: &HsBlindId,
+    params: &HsDirParams,
+    spread: usize,
+) -> Vec<Vec<Relay>> {
     let mut ring: Vec<([u8; 32], &Relay)> = relays
         .iter()
         .filter(|relay| relay.flags.contains("HSDir"))
@@ -214,7 +240,7 @@ pub(crate) fn select_hsdirs(
     ring.sort_by_key(|(index, _)| *index);
 
     let mut chosen = HashSet::new();
-    let mut selected = Vec::new();
+    let mut replicas = Vec::new();
     for replica in 1..=HSDIR_N_REPLICAS {
         let index = service_hsdir_index(blind_id, replica, params);
         let position = ring
@@ -224,16 +250,19 @@ pub(crate) fn select_hsdirs(
             .iter()
             .chain(&ring[..position])
             .filter(|(index, _)| !chosen.contains(index))
-            .take(HSDIR_SPREAD_FETCH)
+            .take(spread)
             .copied()
             .collect();
+        let mut selected = Vec::new();
         for (index, relay) in picked {
             chosen.insert(index);
             selected.push(relay.clone());
         }
+        if !selected.is_empty() {
+            replicas.push(selected);
+        }
     }
-    selected.shuffle(&mut rand::rng());
-    selected
+    replicas
 }
 
 /// A rendezvous point that has acknowledged our cookie and is waiting for
@@ -653,20 +682,35 @@ impl OnionConnector {
 fn intro_point_target(
     intro_point: &IntroPointDesc,
 ) -> Result<VerbatimLinkSpecCircTarget<OwnedCircTarget>> {
-    let link_specifiers = intro_point.link_specifiers();
+    verbatim_target(
+        intro_point.link_specifiers(),
+        intro_point.ipt_ntor_key(),
+        "Introduction point",
+    )
+}
+
+/// Build a circuit target from link specifiers that came from a peer, which
+/// the middle relay is asked to forward verbatim. A client does this for a
+/// descriptor's introduction points; a service does it for the rendezvous
+/// point an INTRODUCE2 names.
+pub(crate) fn verbatim_target(
+    link_specifiers: &[tor_linkspec::EncodedLinkSpec],
+    ntor_onion_key: &tor_llcrypto::pk::curve25519::PublicKey,
+    what: &str,
+) -> Result<VerbatimLinkSpecCircTarget<OwnedCircTarget>> {
     let chan_target =
         OwnedChanTargetBuilder::from_encoded_linkspecs(Strictness::Standard, link_specifiers)
             .map_err(|error| {
-                TorError::Onion(format!("Introduction point is not a valid target: {error}"))
+                TorError::Onion(format!("{what} is not a valid target: {error}"))
             })?;
     let mut builder = OwnedCircTarget::builder();
     *builder.chan_target() = chan_target;
     builder
-        .ntor_onion_key(*intro_point.ipt_ntor_key())
+        .ntor_onion_key(*ntor_onion_key)
         .protocols(Protocols::default());
-    let target = builder.build().map_err(|error| {
-        TorError::Onion(format!("Introduction point is not a valid target: {error}"))
-    })?;
+    let target = builder
+        .build()
+        .map_err(|error| TorError::Onion(format!("{what} is not a valid target: {error}")))?;
     Ok(VerbatimLinkSpecCircTarget::new(
         target,
         link_specifiers.to_vec(),
@@ -734,6 +778,38 @@ mod tests {
             .map(|relay| relay.fingerprint.as_str())
             .collect();
         assert_eq!(unique.len(), selected.len());
+    }
+
+    #[test]
+    fn spread_selection_keeps_the_replicas_apart() {
+        let params = params();
+        let relays: Vec<Relay> = (0u8..40)
+            .map(|n| {
+                let mut relay = Relay::new(
+                    hex::encode([n; 20]),
+                    format!("hsdir{n}"),
+                    "127.0.0.1".to_string(),
+                    9001,
+                    ["HSDir".to_string()].into_iter().collect(),
+                    hex::encode([n; 32]),
+                );
+                relay.ed25519_identity = Some(hex::encode([n; 32]));
+                relay
+            })
+            .collect();
+        let replicas = select_hsdirs_with_spread(&relays, &HsBlindId::from([0x42; 32]), &params, 4);
+        assert_eq!(replicas.len(), usize::from(HSDIR_N_REPLICAS));
+        for replica in &replicas {
+            assert_eq!(replica.len(), 4);
+        }
+        // A relay in two replicas would make one of them look covered when
+        // only the other one is.
+        let unique: HashSet<&str> = replicas
+            .iter()
+            .flatten()
+            .map(|relay| relay.fingerprint.as_str())
+            .collect();
+        assert_eq!(unique.len(), usize::from(HSDIR_N_REPLICAS) * 4);
     }
 
     #[test]

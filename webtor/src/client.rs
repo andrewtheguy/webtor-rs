@@ -11,6 +11,7 @@ use crate::error::{Result, TorError};
 use crate::http::{build_request, execute_request, HttpRequest, HttpResponse};
 use crate::onion_url::OnionUrl;
 use crate::onion::OnionConnector;
+use crate::onion_service::{OnionService, OnionServiceOptions};
 use crate::relay::RelayManager;
 use crate::retry::with_timeout;
 use crate::snowflake_webrtc::{SnowflakeWebRtcConfig, SnowflakeWebRtcStream};
@@ -28,11 +29,15 @@ use tor_proto::client::channel::ClientChannelBuilder;
 use tor_proto::client::stream::DataStream;
 use tor_proto::memquota::{ChannelAccount, SpecificAccount};
 use tor_proto::peer::PeerAddr;
-use tracing::{debug, error, info};
+use tracing::{error, info, warn};
 
 pub struct TorClient {
     options: TorClientOptions,
     directory_manager: Arc<DirectoryManager>,
+    /// Circuit and relay state, shared with the onion client and with any
+    /// service this client publishes.
+    circuit_manager: Arc<CircuitManager>,
+    relay_manager: Arc<RwLock<RelayManager>>,
     onion: OnionConnector,
     initialized: RwLock<bool>,
     bootstrap_lock: Mutex<()>,
@@ -57,15 +62,17 @@ impl TorClient {
             channel.clone(),
         ));
         let onion = OnionConnector::new(
-            circuit_manager,
+            circuit_manager.clone(),
             directory_manager.clone(),
-            relay_manager,
+            relay_manager.clone(),
             options.on_log.clone(),
         );
 
         Ok(Self {
             options,
             directory_manager,
+            circuit_manager,
+            relay_manager,
             onion,
             initialized: RwLock::new(false),
             bootstrap_lock: Mutex::new(()),
@@ -95,8 +102,38 @@ impl TorClient {
 
     /// Open a raw stream to the URL's onion service and port.
     pub async fn open_stream(&self, url: &OnionUrl) -> Result<DataStream> {
+        self.connect_stream(url.host(), url.port()).await
+    }
+
+    /// Open a raw stream to an onion address and virtual port, with no
+    /// protocol layered on top. This is what talks to a service that speaks
+    /// something other than HTTP.
+    pub async fn connect_stream(&self, host: &str, port: u16) -> Result<DataStream> {
         self.ensure_ready().await?;
-        self.onion.connect(url.host(), url.port()).await
+        self.onion.connect(host, port).await
+    }
+
+    /// Publish a v3 onion service from this client and start answering
+    /// introductions. The identity key is generated here and never stored, so
+    /// every call yields a new address that lives as long as the returned
+    /// service.
+    ///
+    /// The descriptor is uploaded once and not renewed: the address stops
+    /// being reachable a few hours later, when the descriptor expires or the
+    /// onion service time period turns over.
+    pub async fn publish_onion_service(
+        &self,
+        options: OnionServiceOptions,
+    ) -> Result<OnionService> {
+        self.ensure_ready().await?;
+        OnionService::launch(
+            self.circuit_manager.clone(),
+            self.directory_manager.clone(),
+            self.relay_manager.clone(),
+            options,
+            self.options.on_log.clone(),
+        )
+        .await
     }
 
     pub async fn ensure_ready(&self) -> Result<()> {
@@ -271,7 +308,13 @@ impl TorClient {
 
         wasm_bindgen_futures::spawn_local(async move {
             if let Err(error) = reactor.run().await {
-                debug!("Tor channel reactor stopped: {}", error);
+                // Every circuit rides this one channel, so losing it takes the
+                // whole client down. `debug!` is compiled out of a release
+                // build, which made that the quietest possible failure.
+                warn!(
+                    "Tor channel reactor stopped: {}",
+                    crate::error::error_chain(&error)
+                );
             }
         });
         Ok(channel)
