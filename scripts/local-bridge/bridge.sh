@@ -62,10 +62,20 @@ start() {
 
 # `export` so that `eval "$(bridge.sh env)"` puts these in the environment a
 # test actually reads, rather than in shell variables it never sees.
+#
+# tor writes the identity a moment after the container starts, so this can be
+# asked before there is an answer. Emitting the pair with an empty fingerprint
+# would export a broken config that fails later and further away, so say what
+# is missing and produce nothing.
 env_lines() {
     prefix=${1:-}
+    identity=$(fingerprint 2>/dev/null) || identity=
+    if [ -z "$identity" ]; then
+        echo "no bridge identity yet: tor has not written one to $VOLUME" >&2
+        return 1
+    fi
     echo "${prefix}BRIDGE_URL=ws://localhost:$PORT/"
-    echo "${prefix}BRIDGE_FINGERPRINT=$(fingerprint)"
+    echo "${prefix}BRIDGE_FINGERPRINT=$identity"
 }
 
 stop() {
@@ -77,10 +87,14 @@ stop() {
 
 status() {
     if running; then
-        podman logs "$CONTAINER" 2>&1 | grep -c 'Bootstrapped 100%' >/dev/null 2>&1 \
-            && echo "running, bootstrapped" \
-            || echo "running, still bootstrapping"
-        env_lines
+        if podman logs "$CONTAINER" 2>&1 | grep -q 'Bootstrapped 100%'; then
+            echo "running, bootstrapped"
+        else
+            echo "running, still bootstrapping"
+        fi
+        # Status reports; it does not fail because the identity is not written
+        # yet, which is a normal state in the first seconds after a start.
+        env_lines || true
     else
         exists && echo "created, not running" || echo "not running"
     fi
