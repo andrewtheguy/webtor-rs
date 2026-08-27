@@ -4,7 +4,6 @@ set -eu
 
 IMAGE=localhost/webtor-local-bridge
 CONTAINER=webtor-bridge
-VOLUME=webtor-bridge-data
 PORT=8080
 HERE=$(unset CDPATH; cd -- "$(dirname -- "$0")" && pwd)
 
@@ -20,16 +19,11 @@ build() {
     podman build -t "$IMAGE" "$HERE"
 }
 
+# Only answerable while the bridge is up: the identity lives in the container,
+# which --rm takes away on stop.
 fingerprint() {
-    # The identity lives in the volume, so it is readable whether or not the
-    # container is up; a throwaway reader avoids having to start it just to
-    # answer.
-    if running; then
-        podman exec "$CONTAINER" awk '{print $2}' /var/lib/tor/fingerprint
-    else
-        podman run --rm -v "$VOLUME:/var/lib/tor" --entrypoint awk "$IMAGE" \
-            '{print $2}' /var/lib/tor/fingerprint
-    fi
+    running || return 1
+    podman exec "$CONTAINER" awk '{print $2}' /var/lib/tor/fingerprint
 }
 
 start() {
@@ -38,11 +32,12 @@ start() {
     else
         podman image exists "$IMAGE" || build
         exists && podman rm -f "$CONTAINER" >/dev/null
+        # --rm: nothing about a test bridge is worth keeping between runs, and
+        # a stale identity outliving the container it belongs to is a trap.
         # Localhost only: this bridge has no anonymity story and no business
         # being reachable from the rest of the network.
-        podman run -d --name "$CONTAINER" \
+        podman run -d --rm --name "$CONTAINER" \
             -p "127.0.0.1:$PORT:$PORT" \
-            -v "$VOLUME:/var/lib/tor" \
             "$IMAGE" >/dev/null
     fi
 
@@ -56,22 +51,26 @@ start() {
 
     env_lines "export "
     echo >&2
-    echo "The bridge still has to reach Bootstrapped 100% before it can serve" >&2
-    echo "directory data; follow it with: $0 logs" >&2
+    echo "This identity is new: the bridge keeps nothing between runs, so a" >&2
+    echo "fingerprint copied from a previous start is now wrong. It also has" >&2
+    echo "to reach Bootstrapped 100% before it can serve directory data;" >&2
+    echo "follow it with: $0 logs" >&2
 }
 
 # `export` so that `eval "$(bridge.sh env)"` puts these in the environment a
 # test actually reads, rather than in shell variables it never sees.
 #
 # tor writes the identity a moment after the container starts, so this can be
-# asked before there is an answer. Emitting the pair with an empty fingerprint
-# would export a broken config that fails later and further away, so say what
-# is missing and produce nothing.
+# asked before there is an answer -- and there is no answer at all while the
+# bridge is down. Emitting the pair with an empty fingerprint would export a
+# broken config that fails later and further away, so say what is missing and
+# produce nothing.
 env_lines() {
     prefix=${1:-}
     identity=$(fingerprint 2>/dev/null) || identity=
     if [ -z "$identity" ]; then
-        echo "no bridge identity yet: tor has not written one to $VOLUME" >&2
+        echo "no bridge identity: the bridge is down, or tor has not written" >&2
+        echo "one yet. Try: $0 start" >&2
         return 1
     fi
     echo "${prefix}BRIDGE_URL=ws://localhost:$PORT/"
@@ -81,8 +80,12 @@ env_lines() {
 stop() {
     exists || { echo "$CONTAINER does not exist" >&2; return 0; }
     podman stop "$CONTAINER" >/dev/null
-    podman rm "$CONTAINER" >/dev/null
-    echo "stopped; $VOLUME keeps the identity for next time" >&2
+    # --rm clears it on stop; sweep up anything that lingered, such as a
+    # container that was created but never ran and so never made that promise.
+    if exists; then
+        podman rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    fi
+    echo "stopped; its identity and directory cache went with it" >&2
 }
 
 status() {

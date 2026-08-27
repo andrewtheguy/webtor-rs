@@ -35,22 +35,23 @@ export BRIDGE_FINGERPRINT=82F663FA372767B5373A3CA7EAD6F2F68F331ADB
 ```
 
 `env` prints those two lines alone and `fingerprint` prints the identity alone,
-both of which work while the bridge is stopped, so a shell can take them
-directly:
+so a shell can take them directly:
 
 ```bash
 eval "$(scripts/local-bridge/bridge.sh env)" && bun run test:live
 ```
 
-`stop` removes the container but keeps the `webtor-bridge-data` volume, which
-is what holds the identity and the directory cache. Keep it: without it the
-fingerprint changes on every start and every config below goes stale. It also
-makes restarts cheap — a first start needs a minute or two to fill the
-directory cache, a restart against a warm volume reaches `Bootstrapped 100%`
-in about nine seconds.
+The container runs with `--rm` and no volume, so `stop` takes the whole thing
+with it: the tor identity, the directory cache, all of it. Nothing about a
+test bridge is worth keeping between runs, and a stale fingerprint outliving
+the container it belonged to is a trap rather than a saving.
 
-The bridge has to be bootstrapped before it can serve directory data;
-`status` says whether it is.
+Two things follow. **The fingerprint is different on every start**, so read it
+from `env` or `fingerprint` each time rather than pasting it somewhere and
+forgetting — and neither answers while the bridge is down, since there is
+nothing left to read. And each start refills the bridge's own directory cache,
+which takes about 25 seconds to reach `Bootstrapped 100%`. It cannot serve
+directory data before then; `status` says whether it has.
 
 ## Point something at it
 
@@ -66,6 +67,11 @@ The onion service example, in `examples/onion-service-poc/.env.local`:
 VITE_BRIDGE_URL=ws://localhost:8080/
 VITE_BRIDGE_FINGERPRINT=<what `bridge.sh fingerprint` prints>
 ```
+
+That one has to be rewritten after every `bridge.sh start`, since the
+fingerprint it names is gone. The client refuses a wrong one at `create()`
+rather than failing later in the channel handshake, so a stale file is a clear
+error and not a mystery.
 
 Both are all-or-nothing. A URL with no fingerprint is a request to trust
 whatever answers on that port, so it is refused rather than defaulted.
