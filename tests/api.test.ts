@@ -115,6 +115,49 @@ describe('webtor-wasm API', () => {
       );
     });
 
+    it('takes a bridge URL and its identity together, or neither', async () => {
+      await assert.rejects(
+        () => harness.call('createRejects', { bridgeUrl: 'ws://localhost:8080/' }),
+        /needs "bridgeFingerprint"/,
+      );
+      await assert.rejects(
+        () =>
+          harness.call('createRejects', {
+            bridgeFingerprint: '2B280B23E1107BB62ABFC40DDCC8824814F80A72',
+          }),
+        /needs "bridgeUrl"/,
+      );
+      await assert.rejects(
+        () =>
+          harness.call('createRejects', {
+            bridge: 'webrtc',
+            stunUrls: ['stun:stun.example.com'],
+            bridgeUrl: 'ws://localhost:8080/',
+            bridgeFingerprint: '2B280B23E1107BB62ABFC40DDCC8824814F80A72',
+          }),
+        /apply to the websocket bridge only/,
+      );
+    });
+
+    it('checks the bridge fingerprint before spending a bootstrap on it', async () => {
+      await assert.rejects(
+        () =>
+          harness.call('createRejects', {
+            bridgeUrl: 'ws://localhost:8080/',
+            bridgeFingerprint: '2B280B23E1107BB6',
+          }),
+        /must be 40 hex characters/,
+      );
+      await assert.rejects(
+        () =>
+          harness.call('createRejects', {
+            bridgeUrl: 'ws://localhost:8080/',
+            bridgeFingerprint: 'ZZ280B23E1107BB62ABFC40DDCC8824814F80A72',
+          }),
+        /must be 40 hex characters/,
+      );
+    });
+
     it('type-checks each field', async () => {
       await assert.rejects(
         () => harness.call('createRejects', { connectionTimeoutMs: -1 }),

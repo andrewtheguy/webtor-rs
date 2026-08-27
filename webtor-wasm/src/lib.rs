@@ -36,6 +36,8 @@ const DEFAULT_LOG_PREFIX: &str = "[webtor]";
 const CLIENT_OPTIONS: &[&str] = &[
     "bridge",
     "stunUrls",
+    "bridgeUrl",
+    "bridgeFingerprint",
     "directorySeed",
     "connectionTimeoutMs",
     "log",
@@ -52,6 +54,18 @@ const DEFAULT_INTRO_POINTS: u64 = 3;
 const MAX_INTRO_POINTS: u64 = 6;
 /// How much of one client's stream a single `receive()` returns.
 const SERVICE_READ_BYTES: usize = 8192;
+
+/// A bridge identity is 40 hex characters. Checking it here costs nothing and
+/// saves a typo from surfacing minutes later as a channel handshake failure,
+/// which reads like a network problem rather than a config one.
+fn check_fingerprint(fingerprint: String) -> Result<String, JsValue> {
+    if fingerprint.len() == 40 && fingerprint.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Ok(fingerprint);
+    }
+    Err(option_error(format!(
+        "WebtorClient.create option \"bridgeFingerprint\" must be 40 hex characters, not {fingerprint:?}"
+    )))
+}
 
 fn js_error(context: &str, error: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&format!("{context}: {error}"))
@@ -85,6 +99,8 @@ fn read_client_config(raw: Option<js_sys::Object>) -> Result<ClientConfig, JsVal
 
     let bridge = options::string(&bag, "bridge", what)?.unwrap_or_else(|| "websocket".to_string());
     let stun_urls = options::string_array(&bag, "stunUrls", what)?.unwrap_or_default();
+    let bridge_url = options::string(&bag, "bridgeUrl", what)?;
+    let bridge_fingerprint = options::string(&bag, "bridgeFingerprint", what)?;
     let options = match bridge.as_str() {
         // The direct bridge WebSocket needs no broker, no volunteer proxy and
         // no STUN server, which is why it is the default: one fixed endpoint
@@ -95,11 +111,33 @@ fn read_client_config(raw: Option<js_sys::Object>) -> Result<ClientConfig, JsVal
                     "WebtorClient.create option \"stunUrls\" applies to the webrtc bridge only",
                 ));
             }
-            TorClientOptions::snowflake_websocket()
+            // A bridge is authenticated by its RSA identity alone, so a URL
+            // without one would be a request to trust whatever answers.
+            match (bridge_url, bridge_fingerprint) {
+                (Some(url), Some(fingerprint)) => {
+                    TorClientOptions::snowflake_websocket_at(url, check_fingerprint(fingerprint)?)
+                }
+                (None, None) => TorClientOptions::snowflake_websocket(),
+                (Some(_), None) => {
+                    return Err(option_error(
+                        "WebtorClient.create option \"bridgeUrl\" needs \"bridgeFingerprint\": a bridge is authenticated by its RSA identity and nothing else",
+                    ))
+                }
+                (None, Some(_)) => {
+                    return Err(option_error(
+                        "WebtorClient.create option \"bridgeFingerprint\" needs \"bridgeUrl\"",
+                    ))
+                }
+            }
         }
         // A volunteer Snowflake proxy, brokered over HTTPS. Harder to block,
         // and it needs a STUN server to find its own address.
         "webrtc" => {
+            if bridge_url.is_some() || bridge_fingerprint.is_some() {
+                return Err(option_error(
+                    "WebtorClient.create options \"bridgeUrl\" and \"bridgeFingerprint\" apply to the websocket bridge only",
+                ));
+            }
             if stun_urls.is_empty() {
                 return Err(option_error(
                     "WebtorClient.create bridge \"webrtc\" requires at least one STUN URL in \"stunUrls\"",
@@ -186,6 +224,9 @@ impl WebtorClient {
     /// Options, all optional:
     /// - `bridge`: `"websocket"` (default) or `"webrtc"`.
     /// - `stunUrls`: STUN servers for the `"webrtc"` bridge, required there.
+    /// - `bridgeUrl` and `bridgeFingerprint`: a bridge to use instead of the
+    ///   public one, for the `"websocket"` bridge. Both or neither;
+    ///   `scripts/local-bridge` runs one on localhost.
     /// - `directorySeed`: a previous `directoryCache()`, to skip downloading
     ///   the directory over the bridge.
     /// - `connectionTimeoutMs`: bootstrap budget, default 300000.

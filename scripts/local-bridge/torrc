@@ -1,0 +1,33 @@
+# Bridge configuration for the local test rig. Read scripts/local-bridge/README.md
+# before reusing any of this: several settings here are safe only because this
+# bridge is never given to anyone.
+
+User debian-tor
+DataDirectory /var/lib/tor
+Log notice stdout
+SocksPort 0
+
+BridgeRelay 1
+ORPort 9001
+ExtORPort auto
+ExitRelay 0
+Nickname webtorlocal
+
+# BridgeDB must never learn about this one, and the ORPort reachability
+# self-test can never pass from inside a container with no inbound port, so
+# skip it rather than waiting out the retries.
+PublishServerDescriptor 0
+AssumeReachable 1
+
+# webtor fetches the consensus and every microdescriptor one hop from the
+# bridge, so the directory cache is the entire reason this is faster than the
+# public bridge. Losing it would leave the rig slower than what it replaces.
+DirCache 1
+
+# Nothing consumes a test bridge's usage statistics, and collecting them only
+# produces a startup warning about the GeoIP database this image has no reason
+# to carry.
+BridgeRecordUsageByCountry 0
+
+ServerTransportPlugin snowflake exec /usr/local/bin/snowflake-server -disable-tls
+ServerTransportListenAddr snowflake 0.0.0.0:8080

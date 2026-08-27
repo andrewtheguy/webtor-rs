@@ -5,7 +5,7 @@
 //! built for it; nothing this client does reaches a Tor exit.
 
 use crate::circuit::CircuitManager;
-use crate::config::{BridgeType, LogType, TorClientOptions, SNOWFLAKE_FINGERPRINT};
+use crate::config::{BridgeType, LogType, TorClientOptions};
 use crate::directory::DirectoryManager;
 use crate::error::{Result, TorError};
 use crate::http::{build_request, execute_request, HttpRequest, HttpResponse};
@@ -203,23 +203,24 @@ impl TorClient {
 
     async fn open_bridge_channel(&self) -> Result<Arc<tor_proto::channel::Channel>> {
         self.log("Establishing Snowflake bridge channel", LogType::Info);
-        let rsa_identity = parse_snowflake_identity()?;
+        let rsa_identity = parse_snowflake_identity(self.options.bridge.fingerprint())?;
 
         let channel = match &self.options.bridge {
             BridgeType::SnowflakeWebRtc {
                 broker_url,
                 stun_urls,
+                fingerprint,
             } => {
                 self.log("Connecting to Snowflake via WebRTC", LogType::Info);
                 let stream = SnowflakeWebRtcStream::connect(SnowflakeWebRtcConfig {
                     broker_url: broker_url.clone(),
-                    fingerprint: SNOWFLAKE_FINGERPRINT.to_string(),
+                    fingerprint: fingerprint.clone(),
                     stun_urls: stun_urls.clone(),
                 })
                 .await?;
                 self.create_channel(stream, rsa_identity).await?
             }
-            BridgeType::SnowflakeWebSocket { url } => {
+            BridgeType::SnowflakeWebSocket { url, .. } => {
                 self.log("Connecting to Snowflake via WebSocket", LogType::Info);
                 let stream = SnowflakeWsStream::connect(url).await?;
                 self.create_channel(stream, rsa_identity).await?
@@ -332,9 +333,9 @@ impl TorClient {
     }
 }
 
-/// Whether `host` names a v3 onion service rather than a clearnet host.
-fn parse_snowflake_identity() -> Result<RsaIdentity> {
-    let bytes = hex::decode(SNOWFLAKE_FINGERPRINT)
+/// The bridge's RSA identity, as the channel handshake wants it.
+fn parse_snowflake_identity(fingerprint: &str) -> Result<RsaIdentity> {
+    let bytes = hex::decode(fingerprint)
         .map_err(|error| TorError::Configuration(format!("Invalid bridge identity: {error}")))?;
     RsaIdentity::from_bytes(&bytes)
         .ok_or_else(|| TorError::Configuration("Invalid bridge identity length".to_string()))
@@ -346,6 +347,19 @@ mod tests {
 
     #[test]
     fn snowflake_identity_is_valid() {
-        assert!(parse_snowflake_identity().is_ok());
+        let options = TorClientOptions::snowflake_websocket();
+        assert!(parse_snowflake_identity(options.bridge.fingerprint()).is_ok());
+    }
+
+    #[test]
+    fn a_fingerprint_of_the_wrong_length_is_refused() {
+        // Truncated hex parses fine as bytes, so the length check is the only
+        // thing standing between a typo and a confusing handshake failure.
+        assert!(parse_snowflake_identity("2B280B23E1107BB6").is_err());
+    }
+
+    #[test]
+    fn a_fingerprint_that_is_not_hex_is_refused() {
+        assert!(parse_snowflake_identity("not-a-fingerprint").is_err());
     }
 }

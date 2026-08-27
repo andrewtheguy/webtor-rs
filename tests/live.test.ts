@@ -11,6 +11,11 @@
 //                   minutes and often exceeds the budget.
 //   BRIDGE          "websocket" (default) or "webrtc"
 //   STUN_URLS       comma-separated, for the webrtc bridge
+//   BRIDGE_URL      a bridge to use instead of the public one, with
+//   BRIDGE_FINGERPRINT  its RSA identity. Both or neither. `scripts/local-bridge`
+//                   runs one on localhost and prints the fingerprint, which
+//                   makes the directory download local instead of a download
+//                   across the public bridge.
 //   CHROME_PATH     Chrome-family binary (default /usr/bin/google-chrome)
 
 import assert from 'node:assert/strict';
@@ -38,6 +43,8 @@ const STUN_URLS = (process.env.STUN_URLS ?? '')
   .split(',')
   .map((url) => url.trim())
   .filter(Boolean);
+const BRIDGE_URL = process.env.BRIDGE_URL;
+const BRIDGE_FINGERPRINT = process.env.BRIDGE_FINGERPRINT;
 
 /** What the WebSocket cases ask a relay for; short, and always answered. */
 const REQUEST = JSON.stringify(['REQ', 'webtor-test', { kinds: [1], limit: 2 }]);
@@ -70,6 +77,19 @@ describe('webtor-wasm over Tor', () => {
     if (BRIDGE === 'webrtc') {
       assert.ok(STUN_URLS.length, 'BRIDGE=webrtc needs STUN_URLS');
       options.stunUrls = STUN_URLS;
+    }
+    // Half a bridge is not a usable bridge, and the half that is missing
+    // decides whether the run is slow or insecure, so refuse both ways round
+    // rather than falling back to the public one.
+    assert.equal(
+      Boolean(BRIDGE_URL),
+      Boolean(BRIDGE_FINGERPRINT),
+      'BRIDGE_URL and BRIDGE_FINGERPRINT are set together or not at all',
+    );
+    if (BRIDGE_URL && BRIDGE_FINGERPRINT) {
+      options.bridgeUrl = BRIDGE_URL;
+      options.bridgeFingerprint = BRIDGE_FINGERPRINT;
+      console.log(`  using bridge ${BRIDGE_URL} (${BRIDGE_FINGERPRINT})`);
     }
     const { seconds } = await harness.call('create', options, seedUrl);
     console.log(`  client ready in ${seconds}s`);

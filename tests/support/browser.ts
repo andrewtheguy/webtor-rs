@@ -32,6 +32,8 @@ export interface OnionUrl {
 
 export interface CreateOptions {
   bridge?: string;
+  bridgeFingerprint?: string;
+  bridgeUrl?: string;
   connectionTimeoutMs?: number;
   logPrefix?: string;
   maxMessageBytes?: number;
