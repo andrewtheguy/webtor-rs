@@ -77,6 +77,11 @@ const CERT_LIFETIME: Duration = Duration::from_secs(54 * 60 * 60);
 /// The CREATE handshake a client may use on the rendezvous circuit.
 const CREATE2_FORMATS: &[HandshakeType] = &[HandshakeType::NTOR];
 
+/// How long after publishing the descriptor is published again, drawn from
+/// this window. The same 60-to-120-minute range Arti's publisher uses, and
+/// randomised for the same reason: services should not all upload at once.
+const REPUBLISH_INTERVAL: (u64, u64) = (60 * 60, 120 * 60);
+
 const ESTABLISH_INTRO_TIMEOUT: Duration = Duration::from_secs(90);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(90);
@@ -139,10 +144,9 @@ struct EstablishedIntroPoint {
 /// Dropping it, or calling [`OnionService::close`], tears down the
 /// introduction points; the descriptor then expires on its own.
 ///
-/// The descriptor is published once, for the current time period and the ones
-/// either side of it, and never renewed. The address therefore stops being
-/// reachable after `DESCRIPTOR_LIFETIME`; a service meant to outlive that
-/// would have to rebuild and re-upload the descriptor in the background.
+/// The descriptor is published for the current time period and the ones either
+/// side of it, and republished on a timer for as long as the service is up, so
+/// the address survives both the descriptor expiring and the rings rotating.
 pub struct OnionService {
     address: String,
     incoming: Mutex<mpsc::Receiver<DataStream>>,
@@ -157,10 +161,19 @@ pub struct OnionService {
 /// The parts of a running service that its background tasks share.
 struct ServiceState {
     circuit_manager: Arc<CircuitManager>,
-    /// One per time period the descriptor was published for. A client
-    /// encrypts its INTRODUCE2 to the subcredential of the period it found
-    /// the descriptor under, so every one of them has to be tried.
-    subcredentials: Vec<Subcredential>,
+    /// Held for republishing: every time period needs the identity blinded
+    /// again, so this key lives as long as the service does rather than being
+    /// dropped once the first descriptor is signed.
+    identity: HsIdKeypair,
+    directory_manager: Arc<DirectoryManager>,
+    relay_manager: Arc<RwLock<RelayManager>>,
+    /// What every descriptor advertises. Established once at launch.
+    intro_points: RwLock<Vec<IntroPointDesc>>,
+    /// One per time period the descriptor has been published for, newest
+    /// periods last. A client encrypts its INTRODUCE2 to the subcredential of
+    /// the period it found the descriptor under, so every one still in reach
+    /// of a live consensus has to be tried.
+    subcredentials: RwLock<Vec<(TimePeriod, Subcredential)>>,
     on_log: Option<LogCallback>,
     /// Introduction circuits and live client circuits. A tunnel's reactor
     /// stops when its last handle is dropped, so they are held here.
@@ -177,6 +190,169 @@ impl ServiceState {
         }
         info!("{}", message);
     }
+
+    /// Sign a descriptor for every time period the directory currently names,
+    /// and start accepting introductions under each.
+    ///
+    /// The descriptor goes to the ring of the period this consensus is in and
+    /// to the rings either side of it. A peer whose own consensus has not
+    /// turned over yet — or has turned over already — computes one of those
+    /// neighbouring rings, and publishing to the current one alone would leave
+    /// it looking at HSDirs that hold nothing.
+    ///
+    /// The current period comes first: it is the one that decides whether the
+    /// address works for a peer reading the same consensus as this service.
+    async fn prepare_publications(&self) -> Result<Vec<Publication>> {
+        let rings = self.directory_manager.hsdir_params().await?;
+        let intro_points = self.intro_points.read().await.clone();
+        let relays = self.relay_manager.read().await.relays.clone();
+        let now = system_time_now();
+        let mut rng = rand::rng();
+
+        let mut publications = Vec::with_capacity(1 + rings.secondary.len());
+        let mut fresh = Vec::with_capacity(publications.capacity());
+        for params in std::iter::once(&rings.current).chain(rings.secondary.iter()) {
+            let period = params.time_period();
+            let (blind_key, blind_keypair, subcredential) = self
+                .identity
+                .compute_blinded_key(period)
+                .map_err(|error| TorError::Onion(format!("Key blinding failed: {error}")))?;
+            let descriptor = build_descriptor(
+                &blind_key,
+                &blind_keypair,
+                &subcredential,
+                &intro_points,
+                &period,
+                now,
+                &mut rng,
+            )?;
+            let blind_id: HsBlindId = blind_key.id();
+            let replicas =
+                select_hsdirs_with_spread(&relays, &blind_id, params, HSDIR_SPREAD_STORE);
+            if replicas.is_empty() {
+                return Err(TorError::Onion(
+                    "The directory has no HSDir relays to publish the descriptor to".to_string(),
+                ));
+            }
+            publications.push(Publication {
+                period,
+                blind_id,
+                descriptor,
+                replicas,
+            });
+            fresh.push((period, subcredential));
+        }
+
+        // Accepted before the descriptors naming them are stored, never after:
+        // a client that finds one must not be turned away because this side is
+        // not yet willing to decrypt what it sends.
+        //
+        // Periods drop out only once they are two intervals behind, which no
+        // live consensus can still place a client in.
+        let oldest = rings
+            .current
+            .time_period()
+            .prev()
+            .unwrap_or_else(|| rings.current.time_period())
+            .interval_num();
+        let mut held = self.subcredentials.write().await;
+        for (period, subcredential) in fresh {
+            if !held.iter().any(|(known, _)| *known == period) {
+                held.push((period, subcredential));
+            }
+        }
+        held.retain(|(period, _)| period.interval_num() >= oldest);
+
+        Ok(publications)
+    }
+}
+
+/// Publish the descriptor again, for as long as the service is up.
+///
+/// A descriptor expires after `DESCRIPTOR_LIFETIME`, and the rings it sits on
+/// rotate with the onion service time period, so a service that uploads once
+/// stops being reachable a few hours later while still looking healthy from
+/// the inside. C tor and Arti both republish on a timer for this reason.
+async fn republish_forever(state: Arc<ServiceState>) {
+    loop {
+        let delay = {
+            use rand::RngExt as _;
+            Duration::from_secs(
+                rand::rng().random_range(REPUBLISH_INTERVAL.0..=REPUBLISH_INTERVAL.1),
+            )
+        };
+        crate::retry::sleep(delay).await;
+        if let Err(error) = republish(&state).await {
+            state.log(
+                &format!("Could not republish the descriptor: {error}"),
+                LogType::Error,
+            );
+        }
+    }
+}
+
+/// One republication: a current directory, then a descriptor on every ring it
+/// names.
+async fn republish(state: &Arc<ServiceState>) -> Result<()> {
+    // The rings come from the consensus, so republishing against the one this
+    // service started with would put the descriptor straight back onto the
+    // ring the network is leaving. A refresh that fails is not fatal — the
+    // directory in hand is still signed and still timely, and republishing
+    // onto its rings beats letting the descriptor expire.
+    match state.circuit_manager.channel().await {
+        Ok(channel) => {
+            if let Err(error) = state
+                .directory_manager
+                .fetch_and_process_consensus(channel)
+                .await
+            {
+                state.log(
+                    &format!(
+                        "Could not refresh the Tor directory before republishing, so the \
+                         descriptor goes back on the rings already in hand: {error}"
+                    ),
+                    LogType::Error,
+                );
+            }
+        }
+        Err(error) => {
+            state.log(
+                &format!("No Tor channel to refresh the directory on: {error}"),
+                LogType::Error,
+            );
+        }
+    }
+
+    let publications = state.prepare_publications().await?;
+    let outcomes = futures::future::join_all(
+        publications
+            .iter()
+            .map(|publication| publish_descriptor(state, publication)),
+    )
+    .await;
+
+    // Unlike the first publication, none of these decides whether the service
+    // exists: it is already running, and a period that fails now is retried at
+    // the next interval.
+    let mut stored = 0_usize;
+    for (publication, outcome) in publications.iter().zip(outcomes) {
+        match outcome {
+            Ok(()) => stored += 1,
+            Err(error) => state.log(
+                &format!(
+                    "The descriptor for time period {} was not republished: {error}",
+                    publication.period.interval_num()
+                ),
+                LogType::Error,
+            ),
+        }
+    }
+    if stored == 0 {
+        return Err(TorError::Onion(
+            "No time period accepted the republished descriptor".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 impl OnionService {
@@ -207,22 +383,13 @@ impl OnionService {
         // not turned over yet — or has turned over already — computes one of
         // those neighbouring rings, and publishing to the current one alone
         // would leave it looking at HSDirs that hold nothing.
-        let rings = directory_manager.hsdir_params().await?;
-        let mut blinded = Vec::with_capacity(1 + rings.secondary.len());
-        for params in std::iter::once(&rings.current).chain(rings.secondary.iter()) {
-            let (blind_key, blind_keypair, subcredential) = identity
-                .compute_blinded_key(params.time_period())
-                .map_err(|error| TorError::Onion(format!("Key blinding failed: {error}")))?;
-            blinded.push((params.clone(), blind_key, blind_keypair, subcredential));
-        }
-        let subcredentials = blinded
-            .iter()
-            .map(|(_, _, _, subcredential)| *subcredential)
-            .collect();
-
         let state = Arc::new(ServiceState {
             circuit_manager,
-            subcredentials,
+            identity,
+            directory_manager,
+            relay_manager: relay_manager.clone(),
+            intro_points: RwLock::new(Vec::new()),
+            subcredentials: RwLock::new(Vec::new()),
             on_log,
             tunnels: RwLock::new(Vec::new()),
             aborts: RwLock::new(Vec::new()),
@@ -254,41 +421,11 @@ impl OnionService {
             }
         }
 
-        let now = system_time_now();
-        let relays = relay_manager.read().await.relays.clone();
-        let mut publications = Vec::with_capacity(blinded.len());
-        for (params, blind_key, blind_keypair, subcredential) in &blinded {
-            let descriptor = build_descriptor(
-                blind_key,
-                blind_keypair,
-                subcredential,
-                &descriptors,
-                &params.time_period(),
-                now,
-                &mut rng,
-            )?;
-            let blind_id: HsBlindId = blind_key.id();
-            let replicas =
-                select_hsdirs_with_spread(&relays, &blind_id, params, HSDIR_SPREAD_STORE);
-            if replicas.is_empty() {
-                return Err(TorError::Onion(
-                    "The directory has no HSDir relays to publish the descriptor to".to_string(),
-                ));
-            }
-            publications.push(Publication {
-                period: params.time_period(),
-                blind_id,
-                descriptor,
-                replicas,
-            });
-        }
-        // The blinding keypairs have done their work in the signatures.
-        drop(blinded);
+        *state.intro_points.write().await = descriptors;
 
-        // The current period decides whether the address works at all, since
-        // that is where a peer reading this same consensus looks; the
-        // neighbours only widen who else can find it, so one of them failing
-        // is not a reason to refuse to serve.
+        // The first publication is the one that decides whether the address
+        // works at all, so unlike a republish it is allowed to fail the launch.
+        let publications = state.prepare_publications().await?;
         let (current, neighbours) = publications
             .split_first()
             .expect("the current period is always published");
@@ -313,6 +450,16 @@ impl OnionService {
                 );
             }
         }
+
+        // Keep it published. A descriptor expires, and the rings it sits on
+        // rotate, so a service that uploads once quietly stops being reachable
+        // while still looking healthy from the inside.
+        let (republish_abort, republish_registration) = AbortHandle::new_pair();
+        state.aborts.write().await.push(republish_abort);
+        let republish_state = state.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = Abortable::new(republish_forever(republish_state), republish_registration).await;
+        });
 
         // From here on the service answers introductions on its own.
         let (abort_handle, abort_registration) = AbortHandle::new_pair();
@@ -680,11 +827,18 @@ async fn serve_introduction(
     message: Introduce2,
     mut streams: mpsc::Sender<DataStream>,
 ) -> Result<()> {
+    let subcredentials: Vec<Subcredential> = state
+        .subcredentials
+        .read()
+        .await
+        .iter()
+        .map(|(_, subcredential)| *subcredential)
+        .collect();
     let (keygen, rendezvous1_body, payload) = hs_ntor::server_receive_intro(
         &mut rand::rng(),
         &keys.ntor,
         &keys.session_id_key,
-        &state.subcredentials,
+        &subcredentials,
         message.encoded_header(),
         message.encrypted_body(),
     )

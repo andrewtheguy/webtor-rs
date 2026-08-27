@@ -173,7 +173,7 @@ impl CircuitManager {
         Ok((tunnel, middle))
     }
 
-    async fn channel(&self) -> Result<Arc<Channel>> {
+    pub(crate) async fn channel(&self) -> Result<Arc<Channel>> {
         self.channel
             .read()
             .await

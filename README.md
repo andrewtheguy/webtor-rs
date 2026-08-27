@@ -40,7 +40,10 @@ Publishing a service runs the same machinery from the other end, in
 address from it, establish introduction points with `ESTABLISH_INTRO`, sign a
 descriptor naming them and upload it to the responsible HSDirs — for the
 current time period and for the ones either side of it, so that a client whose
-consensus places it in a neighbouring period still finds the service. Every
+consensus places it in a neighbouring period still finds the service. That is
+then repeated every 60 to 120 minutes, against a freshly downloaded consensus,
+which is what keeps the address alive past the descriptor's own lifetime and
+across the rotation that moves every ring. Every
 `INTRODUCE2` that arrives afterwards is answered by building a circuit to the
 client's rendezvous point, completing the hs-ntor handshake as the responder,
 and sending `RENDEZVOUS1`; the streams the client then begins are handed to the

@@ -129,6 +129,23 @@ impl DirectoryManager {
     }
 
     pub async fn fetch_and_process_consensus(&self, channel: Arc<Channel>) -> Result<()> {
+        // Relays turn over slowly, so nearly every microdescriptor a new
+        // consensus names is one this client already holds. Keeping them turns
+        // a refresh from thousands of downloads over a single bridge circuit
+        // into a handful, which is what makes refreshing affordable at all.
+        let retained_is_empty = self.retained_microdescriptors.read().await.is_empty();
+        if retained_is_empty {
+            let installed = self
+                .cache
+                .read()
+                .await
+                .as_ref()
+                .map(|cache| index_microdescriptors(&cache.microdescriptors));
+            if let Some(installed) = installed {
+                *self.retained_microdescriptors.write().await = installed;
+            }
+        }
+
         self.log("Creating a Tor directory circuit...", LogType::Info);
         let tunnel = self.create_directory_tunnel(channel.clone()).await?;
         self.log("Tor directory circuit established", LogType::Success);
