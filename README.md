@@ -123,7 +123,8 @@ caller's question, and no third-party address is compiled into the wasm.
   stored the descriptor, which is when clients can reach the address, to a
   service with `onionAddress`, `accept()` and `close()`. `accept()` resolves to
   the next client's `OnionStream`, or `null` once the service is closed;
-  `close()` withdraws the introduction points and every client circuit. The
+  `close()` withdraws the introduction points and every client circuit, and so
+  does freeing the service. The
   identity key is generated in the page and never stored, so every call yields
   a new address that lives as long as the service.
 - `directoryCache()` — the consensus, the authority certificates that check its

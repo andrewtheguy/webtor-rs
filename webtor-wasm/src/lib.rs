@@ -683,6 +683,19 @@ impl WebtorOnionService {
     }
 }
 
+impl Drop for WebtorOnionService {
+    /// Freeing the service from JavaScript withdraws it, the same as
+    /// `close()` without the promise to await.
+    ///
+    /// A pending `accept` holds the service too, so this is what has to end
+    /// it: without it, a page that let go of the object while waiting for a
+    /// client would leave the service published, the timer republishing it
+    /// and the introduction points answering, until the tab closed.
+    fn drop(&mut self) {
+        self.service.shutdown();
+    }
+}
+
 /// A raw onion stream: either a client's stream into a service this page
 /// runs, or this page's stream out to somebody else's service.
 #[wasm_bindgen]

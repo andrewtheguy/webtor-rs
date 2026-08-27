@@ -78,6 +78,13 @@ const RENDEZVOUS_COMPLETION_TIMEOUT: Duration = Duration::from_secs(90);
 pub(crate) struct HsDirParams {
     time_period: TimePeriod,
     shared_rand: [u8; 32],
+    /// When the shared random value above became the most recent one.
+    ///
+    /// Kept because it is the only instant a descriptor's revision counter
+    /// can be measured from: it is always already past, even for a period
+    /// that has not begun yet. See `build_descriptor` in
+    /// [`crate::onion_service`].
+    srv_start: SystemTime,
 }
 
 /// The rings one consensus defines: the period it is itself in, and the
@@ -133,6 +140,11 @@ impl HsDirParams {
     pub(crate) fn time_period(&self) -> TimePeriod {
         self.time_period
     }
+
+    /// When the shared random value behind this ring took effect.
+    pub(crate) fn srv_start(&self) -> SystemTime {
+        self.srv_start
+    }
 }
 
 /// Every shared random value the consensus carries, each with the span over
@@ -177,9 +189,12 @@ fn shared_random_values(
 /// random value covers them, since a ring nobody else computes the same way
 /// would place the descriptor where no client will look.
 fn rings_for(period: TimePeriod, values: &[([u8; 32], Range<SystemTime>)]) -> HsDirRings {
-    let current = params_for_period(values, period).unwrap_or(HsDirParams {
+    let current = params_for_period(values, period).unwrap_or_else(|| HsDirParams {
         time_period: period,
         shared_rand: disaster_shared_rand(period),
+        // Nothing named this value, so nothing dates it either; it stands for
+        // the whole period, which is what Arti measures it from too.
+        srv_start: period_start(period),
     });
     let secondary = [period.prev(), period.next()]
         .into_iter()
@@ -199,10 +214,19 @@ fn params_for_period(
     values
         .iter()
         .find(|(_, lifespan)| lifespan.contains(&start))
-        .map(|(value, _)| HsDirParams {
+        .map(|(value, lifespan)| HsDirParams {
             time_period: period,
             shared_rand: *value,
+            srv_start: lifespan.start,
         })
+}
+
+/// When `period` begins, or the epoch if it is too far out to represent —
+/// which takes a consensus dated centuries from now.
+fn period_start(period: TimePeriod) -> SystemTime {
+    period
+        .range()
+        .map_or(SystemTime::UNIX_EPOCH, |range| range.start)
 }
 
 fn start_of_day_containing(when: SystemTime) -> SystemTime {
@@ -787,6 +811,7 @@ mod tests {
         HsDirParams {
             time_period,
             shared_rand: [0x43; 32],
+            srv_start: period_start(time_period),
         }
     }
 
@@ -845,7 +870,27 @@ mod tests {
         let period = period_at(42);
         let rings = rings_for(period, &[]);
         assert_eq!(rings.current.shared_rand, disaster_shared_rand(period));
+        assert_eq!(rings.current.srv_start(), period_start(period));
         assert!(rings.secondary.is_empty());
+    }
+
+    /// Every ring counts from its shared random value rather than from its
+    /// own period, which is what gives a descriptor for a period that has not
+    /// begun a revision counter above zero — and so one that can be raised
+    /// again by the next republication.
+    #[test]
+    fn a_ring_counts_from_its_shared_random_value() {
+        let value = srv(0x43, 40, 5);
+        let rings = rings_for(period_at(42), std::slice::from_ref(&value));
+        assert_eq!(rings.current.srv_start(), value.1.start);
+
+        let next = rings
+            .secondary
+            .iter()
+            .find(|params| params.time_period().interval_num() == 43)
+            .expect("the next period is covered by this value");
+        assert_eq!(next.srv_start(), value.1.start);
+        assert!(next.srv_start() < period_start(next.time_period()));
     }
 
     /// The index vectors `tor-netdir` checks its ring against.

@@ -25,7 +25,7 @@ use crate::circuit::{make_circ_params, CircuitManager};
 use crate::config::{LogCallback, LogType};
 use crate::directory::{post_directory_document, DirectoryManager};
 use crate::error::{Result, TorError};
-use crate::onion::{select_hsdirs_with_spread, verbatim_target};
+use crate::onion::{select_hsdirs_with_spread, verbatim_target, HsDirParams};
 use crate::relay::{selection, Relay, RelayManager};
 use crate::retry::with_timeout;
 use crate::time::system_time_now;
@@ -35,6 +35,7 @@ use futures::future::{AbortHandle, Abortable};
 use futures::{SinkExt, StreamExt};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use safelog::DisplayRedacted;
 use std::time::{Duration, SystemTime};
 use tor_cell::chancell::msg::HandshakeType;
@@ -81,6 +82,15 @@ const CREATE2_FORMATS: &[HandshakeType] = &[HandshakeType::NTOR];
 /// this window. The same 60-to-120-minute range Arti's publisher uses, and
 /// randomised for the same reason: services should not all upload at once.
 const REPUBLISH_INTERVAL: (u64, u64) = (60 * 60, 120 * 60);
+/// How long after a time period turns over the descriptor is published for
+/// the rings that turnover created, when that comes first. Not zero, so that
+/// the consensus naming the new period has had time to be voted on, and so
+/// that services waiting on the same boundary do not all upload together.
+const TRANSITION_DELAY: (u64, u64) = (5 * 60, 15 * 60);
+/// The shortest wait between publications, whatever the rings say. Without it
+/// a consensus stuck before the period boundary — one that cannot be
+/// refreshed — would put this in a loop.
+const MIN_REPUBLISH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 const ESTABLISH_INTRO_TIMEOUT: Duration = Duration::from_secs(90);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
@@ -141,8 +151,9 @@ struct EstablishedIntroPoint {
 
 /// A published onion service.
 ///
-/// Dropping it, or calling [`OnionService::close`], tears down the
-/// introduction points; the descriptor then expires on its own.
+/// Dropping it, or calling [`OnionService::close`], stops the republishing
+/// and tears down the introduction points; the descriptor then expires on its
+/// own.
 ///
 /// The descriptor is published for the current time period and the ones either
 /// side of it, and republished on a timer for as long as the service is up, so
@@ -178,8 +189,29 @@ struct ServiceState {
     /// Introduction circuits and live client circuits. A tunnel's reactor
     /// stops when its last handle is dropped, so they are held here.
     tunnels: RwLock<Vec<Arc<ClientTunnel>>>,
-    /// Aborts the background tasks when the service is closed.
-    aborts: RwLock<Vec<AbortHandle>>,
+    /// Aborts the background tasks when the service is closed or dropped.
+    ///
+    /// A `std` lock rather than an async one because [`Drop`] has to take it,
+    /// and nothing holds it across an await.
+    aborts: StdMutex<Vec<AbortHandle>>,
+    /// Aborts the descriptor uploads of the most recent publication, which
+    /// outlive the call that started them. Republishing replaces the list:
+    /// keeping every round's handles for the life of the service would grow
+    /// without bound, and an upload from a previous round is long since over.
+    upload_aborts: StdMutex<Vec<AbortHandle>>,
+}
+
+/// Take one of the abort lists, ignoring a poisoned lock: the handles are
+/// worth aborting whatever panicked while the list was held.
+fn aborts_of(lock: &StdMutex<Vec<AbortHandle>>) -> std::sync::MutexGuard<'_, Vec<AbortHandle>> {
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Abort everything in one of the lists and empty it.
+fn abort_all(lock: &StdMutex<Vec<AbortHandle>>) {
+    for abort in aborts_of(lock).drain(..) {
+        abort.abort();
+    }
 }
 
 impl ServiceState {
@@ -222,7 +254,7 @@ impl ServiceState {
                 &blind_keypair,
                 &subcredential,
                 &intro_points,
-                &period,
+                params,
                 now,
                 &mut rng,
             )?;
@@ -275,12 +307,7 @@ impl ServiceState {
 /// the inside. C tor and Arti both republish on a timer for this reason.
 async fn republish_forever(state: Arc<ServiceState>) {
     loop {
-        let delay = {
-            use rand::RngExt as _;
-            Duration::from_secs(
-                rand::rng().random_range(REPUBLISH_INTERVAL.0..=REPUBLISH_INTERVAL.1),
-            )
-        };
+        let delay = republish_delay(&state).await;
         crate::retry::sleep(delay).await;
         if let Err(error) = republish(&state).await {
             state.log(
@@ -291,9 +318,59 @@ async fn republish_forever(state: Arc<ServiceState>) {
     }
 }
 
+/// How long to wait before publishing again.
+///
+/// The interval alone is only enough while a time period outlasts it. Periods
+/// can be as short as half an hour, and a publication covers the current one
+/// and its neighbours, so a service that always slept the full interval could
+/// wake two periods on with clients already asking rings it never uploaded
+/// to. Waking shortly after the boundary instead keeps every ring a client
+/// might compute covered, whatever `hsdir_interval` the consensus sets.
+async fn republish_delay(state: &ServiceState) -> Duration {
+    let (interval, transition) = {
+        use rand::RngExt as _;
+        let mut rng = rand::rng();
+        (
+            Duration::from_secs(rng.random_range(REPUBLISH_INTERVAL.0..=REPUBLISH_INTERVAL.1)),
+            Duration::from_secs(rng.random_range(TRANSITION_DELAY.0..=TRANSITION_DELAY.1)),
+        )
+    };
+    let Some(period_end) = state
+        .directory_manager
+        .hsdir_params()
+        .await
+        .ok()
+        .and_then(|rings| rings.current.time_period().range().ok())
+        .map(|range| range.end)
+    else {
+        return interval;
+    };
+    let until_transition = period_end
+        .duration_since(system_time_now())
+        .unwrap_or_default();
+    capped_republish_delay(interval, transition, until_transition)
+}
+
+/// The delay itself, given how long the current period has left: whichever of
+/// the interval and the boundary comes first, and never less than
+/// [`MIN_REPUBLISH_INTERVAL`].
+fn capped_republish_delay(
+    interval: Duration,
+    transition: Duration,
+    until_transition: Duration,
+) -> Duration {
+    interval
+        .min(until_transition + transition)
+        .max(MIN_REPUBLISH_INTERVAL)
+}
+
 /// One republication: a current directory, then a descriptor on every ring it
 /// names.
 async fn republish(state: &Arc<ServiceState>) -> Result<()> {
+    // Whatever is left of the previous round's uploads has either finished or
+    // run out its timeout many times over by now.
+    abort_all(&state.upload_aborts);
+
     // The rings come from the consensus, so republishing against the one this
     // service started with would put the descriptor straight back onto the
     // ring the network is leaving. A refresh that fails is not fatal — the
@@ -392,7 +469,8 @@ impl OnionService {
             subcredentials: RwLock::new(Vec::new()),
             on_log,
             tunnels: RwLock::new(Vec::new()),
-            aborts: RwLock::new(Vec::new()),
+            aborts: StdMutex::new(Vec::new()),
+            upload_aborts: StdMutex::new(Vec::new()),
         });
         state.log(
             &format!("Publishing onion service {address}"),
@@ -455,7 +533,7 @@ impl OnionService {
         // rotate, so a service that uploads once quietly stops being reachable
         // while still looking healthy from the inside.
         let (republish_abort, republish_registration) = AbortHandle::new_pair();
-        state.aborts.write().await.push(republish_abort);
+        aborts_of(&state.aborts).push(republish_abort);
         let republish_state = state.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let _ = Abortable::new(republish_forever(republish_state), republish_registration).await;
@@ -463,7 +541,7 @@ impl OnionService {
 
         // From here on the service answers introductions on its own.
         let (abort_handle, abort_registration) = AbortHandle::new_pair();
-        state.aborts.write().await.push(abort_handle);
+        aborts_of(&state.aborts).push(abort_handle);
         let loop_state = state.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let _ = Abortable::new(
@@ -502,11 +580,38 @@ impl OnionService {
     pub async fn close(&self) {
         // First, so that an `accept` waiting for the next client wakes up and
         // gives up the lock it is holding on the receiver.
-        self.streams.clone().close_channel();
-        for abort in self.state.aborts.write().await.drain(..) {
-            abort.abort();
-        }
+        self.shutdown();
         self.state.tunnels.write().await.clear();
+    }
+
+    /// Everything [`OnionService::close`] does that needs no await: stop the
+    /// background tasks, and wake an `accept` that is waiting for a client.
+    ///
+    /// Exposed because the last thing holding a service is often a task of
+    /// its own — a pending `accept`, an upload still in flight — so a caller
+    /// letting go of its handle cannot rely on `Drop` running. Calling this
+    /// is what lets those tasks finish, and the state goes with the last of
+    /// them.
+    pub fn shutdown(&self) {
+        // First, so that an `accept` waiting for the next client wakes up.
+        self.streams.clone().close_channel();
+        abort_all(&self.state.aborts);
+        abort_all(&self.state.upload_aborts);
+    }
+}
+
+impl Drop for OnionService {
+    /// The same teardown as [`OnionService::close`], minus the part that has
+    /// to await.
+    ///
+    /// Dropping this handle does not by itself drop the state the background
+    /// tasks share, because each of those tasks holds it too: aborting them
+    /// is what lets the last reference go, and the introduction points and
+    /// circuits go with it. Without this, a dropped service would keep
+    /// answering introductions and republishing its descriptor for as long as
+    /// the page was open.
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -653,7 +758,7 @@ fn build_descriptor<R: rand::Rng + rand::CryptoRng>(
     blind_keypair: &tor_hscrypto::pk::HsBlindIdKeypair,
     subcredential: &Subcredential,
     intro_points: &[IntroPointDesc],
-    time_period: &tor_hscrypto::time::TimePeriod,
+    params: &HsDirParams,
     now: SystemTime,
     rng: &mut R,
 ) -> Result<String> {
@@ -668,14 +773,19 @@ fn build_descriptor<R: rand::Rng + rand::CryptoRng>(
     })?;
 
     // Descriptors for the same blinded identity are ordered by this counter,
-    // so it has to grow. Seconds since the time period began does that, and
-    // never runs backwards while the service is up.
-    let period_start = time_period
-        .range()
-        .map_err(|error| TorError::Onion(format!("Time period is unrepresentable: {error}")))?
-        .start;
+    // and an HSDir keeps the copy it already holds unless a new one raises it,
+    // so it has to grow across every republication.
+    //
+    // Seconds since the *time period* began cannot do that for the period
+    // ahead, which is published before it starts: every upload until then
+    // would count zero and none of them could replace the first, leaving that
+    // ring holding an expired descriptor by the time clients move onto it.
+    // The shared random value the ring is built from is already in force
+    // whenever a ring exists at all, so seconds since that rise from the
+    // first publication onwards. Arti counts from the same instant, though it
+    // encrypts the result to keep the upload time off the HSDir.
     let revision = now
-        .duration_since(period_start)
+        .duration_since(params.srv_start())
         .unwrap_or_default()
         .as_secs();
 
@@ -762,7 +872,7 @@ async fn publish_descriptor(state: &Arc<ServiceState>, publication: &Publication
     }
     // Otherwise the receiver below would never see the end of the uploads.
     drop(outcome_tx);
-    state.aborts.write().await.append(&mut aborts);
+    aborts_of(&state.upload_aborts).append(&mut aborts);
 
     let mut stored = vec![0_usize; replicas.len()];
     let mut accepted = 0_usize;
@@ -1005,5 +1115,39 @@ impl MsgHandler for IntroPointHandler {
                 other.cmd()
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const INTERVAL: Duration = Duration::from_secs(90 * 60);
+    const TRANSITION: Duration = Duration::from_secs(10 * 60);
+
+    /// A day-long period outlasts the interval many times over, so nothing is
+    /// gained by waking any earlier than usual.
+    #[test]
+    fn a_long_period_leaves_the_interval_alone() {
+        let delay = capped_republish_delay(INTERVAL, TRANSITION, Duration::from_secs(20 * 3600));
+        assert_eq!(delay, INTERVAL);
+    }
+
+    /// With `hsdir_interval` at its floor of half an hour, sleeping the whole
+    /// interval would skip past periods clients are already asking about.
+    #[test]
+    fn a_short_period_is_woken_just_after_its_boundary() {
+        let delay = capped_republish_delay(INTERVAL, TRANSITION, Duration::from_secs(12 * 60));
+        assert_eq!(delay, Duration::from_secs(22 * 60));
+        assert!(delay < INTERVAL);
+    }
+
+    /// A directory that cannot be refreshed leaves the boundary in the past.
+    /// Publishing again is still worth doing — the attempt starts by trying
+    /// the refresh again — but not in a tight loop.
+    #[test]
+    fn a_boundary_already_passed_still_waits() {
+        let delay = capped_republish_delay(INTERVAL, TRANSITION, Duration::ZERO);
+        assert_eq!(delay, MIN_REPUBLISH_INTERVAL);
     }
 }
