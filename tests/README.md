@@ -46,7 +46,11 @@ binary (default `../ptransfer-cli/target/release/ptransfer`) and `ONLY=client`
 or `ONLY=server` runs one direction.
 
 Environment: `DIRECTORY_SEED` (default `tests/.directory-seed.json`), `BRIDGE`
-(`websocket` or `webrtc`), `STUN_URLS` (comma-separated, for `webrtc`).
+(`websocket` or `webrtc`), `STUN_URLS` (comma-separated, for `webrtc`), and
+`BRIDGE_URL` with `BRIDGE_FINGERPRINT` to use a bridge other than the public
+one. Both or neither: a URL with no identity is a request to trust whatever
+answers. `scripts/local-bridge` runs one in a container and prints both, which
+is the other way to make the directory download cheap — see below.
 
 ## The directory snapshot
 
@@ -59,6 +63,12 @@ a seed arrives with no circuit behind it to vouch for it. Without a snapshot the
 circuit — and it needs *every* HSDir microdescriptor, because a relay's
 position on the hash ring comes from the ed25519 identity in its
 microdescriptor, so that is thousands of documents through one circuit.
+
+The other way out is to move the bridge rather than skip the download. Those
+documents come one hop from the bridge, so a bridge on localhost
+(`scripts/local-bridge`) makes fetching all of them a local transfer, and
+unlike a snapshot it never goes stale. Cold and seedless against a local
+bridge, a bootstrap is 7 seconds.
 
 Seeded, a bootstrap is a few seconds. A consensus is valid for three hours and
 the client rejects an expired one, so a snapshot has to be rebuilt to stay

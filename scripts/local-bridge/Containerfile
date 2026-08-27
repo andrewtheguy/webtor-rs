@@ -1,0 +1,24 @@
+# A Snowflake bridge on localhost, for testing webtor's WebSocket transport
+# without the public bridge in the path. It is a test rig and nothing else:
+# it publishes no descriptor, so no real client can ever be handed this bridge.
+
+FROM docker.io/library/golang:1.25-bookworm AS build
+
+ARG SNOWFLAKE_REF=main
+RUN git clone --depth 1 --branch "$SNOWFLAKE_REF" \
+      https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake.git /src
+WORKDIR /src/server
+RUN CGO_ENABLED=0 go build -o /out/snowflake-server .
+
+FROM docker.io/library/debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tor \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /out/snowflake-server /usr/local/bin/snowflake-server
+COPY torrc /etc/tor/torrc
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

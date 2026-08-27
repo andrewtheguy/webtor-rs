@@ -41,6 +41,26 @@ export interface SelfFetch {
 /** STUN servers the `webrtc` bridge needs to find its own address. */
 const STUN_URLS = ['stun:stun.l.google.com:19302'];
 
+/**
+ * A bridge to use instead of the public one, from `.env.local`:
+ *
+ *   VITE_BRIDGE_URL=ws://localhost:8080/
+ *   VITE_BRIDGE_FINGERPRINT=<what scripts/local-bridge prints>
+ *
+ * Worth doing while iterating, because the client fetches the consensus and
+ * every HSDir microdescriptor one hop from the bridge: against a local one
+ * that download is local too. Both or neither — a URL without an identity
+ * would be a request to trust whatever answers.
+ */
+const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL;
+const BRIDGE_FINGERPRINT = import.meta.env.VITE_BRIDGE_FINGERPRINT;
+
+if (Boolean(BRIDGE_URL) !== Boolean(BRIDGE_FINGERPRINT)) {
+  throw new Error(
+    'Set VITE_BRIDGE_URL and VITE_BRIDGE_FINGERPRINT together, or neither',
+  );
+}
+
 /** How long the page waits for its own service to answer. */
 const SELF_FETCH_TIMEOUT_MS = 240_000;
 
@@ -78,6 +98,9 @@ export async function startOnionService(
   const client = await WebtorClient.create({
     bridge: options.bridge,
     ...(options.bridge === 'webrtc' ? { stunUrls: STUN_URLS } : {}),
+    ...(BRIDGE_URL && BRIDGE_FINGERPRINT
+      ? { bridgeUrl: BRIDGE_URL, bridgeFingerprint: BRIDGE_FINGERPRINT }
+      : {}),
     ...(seed.value ? { directorySeed: seed.value } : {}),
     logPrefix: '[onion-service-poc]',
   });

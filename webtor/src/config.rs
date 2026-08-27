@@ -15,8 +15,8 @@ impl fmt::Debug for LogCallback {
     }
 }
 
-pub(crate) const SNOWFLAKE_FINGERPRINT: &str =
-    "2B280B23E1107BB62ABFC40DDCC8824814F80A72";
+/// The bridge every constructor here reaches unless the caller names another.
+const PUBLIC_SNOWFLAKE_FINGERPRINT: &str = "2B280B23E1107BB62ABFC40DDCC8824814F80A72";
 const SNOWFLAKE_BROKER_URL: &str = "https://snowflake-broker.torproject.net/";
 const DIRECT_SNOWFLAKE_WS_URL: &str = "wss://snowflake.torproject.net/";
 
@@ -27,9 +27,22 @@ pub enum BridgeType {
     SnowflakeWebRtc {
         broker_url: String,
         stun_urls: Vec<String>,
+        fingerprint: String,
     },
     /// Direct browser WebSocket to the bridge, chosen explicitly by the caller.
-    SnowflakeWebSocket { url: String },
+    SnowflakeWebSocket { url: String, fingerprint: String },
+}
+
+impl BridgeType {
+    /// The bridge's RSA identity. Nothing else authenticates a bridge, so a
+    /// wrong value here fails the channel handshake; it cannot quietly put the
+    /// client on some other relay.
+    pub(crate) fn fingerprint(&self) -> &str {
+        match self {
+            Self::SnowflakeWebRtc { fingerprint, .. }
+            | Self::SnowflakeWebSocket { fingerprint, .. } => fingerprint,
+        }
+    }
 }
 
 /// Client options. The bridge choice is the only transport decision: a
@@ -54,6 +67,7 @@ impl TorClientOptions {
             bridge: BridgeType::SnowflakeWebRtc {
                 broker_url: SNOWFLAKE_BROKER_URL.to_string(),
                 stun_urls,
+                fingerprint: PUBLIC_SNOWFLAKE_FINGERPRINT.to_string(),
             },
             connection_timeout: 300_000,
             on_log: None,
@@ -66,7 +80,19 @@ impl TorClientOptions {
         Self {
             bridge: BridgeType::SnowflakeWebSocket {
                 url: DIRECT_SNOWFLAKE_WS_URL.to_string(),
+                fingerprint: PUBLIC_SNOWFLAKE_FINGERPRINT.to_string(),
             },
+            connection_timeout: 300_000,
+            on_log: None,
+        }
+    }
+
+    /// The same transport aimed at a bridge the caller runs, which has its own
+    /// RSA identity: `scripts/local-bridge` puts one on localhost so a test
+    /// does not have to pull the whole directory across the public bridge.
+    pub fn snowflake_websocket_at(url: String, fingerprint: String) -> Self {
+        Self {
+            bridge: BridgeType::SnowflakeWebSocket { url, fingerprint },
             connection_timeout: 300_000,
             on_log: None,
         }
@@ -100,6 +126,23 @@ mod tests {
             TorClientOptions::snowflake_websocket().bridge,
             BridgeType::SnowflakeWebSocket {
                 url: DIRECT_SNOWFLAKE_WS_URL.to_string(),
+                fingerprint: PUBLIC_SNOWFLAKE_FINGERPRINT.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_named_bridge_replaces_both_the_url_and_the_identity() {
+        let options = TorClientOptions::snowflake_websocket_at(
+            "ws://localhost:8080/".to_string(),
+            "AAAA".to_string(),
+        );
+        assert_eq!(options.bridge.fingerprint(), "AAAA");
+        assert_eq!(
+            options.bridge,
+            BridgeType::SnowflakeWebSocket {
+                url: "ws://localhost:8080/".to_string(),
+                fingerprint: "AAAA".to_string(),
             }
         );
     }
