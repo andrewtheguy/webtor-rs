@@ -44,6 +44,14 @@ const STUN_URLS = ['stun:stun.l.google.com:19302'];
 /** How long the page waits for its own service to answer. */
 const SELF_FETCH_TIMEOUT_MS = 240_000;
 
+/**
+ * How much of a request head this will read before giving up on a client.
+ * Anyone on the network can open a stream to a published service, and one
+ * that never sends the blank line would otherwise grow this tab's memory
+ * without bound.
+ */
+const MAX_REQUEST_HEAD_BYTES = 16 * 1024;
+
 function page(address: string, served: number): string {
   return `<!doctype html>
 <meta charset="utf-8">
@@ -97,7 +105,6 @@ export async function startOnionService(
 
   let served = 0;
   let stopped = false;
-  const decoder = new TextDecoder();
 
   // The accept loop runs for as long as the service does. Each client gets
   // its own task so a slow one cannot hold up the next.
@@ -106,12 +113,31 @@ export async function startOnionService(
       const stream = await service.accept();
       if (stream == null || stopped) return;
       void (async () => {
+        // Its own decoder: one shared between clients would carry a partial
+        // multi-byte character from one stream into the next.
+        const decoder = new TextDecoder();
         try {
           let request = '';
+          let headBytes = 0;
+          let oversized = false;
           while (!request.includes('\r\n\r\n')) {
             const chunk = await stream.receive();
             if (chunk == null) break;
+            headBytes += chunk.length;
+            if (headBytes > MAX_REQUEST_HEAD_BYTES) {
+              oversized = true;
+              break;
+            }
             request += decoder.decode(chunk, { stream: true });
+          }
+          if (oversized) {
+            log('error', 'A client sent an oversized request head');
+            await stream.send(
+              'HTTP/1.1 431 Request Header Fields Too Large\r\n' +
+                'Content-Length: 0\r\n' +
+                'Connection: close\r\n\r\n',
+            );
+            return;
           }
           const line = request.split('\r\n', 1)[0] ?? '(empty request)';
           served += 1;
@@ -149,8 +175,13 @@ export async function startOnionService(
     },
     async stop(): Promise<void> {
       stopped = true;
-      await service.close();
-      await client.close();
+      try {
+        await service.close();
+      } finally {
+        // A service that failed to withdraw is all the more reason to take
+        // the client's circuits down with it.
+        await client.close();
+      }
       log('info', 'Service withdrawn and client closed');
     },
   };

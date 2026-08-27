@@ -165,8 +165,11 @@ impl RecordLayer {
     where
         S: AsyncWrite + Unpin,
     {
-        // Split into multiple records if needed
-        for chunk in data.chunks(MAX_PLAINTEXT_SIZE) {
+        // One record carries at most 2^14 bytes of plaintext (RFC 8446 5.1),
+        // and TLS 1.3 counts the content type byte appended in
+        // `write_single_record` against that. A peer answers a larger record
+        // with a `record_overflow` alert and drops the connection.
+        for chunk in data.chunks(MAX_PLAINTEXT_SIZE - 1) {
             self.write_single_record(stream, content_type, chunk)
                 .await?;
         }
@@ -381,5 +384,26 @@ mod tests {
             declared <= MAX_RECORD_SIZE,
             "record of {declared} bytes is over the {MAX_RECORD_SIZE} byte limit"
         );
+    }
+
+    /// The same limit applies to a payload the caller hands `write_record` in
+    /// one piece: it becomes several records rather than one oversized one.
+    #[test]
+    fn write_record_splits_at_the_plaintext_limit() {
+        let mut layer = RecordLayer::new();
+        let mut written: Vec<u8> = Vec::new();
+
+        futures::executor::block_on(layer.write_record(
+            &mut written,
+            CONTENT_TYPE_APPLICATION_DATA,
+            &vec![0_u8; MAX_PLAINTEXT_SIZE],
+        ))
+        .unwrap();
+
+        let first = u16::from_be_bytes([written[3], written[4]]) as usize;
+        assert_eq!(first, MAX_PLAINTEXT_SIZE - 1);
+        let rest = &written[5 + first..];
+        assert_eq!(u16::from_be_bytes([rest[3], rest[4]]) as usize, 1);
+        assert_eq!(rest.len(), 5 + 1);
     }
 }

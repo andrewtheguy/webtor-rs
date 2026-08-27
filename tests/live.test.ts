@@ -248,9 +248,9 @@ describe('webtor-wasm over Tor', () => {
     const body = `webtor onion service ${Date.now()}`;
     const published = await harness.call('servicePublish', { introPoints: 3 });
     console.log(`  published ${published.address} in ${published.seconds}s`);
-    assert.match(published.address, /^[a-z2-7]{56}\.onion$/);
 
     try {
+      assert.match(published.address, /^[a-z2-7]{56}\.onion$/);
       assert.equal(await harness.call('serviceServeHttp', body), 'serving');
       const path = `/webtor-${Date.now()}`;
       const response = await harness.call(

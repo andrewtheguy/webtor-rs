@@ -124,6 +124,12 @@ struct EstablishedIntroPoint {
 ///
 /// Dropping it, or calling [`OnionService::close`], tears down the
 /// introduction points; the descriptor then expires on its own.
+///
+/// The descriptor is published once and never renewed, so the address stops
+/// being reachable after `DESCRIPTOR_LIFETIME`, or sooner if the onion
+/// service time period turns over before that. A service meant to outlive
+/// that would have to rebuild and re-upload the descriptor in the
+/// background.
 pub struct OnionService {
     address: String,
     incoming: Mutex<mpsc::Receiver<DataStream>>,
@@ -477,7 +483,6 @@ fn build_descriptor<R: rand::Rng + rand::CryptoRng>(
         .map_err(|error| TorError::Onion(format!("Failed to sign the descriptor: {error}")))
 }
 
-/// POST the descriptor to every responsible HSDir. One acceptance is enough
 /// Store the descriptor at every HSDir responsible for it, resolving as soon
 /// as each replica holds a copy.
 ///
@@ -683,7 +688,7 @@ async fn serve_introduction(
         .await
         .map_err(|error| TorError::Onion(format!("Failed to send RENDEZVOUS1: {error}")))?;
     state.log("A client circuit is open", LogType::Success);
-    state.tunnels.write().await.push(tunnel);
+    state.tunnels.write().await.push(tunnel.clone());
 
     while let Some(request) = requests.next().await {
         let stream = match request
@@ -699,6 +704,15 @@ async fn serve_introduction(
         if streams.send(stream).await.is_err() {
             // Nobody is accepting any more; the service is closing.
             break;
+        }
+    }
+
+    // This client is done, so stop holding its circuit open: a service that
+    // kept every one of them would collect them for as long as it ran.
+    {
+        let mut tunnels = state.tunnels.write().await;
+        if let Some(index) = tunnels.iter().position(|held| Arc::ptr_eq(held, &tunnel)) {
+            tunnels.swap_remove(index);
         }
     }
     Ok(())

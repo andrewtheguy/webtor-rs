@@ -256,7 +256,9 @@
                 await stream.send(
                   `HTTP/1.1 200 OK\r\n` +
                     `Content-Type: text/plain\r\n` +
-                    `Content-Length: ${body.length}\r\n` +
+                    // Bytes, not code units: a non-ASCII body would otherwise
+                    // be cut short by whatever read the header.
+                    `Content-Length: ${new TextEncoder().encode(body).length}\r\n` +
                     `Connection: close\r\n\r\n${body}`,
                 );
               } catch (error) {

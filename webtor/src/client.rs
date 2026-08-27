@@ -117,6 +117,10 @@ impl TorClient {
     /// introductions. The identity key is generated here and never stored, so
     /// every call yields a new address that lives as long as the returned
     /// service.
+    ///
+    /// The descriptor is uploaded once and not renewed: the address stops
+    /// being reachable a few hours later, when the descriptor expires or the
+    /// onion service time period turns over.
     pub async fn publish_onion_service(
         &self,
         options: OnionServiceOptions,
