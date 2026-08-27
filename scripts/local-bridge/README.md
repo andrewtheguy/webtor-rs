@@ -15,46 +15,56 @@ microdescriptors in 117 batches — bootstraps in **7.1 s**, and the whole live
 suite, publishing an onion service and round-tripping to it included, finishes
 in 40 s. Against the public bridge the same seedless bootstrap takes minutes.
 
-## Build and run
+## Run it
+
+`bridge.sh` wraps the podman commands:
 
 ```bash
-podman build -t localhost/webtor-local-bridge scripts/local-bridge
-podman run -d --name webtor-bridge -p 127.0.0.1:8080:8080 \
-  -v webtor-bridge-data:/var/lib/tor localhost/webtor-local-bridge
-podman logs -f webtor-bridge
+scripts/local-bridge/bridge.sh start     # builds the image if it is missing
+scripts/local-bridge/bridge.sh status
+scripts/local-bridge/bridge.sh logs      # follow, ctrl-c to detach
+scripts/local-bridge/bridge.sh stop
 ```
 
-The `-p 127.0.0.1:` prefix matters: this bridge has no anonymity story and no
-business being reachable from the rest of the network.
-
-Wait for `Bootstrapped 100%`, which takes a minute or two on first start — the
-bridge has to fill its own directory cache before it can serve yours. The logs
-print what you need:
+`start` waits for tor to generate the identity and prints what the client
+needs:
 
 ```
-bridge fingerprint: 82F663FA372767B5373A3CA7EAD6F2F68F331ADB
-bridge websocket:   ws://localhost:8080/
+export BRIDGE_URL=ws://localhost:8080/
+export BRIDGE_FINGERPRINT=82F663FA372767B5373A3CA7EAD6F2F68F331ADB
 ```
 
-Keep the named volume. The fingerprint is the identity tor generated on first
-start; without the volume it changes every run and every config below goes
-stale.
+`env` prints those two lines alone and `fingerprint` prints the identity alone,
+both of which work while the bridge is stopped, so a shell can take them
+directly:
+
+```bash
+eval "$(scripts/local-bridge/bridge.sh env)" && bun run test:live
+```
+
+`stop` removes the container but keeps the `webtor-bridge-data` volume, which
+is what holds the identity and the directory cache. Keep it: without it the
+fingerprint changes on every start and every config below goes stale. It also
+makes restarts cheap — a first start needs a minute or two to fill the
+directory cache, a restart against a warm volume reaches `Bootstrapped 100%`
+in about nine seconds.
+
+The bridge has to be bootstrapped before it can serve directory data;
+`status` says whether it is.
 
 ## Point something at it
 
 The live suite:
 
 ```bash
-BRIDGE_URL=ws://localhost:8080/ \
-BRIDGE_FINGERPRINT=<fingerprint from the logs> \
-bun run test:live
+eval "$(scripts/local-bridge/bridge.sh env)" && bun run test:live
 ```
 
 The onion service example, in `examples/onion-service-poc/.env.local`:
 
 ```
 VITE_BRIDGE_URL=ws://localhost:8080/
-VITE_BRIDGE_FINGERPRINT=<fingerprint from the logs>
+VITE_BRIDGE_FINGERPRINT=<what `bridge.sh fingerprint` prints>
 ```
 
 Both are all-or-nothing. A URL with no fingerprint is a request to trust
@@ -73,9 +83,10 @@ above were taken with those warnings scrolling past.
 ## What this is not
 
 A bridge anyone else should use. `PublishServerDescriptor 0` keeps it out of
-BridgeDB and `AssumeReachable 1` skips the ORPort self-test that could never
-pass from inside a container with no inbound port. Both are safe only because
-this bridge is never handed to anybody. Do not lift this torrc into anything
+BridgeDB, `AssumeReachable 1` skips the ORPort self-test that could never pass
+from inside a container with no inbound port, and `bridge.sh` publishes the
+port on `127.0.0.1` only. All three are safe only because this bridge is never
+handed to anybody. Do not lift this torrc into anything
 that is.
 
 It is also not anonymity: the bridge sees your IP, which the public one does
