@@ -11,12 +11,24 @@
 
 use crate::time::Instant;
 use futures::{AsyncRead, AsyncWrite};
+use gloo_timers::future::TimeoutFuture;
 use kcp::Kcp;
+use std::future::Future;
 use std::io::{self, Write};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tracing::debug;
+
+/// How often KCP's own clock runs while the transport is quiet.
+///
+/// Retransmissions, window probes and any segment the send window would not
+/// take when it was queued leave KCP only from `update()`. Nothing else calls
+/// it once both ends fall silent, so without this a burst that fills the
+/// window — several circuits created at once, or a descriptor upload — wedges
+/// the connection permanently.
+const TICK_MIN_MS: u32 = 10;
+const TICK_MAX_MS: u32 = 100;
 
 /// Output buffer that collects data from KCP for sending
 #[derive(Clone)]
@@ -93,6 +105,8 @@ pub struct KcpStream<S> {
     start_time: Instant,
     /// Pending output data that needs to be written to transport
     pending_write: Vec<u8>,
+    /// Wakes the reader when KCP's clock next needs to run.
+    tick: Option<TimeoutFuture>,
 }
 
 impl<S> KcpStream<S> {
@@ -111,11 +125,53 @@ impl<S> KcpStream<S> {
             transport,
             start_time: Instant::now(),
             pending_write: Vec::new(),
+            tick: None,
         }
     }
 
     fn current_ms(&self) -> u32 {
         self.start_time.elapsed().as_millis() as u32
+    }
+}
+
+impl<S: AsyncWrite + Unpin> KcpStream<S> {
+    /// Run KCP's clock while the transport has nothing to deliver, and arm
+    /// the next run. Always returns `Pending`: it produces protocol traffic,
+    /// never application bytes.
+    fn poll_tick(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        if let Some(tick) = self.tick.as_mut() {
+            match Pin::new(tick).poll(cx) {
+                // The timer is still running, and holds the waker.
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(()) => self.tick = None,
+            }
+        }
+
+        let current = self.current_ms();
+        if let Err(error) = self.kcp.update(current) {
+            return Poll::Ready(Err(io::Error::other(format!(
+                "KCP update error: {error:?}"
+            ))));
+        }
+        let mut outgoing = std::mem::take(&mut self.pending_write);
+        outgoing.extend_from_slice(&self.output.take());
+        if !outgoing.is_empty() {
+            match Pin::new(&mut self.transport).poll_write(cx, &outgoing) {
+                Poll::Ready(Ok(written)) => {
+                    self.pending_write = outgoing.split_off(written.min(outgoing.len()));
+                    let _ = Pin::new(&mut self.transport).poll_flush(cx);
+                }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => self.pending_write = outgoing,
+            }
+        }
+
+        let delay = self.kcp.check(current).clamp(TICK_MIN_MS, TICK_MAX_MS);
+        let mut tick = TimeoutFuture::new(delay);
+        // Poll once so the timer holds this task's waker.
+        let _ = Pin::new(&mut tick).poll(cx);
+        self.tick = Some(tick);
+        Poll::Pending
     }
 }
 
@@ -206,7 +262,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for KcpStream<S> {
                 debug!("KCP read: transport error: {}", e);
                 Poll::Ready(Err(e))
             }
-            Poll::Pending => Poll::Pending,
+            // Nothing to read is when KCP's own clock has to run: see
+            // `poll_tick`.
+            Poll::Pending => self.poll_tick(cx),
         }
     }
 }
