@@ -82,12 +82,18 @@ Bootstraps a client. Every option is optional.
 | `stunUrls` | — | STUN servers for the `"webrtc"` bridge; required there and refused otherwise. |
 | `directorySeed` | — | A previous `directoryCache()`. Without one the client downloads the directory over a single bridge circuit, which is the slowest and least reliable part of a bootstrap. |
 | `connectionTimeoutMs` | `300000` | Bootstrap budget. |
-| `verifyOnion` | `false` | `true` fetches the Tor Project's onion site before `create` resolves, so the client is proven to complete a rendezvous; a string uses that URL instead. |
 | `log` | `true` | Write bootstrap progress to the console. |
 | `logPrefix` | `"[webtor]"` | |
 
 An unknown option is an error, not a shrug: a misspelled `maxMessageBytes`
 would otherwise leave a limit un-enforced for minutes before anything noticed.
+
+`create` resolves once the client has a Tor channel and a directory, and it
+reaches nothing on its own. A caller that wants proof of a full rendezvous
+before it trusts the client does that itself — `fetch` whatever onion it
+considers a good witness and check the status, the way
+`examples/nostr-onion-poc` does. Which service is worth reaching is the
+caller's question, and no third-party address is compiled into the wasm.
 
 ### Methods
 

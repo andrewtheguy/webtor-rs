@@ -26,15 +26,8 @@ use webtor::{
     WebSocketReader, WebSocketWriter,
 };
 
-/// The Tor Project's own onion site. Fetching it exercises the whole client —
-/// HSDir lookup, introduction, rendezvous and a stream — which is what the
-/// `verifyOnion` option asks for when it is set to `true`.
-const DEFAULT_VERIFY_URL: &str =
-    "http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/";
-
 const DEFAULT_CONNECTION_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 240_000;
-const DEFAULT_VERIFY_TIMEOUT_MS: u64 = 240_000;
 /// Time for the onion stream plus the RFC 6455 upgrade on it.
 const DEFAULT_WEBSOCKET_TIMEOUT_MS: u64 = 240_000;
 const DEFAULT_MAX_MESSAGE_BYTES: u64 = 1024 * 1024;
@@ -45,7 +38,6 @@ const CLIENT_OPTIONS: &[&str] = &[
     "stunUrls",
     "directorySeed",
     "connectionTimeoutMs",
-    "verifyOnion",
     "log",
     "logPrefix",
 ];
@@ -83,7 +75,6 @@ type Logger = Arc<dyn Fn(&str, LogType) + Send + Sync>;
 struct ClientConfig {
     options: TorClientOptions,
     directory_seed: Option<String>,
-    verify_url: Option<String>,
     log: Logger,
 }
 
@@ -137,63 +128,12 @@ fn read_client_config(raw: Option<js_sys::Object>) -> Result<ClientConfig, JsVal
     let for_client = log.clone();
     options = options.with_on_log(move |message, log_type| for_client(message, log_type));
 
-    // `verifyOnion` is either a flag choosing the default target or the URL.
-    let verify = options::raw(&bag, "verifyOnion");
-    let verify_url = if verify.is_undefined() || verify.is_null() {
-        None
-    } else if let Some(flag) = verify.as_bool() {
-        flag.then(|| DEFAULT_VERIFY_URL.to_string())
-    } else if let Some(url) = verify.as_string() {
-        Some(url)
-    } else {
-        return Err(option_error(
-            "WebtorClient.create option \"verifyOnion\" must be a boolean or a URL string",
-        ));
-    };
-
     Ok(ClientConfig {
         options,
         directory_seed: options::string(&bag, "directorySeed", what)?
             .filter(|seed| !seed.is_empty()),
-        verify_url,
         log,
     })
-}
-
-/// Prove the client can complete a rendezvous before it is handed over, so a
-/// caller that only watches the log channel gets a verdict either way.
-async fn verify_onion_client(client: &TorClient, url: &str, log: &Logger) -> Result<(), JsValue> {
-    log(
-        &format!("Verifying the onion client against {url} ..."),
-        LogType::Info,
-    );
-    let outcome = webtor::with_timeout(
-        Duration::from_millis(DEFAULT_VERIFY_TIMEOUT_MS),
-        "Onion client verification",
-        client.get(url),
-    )
-    .await;
-    let status = match outcome {
-        Ok(response) if response.is_success() => response.status,
-        Ok(response) => {
-            let message = format!(
-                "Onion client verification against {url} failed: answered HTTP {}",
-                response.status
-            );
-            log(&message, LogType::Error);
-            return Err(JsValue::from_str(&message));
-        }
-        Err(error) => {
-            let message = format!("Onion client verification against {url} failed: {error}");
-            log(&message, LogType::Error);
-            return Err(JsValue::from_str(&message));
-        }
-    };
-    log(
-        &format!("Onion client verified: {url} answered HTTP {status}."),
-        LogType::Success,
-    );
-    Ok(())
 }
 
 /// Whether `host` is a v3 onion address.
@@ -249,10 +189,13 @@ impl WebtorClient {
     /// - `directorySeed`: a previous `directoryCache()`, to skip downloading
     ///   the directory over the bridge.
     /// - `connectionTimeoutMs`: bootstrap budget, default 300000.
-    /// - `verifyOnion`: `true`, or a `http://…onion/` URL, to prove the client
-    ///   can complete a rendezvous before `create` resolves. Default `false`.
     /// - `log`: write progress to the console, default `true`.
     /// - `logPrefix`: default `"[webtor]"`.
+    ///
+    /// A caller that wants proof the client can complete a rendezvous before
+    /// it uses it does that itself, with a `fetch` against a service it
+    /// chooses: which onion is worth reaching is the caller's question, and
+    /// no answer to it belongs in this binding.
     #[wasm_bindgen(js_name = create)]
     pub fn create(options: Option<js_sys::Object>) -> js_sys::Promise {
         future_to_promise(async move {
@@ -271,10 +214,6 @@ impl WebtorClient {
                 .ensure_ready()
                 .await
                 .map_err(|error| js_error("Failed to establish Tor connection", error))?;
-            if let Some(url) = &config.verify_url {
-                verify_onion_client(&client, url, &log).await?;
-            }
-
             Ok(JsValue::from(Self {
                 client: Arc::new(client),
                 log,

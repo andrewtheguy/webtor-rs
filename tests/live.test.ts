@@ -73,6 +73,23 @@ describe('webtor-wasm over Tor', () => {
     }
     const { seconds } = await harness.call('create', options, seedUrl);
     console.log(`  client ready in ${seconds}s`);
+
+    // What the binding's `verifyOnion` option used to do before `create`
+    // resolved, now that no third-party address is compiled into the wasm:
+    // prove the client completes a rendezvous before any case depends on it,
+    // so a broken bootstrap fails here with one message naming what it tried
+    // instead of as whichever case happened to run first.
+    const verified = await firstReachable(HTTP_TARGETS, (url) =>
+      harness.call('fetch', url, { timeoutMs: ATTEMPT_TIMEOUT_MS }),
+    );
+    assert.equal(
+      verified.result.status,
+      200,
+      `${verified.target} answered HTTP ${verified.result.status}`,
+    );
+    console.log(
+      `  client verified against ${verified.target} in ${verified.result.seconds}s`,
+    );
   });
 
   after(async () => {

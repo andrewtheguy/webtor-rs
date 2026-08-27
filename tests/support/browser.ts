@@ -36,7 +36,6 @@ export interface CreateOptions {
   logPrefix?: string;
   maxMessageBytes?: number;
   stunUrls?: string[];
-  verifyOnion?: boolean | string;
   [option: string]: unknown;
 }
 

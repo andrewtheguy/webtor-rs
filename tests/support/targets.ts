@@ -5,7 +5,12 @@
 // https://github.com/0xtrr/onion-service-nostr-relays, which tracks no uptime;
 // docs/onion-relay-probe-2026-08-25.md records one pass over the whole list.
 
-/** The Tor Project's own site, served as a v3 onion over plain HTTP. */
+/**
+ * The Tor Project's own site, served as a v3 onion over plain HTTP. This is
+ * the only place the address lives: the binding compiles no onion address of
+ * its own, so what a client should be checked against is decided here, by the
+ * caller, rather than shipped to every project that loads the wasm.
+ */
 export const HTTP_TARGETS = [
   'http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/',
 ];
