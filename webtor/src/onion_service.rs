@@ -23,7 +23,8 @@
 
 use crate::circuit::{make_circ_params, CircuitManager};
 use crate::config::{LogCallback, LogType};
-use crate::directory::{post_directory_document, DirectoryManager};
+use crate::dir_http::post_directory_document;
+use crate::directory::DirectoryManager;
 use crate::error::{Result, TorError};
 use crate::onion::{select_hsdirs_with_spread, verbatim_target, HsDirParams};
 use crate::relay::{selection, Relay, RelayManager};

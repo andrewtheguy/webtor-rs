@@ -15,6 +15,19 @@ impl fmt::Debug for LogCallback {
     }
 }
 
+/// Told about a directory the client downloaded, as the encoded seed a later
+/// bootstrap would take.
+#[derive(Clone)]
+pub(crate) struct DirectoryCallback(pub Arc<DirectoryHandler>);
+
+type DirectoryHandler = dyn Fn(&str) + Send + Sync;
+
+impl fmt::Debug for DirectoryCallback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DirectoryCallback")
+    }
+}
+
 /// The bridge every constructor here reaches unless the caller names another.
 const PUBLIC_SNOWFLAKE_FINGERPRINT: &str = "2B280B23E1107BB62ABFC40DDCC8824814F80A72";
 const SNOWFLAKE_BROKER_URL: &str = "https://snowflake-broker.torproject.net/";
@@ -52,6 +65,7 @@ pub struct TorClientOptions {
     pub bridge: BridgeType,
     connection_timeout: u64,
     pub(crate) on_log: Option<LogCallback>,
+    pub(crate) on_directory_change: Option<DirectoryCallback>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -74,6 +88,7 @@ impl TorClientOptions {
             },
             connection_timeout: 300_000,
             on_log: None,
+            on_directory_change: None,
         }
     }
 
@@ -87,6 +102,7 @@ impl TorClientOptions {
             },
             connection_timeout: 300_000,
             on_log: None,
+            on_directory_change: None,
         }
     }
 
@@ -98,6 +114,7 @@ impl TorClientOptions {
             bridge: BridgeType::SnowflakeWebSocket { url, fingerprint },
             connection_timeout: 300_000,
             on_log: None,
+            on_directory_change: None,
         }
     }
 
@@ -111,6 +128,27 @@ impl TorClientOptions {
         F: Fn(&str, LogType) + Send + Sync + 'static,
     {
         self.on_log = Some(LogCallback(Arc::new(on_log)));
+        self
+    }
+
+    /// Take every directory this client downloads, encoded the way
+    /// [`crate::TorClient::directory_cache_json`] encodes one.
+    ///
+    /// A client refreshes its directory while a published service is up, and
+    /// `directory_cache_json` is a pull: without this, a caller that exported
+    /// the cache once after bootstrap stores the directory it started with and
+    /// never sees a newer one. Where the seed is kept is still entirely the
+    /// caller's: this hands over a string and makes no assumption about what
+    /// happens to it.
+    ///
+    /// A seed supplied through [`crate::TorClient::set_directory_seed`] is not
+    /// announced. The caller already has it, and reporting it back would say a
+    /// directory changed when none did.
+    pub fn with_on_directory_change<F>(mut self, on_directory_change: F) -> Self
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
+        self.on_directory_change = Some(DirectoryCallback(Arc::new(on_directory_change)));
         self
     }
 

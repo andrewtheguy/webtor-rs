@@ -56,6 +56,7 @@ impl TorClient {
         let directory_manager = Arc::new(DirectoryManager::new(
             relay_manager.clone(),
             options.on_log.clone(),
+            options.on_directory_change.clone(),
         ));
         let circuit_manager = Arc::new(CircuitManager::new(
             relay_manager.clone(),

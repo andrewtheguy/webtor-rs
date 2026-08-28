@@ -66,6 +66,7 @@ Bootstraps a client. Every option is optional.
 | `log` | `true` | Write bootstrap progress to the console. |
 | `logPrefix` | `"[webtor]"` | |
 | `onLog` | — | `(message, level)` to take every line instead of the console, where `level` is `"info"`, `"success"`, `"warn"` or `"error"`. It replaces the console sink that `log` and `logPrefix` configure, so passing it with either is an error. Arti's own warnings arrive here too; nothing else in a browser observes them. |
+| `onDirectoryChange` | — | `(seed)` called with a new `directoryCache()` every time this client downloads a directory, including the refreshes a published service does hours into its life. A `directorySeed` is never handed back, having come from the caller. |
 
 An unknown option is an error, not a shrug: a misspelled `maxMessageBytes`
 would otherwise leave a limit un-enforced for minutes before anything noticed.
@@ -111,7 +112,10 @@ caller's question, and no third-party address is compiled into the wasm.
   trust of its own. The format is versioned; a seed from an older client is
   rejected and a fresh directory downloaded. Where a seed is kept — IndexedDB,
   a file served with the app, nowhere — is the caller's business; webtor holds
-  it in memory and touches no storage API.
+  it in memory and touches no storage API. This is a pull, and a long-lived
+  client refreshes its directory while it runs: a caller that exports once
+  after `create` stores the directory it started with, which is what
+  `onDirectoryChange` is for.
 - `close()` — aborts calls still building circuits and tears the client down.
 
 Three free functions need no client and touch no network: `isOnionHost(host)`,
@@ -200,7 +204,7 @@ The current line is `0.0.1-alpha.*`.
 webtor/       the Tor client: directory, circuits, onion rendezvous, HTTP, WebSocket
 webtor-wasm/  the wasm-bindgen surface packed for distribution
 subtle-tls/   the TLS 1.3 session the bridge channel runs inside (see its README)
-docs/         architecture, network-observation notes, and follow-ups
+docs/         architecture and network-observation notes
 tests/        the browser test project
 examples/     standalone browser integrations
 scripts/      the SOCKS-based probe and an opt-in local WebSocket bridge

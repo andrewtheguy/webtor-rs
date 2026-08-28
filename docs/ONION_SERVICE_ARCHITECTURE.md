@@ -79,6 +79,13 @@ placement arithmetic. Where the seed was stored is likewise outside webtor:
 `directoryCache()` returns a string and `directorySeed` accepts one, and no
 storage API is reachable from the wasm.
 
+A published service refreshes the directory and republishes every 60–120
+minutes, so the directory a long-lived client holds is not the one it
+bootstrapped with. `onDirectoryChange` is handed each downloaded directory as
+it is installed, in the same encoding `directoryCache()` returns, which is how
+an application keeps a current seed without polling for one. A seed the caller
+supplied is never announced back: nothing about the directory changed.
+
 ## Connecting to an Onion Service
 
 For `connectStream`, `fetch`, or `connectWebSocket`, the client:

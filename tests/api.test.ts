@@ -277,6 +277,10 @@ describe('webtor-wasm API', () => {
         () => harness.call('createRejects', { stunUrls: 'stun:one' }),
         /must be an array of strings/,
       );
+      await assert.rejects(
+        () => harness.call('createRejects', { onDirectoryChange: 'store it' }),
+        /must be a function/,
+      );
     });
   });
 });

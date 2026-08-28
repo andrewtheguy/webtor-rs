@@ -1,18 +1,23 @@
-//! Directory management and consensus fetching
+//! The directory this client builds circuits from.
+//!
+//! One directory is a consensus, the authority certificates that sign it, and
+//! the microdescriptors it names. This module gets those — downloaded over a
+//! bridge, or supplied by the caller as a seed — checks them against the
+//! pinned authorities, and turns them into the relays and onion service rings
+//! everything else selects from. Speaking HTTP to a directory cache to get
+//! them is [`crate::dir_http`].
 
 use crate::authority::{authority_certs_path, parse_authority_certs, UncheckedConsensus};
-use crate::config::{LogCallback, LogType};
+use crate::config::{DirectoryCallback, LogCallback, LogType};
+use crate::dir_http::fetch_directory_document;
 use crate::error::{Result, TorError};
 use crate::onion::{HsDirParams, HsDirPlacement, HsDirRings};
 use crate::relay::{Relay, RelayManager};
 use crate::time::system_time_now;
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
-use flate2::read::ZlibDecoder;
-use futures::{AsyncReadExt, AsyncWriteExt};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use async_lock::RwLock;
@@ -36,12 +41,6 @@ const MIN_RELAYS_PER_ROLE: usize = 10;
 const MICRODESCRIPTOR_CHUNK_SIZE: usize = 46;
 const MAX_PARALLEL_CHUNKS: usize = 1;
 const MIN_HSDIR_RELAYS: usize = 100;
-/// Bounds what one directory response off a Tor stream may buffer. The bridge
-/// serving it is untrusted, so this caps an endless stream and a decompression
-/// bomb; it does not bound directory data supplied by the embedding page.
-const MAX_DIRECTORY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
-/// A response whose headers run past this is not one a directory sent.
-const MAX_DIRECTORY_HEADER_BYTES: usize = 8 * 1024;
 const DIRECTORY_CACHE_VERSION: u32 = 3;
 /// Bounds on the bridge's directory service. `tor-proto` has none of its
 /// own, and an instance behind the Snowflake fingerprint sometimes takes a
@@ -164,10 +163,16 @@ struct ProcessedDirectory {
     hsdir_params: HsDirRings,
 }
 
-/// Directory manager for handling network documents
+/// The directory in force, and what it took to get it: one of these holds
+/// the installed consensus, the relays it named, and the seed a caller can
+/// store to skip the download next time.
 pub struct DirectoryManager {
-    pub relay_manager: Arc<RwLock<RelayManager>>,
+    relay_manager: Arc<RwLock<RelayManager>>,
     on_log: Option<LogCallback>,
+    /// Told about every directory this manager downloads. Nothing here stores
+    /// a seed anywhere but in memory; keeping one is the caller's business,
+    /// and this is how a caller hears there is a newer one to keep.
+    on_directory_change: Option<DirectoryCallback>,
     cache: Arc<RwLock<Option<DirectoryCache>>>,
     hsdir_params: Arc<RwLock<Option<HsDirRings>>>,
     /// Microdescriptors from a supplied directory whose consensus was
@@ -182,10 +187,15 @@ pub struct DirectoryManager {
 }
 
 impl DirectoryManager {
-    pub fn new(relay_manager: Arc<RwLock<RelayManager>>, on_log: Option<LogCallback>) -> Self {
+    pub fn new(
+        relay_manager: Arc<RwLock<RelayManager>>,
+        on_log: Option<LogCallback>,
+        on_directory_change: Option<DirectoryCallback>,
+    ) -> Self {
         Self {
             relay_manager,
             on_log,
+            on_directory_change,
             cache: Arc::new(RwLock::new(None)),
             hsdir_params: Arc::new(RwLock::new(None)),
             retained_microdescriptors: RwLock::new(HashMap::new()),
@@ -269,14 +279,31 @@ impl DirectoryManager {
         let processed = process_directory_documents(&consensus, &microdescs_body)?;
         self.install_directory(processed, false).await;
         self.retained_microdescriptors.write().await.clear();
-        *self.cache.write().await = Some(DirectoryCache {
+        let cache = DirectoryCache {
             version: DIRECTORY_CACHE_VERSION,
             consensus: consensus_body,
             certificates: certificates_body,
             microdescriptors: microdescs_body,
-        });
+        };
+        self.announce(&cache);
+        *self.cache.write().await = Some(cache);
 
         Ok(())
+    }
+
+    /// Offer a downloaded directory to whoever asked to be told about one.
+    ///
+    /// Only downloads reach here. A seed the caller supplied is already in its
+    /// hands, and announcing it back would report a change that never
+    /// happened.
+    fn announce(&self, cache: &DirectoryCache) {
+        let Some(callback) = &self.on_directory_change else {
+            return;
+        };
+        match cache.encode() {
+            Ok(encoded) => (callback.0)(&encoded),
+            Err(error) => warn!("Could not offer the refreshed directory to the caller: {error}"),
+        }
     }
 
     pub async fn load_cache(&self, encoded: &str) -> Result<()> {
@@ -534,129 +561,6 @@ impl DirectoryManager {
     }
 }
 
-/// GET one document from the directory cache at the end of `tunnel`, with
-/// the request shape Tor clients use, and return the decoded body.
-pub(crate) async fn fetch_directory_document(
-    tunnel: &Arc<ClientTunnel>,
-    path: &str,
-) -> Result<String> {
-    let mut stream = tunnel
-        .clone()
-        .begin_dir_stream()
-        .await
-        .map_err(|e| TorError::Internal(format!("Failed to begin dir stream: {}", e)))?;
-    let request = format!(
-        "GET {} HTTP/1.0\r\n\
-         Host: directory\r\n\
-         Accept-Encoding: deflate\r\n\
-         Connection: close\r\n\
-         \r\n",
-        path
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .map_err(|e| TorError::Network(format!("Failed to write dir request: {}", e)))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| TorError::Network(format!("Failed to flush dir request: {}", e)))?;
-    let response = read_directory_response(&mut stream).await?;
-    let body = decode_directory_response(&response)?;
-    String::from_utf8(body)
-        .map_err(|e| TorError::serialization(format!("Directory document is not UTF-8: {}", e)))
-}
-
-/// POST one document to the directory cache at the end of `tunnel`, with the
-/// request shape a Tor onion service uses to publish its descriptor. The
-/// response body is empty; only its status matters.
-pub(crate) async fn post_directory_document(
-    tunnel: &Arc<ClientTunnel>,
-    path: &str,
-    document: &str,
-) -> Result<()> {
-    let mut stream = tunnel
-        .clone()
-        .begin_dir_stream()
-        .await
-        .map_err(|e| TorError::Internal(format!("Failed to begin dir stream: {}", e)))?;
-    // The same request shape Arti sends: no Host, no Content-Type, and the
-    // encodings every Tor speaks.
-    let request = format!(
-        "POST {} HTTP/1.0\r\n\
-         Accept-Encoding: deflate, identity\r\n\
-         Content-Length: {}\r\n\
-         \r\n{}",
-        path,
-        document.len(),
-        document
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .map_err(|e| TorError::Network(format!("Failed to write dir request: {}", e)))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| TorError::Network(format!("Failed to flush dir request: {}", e)))?;
-    // A stored descriptor is answered with a status line and nothing else, and
-    // the relay may hold the stream open afterwards — so this reads to the end
-    // of the headers rather than to end of stream.
-    let status = read_directory_status(&mut stream).await?;
-    if status != 200 {
-        return Err(TorError::DirectoryStatus(status));
-    }
-    Ok(())
-}
-
-/// Read one directory response's headers and return its HTTP status.
-async fn read_directory_status<R>(stream: &mut R) -> Result<u16>
-where
-    R: futures::AsyncRead + Unpin,
-{
-    let mut response = Vec::new();
-    let mut buffer = [0_u8; 1024];
-    loop {
-        if let Some((body_start, _)) = directory_response_metadata(&response)? {
-            let header_text = std::str::from_utf8(&response[..body_start - 4]).map_err(|e| {
-                TorError::ConsensusFetch(format!("Directory response headers are not UTF-8: {e}"))
-            })?;
-            return parse_directory_status(header_text);
-        }
-        if response.len() > MAX_DIRECTORY_HEADER_BYTES {
-            return Err(TorError::ConsensusFetch(
-                "Directory response headers were too long".to_string(),
-            ));
-        }
-        let read = stream.read(&mut buffer).await.map_err(|e| {
-            TorError::Network(format!("Failed to read directory response: {e}"))
-        })?;
-        if read == 0 {
-            return Err(TorError::ConsensusFetch(
-                "Directory closed the stream before answering".to_string(),
-            ));
-        }
-        response.extend_from_slice(&buffer[..read]);
-    }
-}
-
-/// The status code out of a response's header block.
-fn parse_directory_status(header_text: &str) -> Result<u16> {
-    let status_line = header_text.lines().next().ok_or_else(|| {
-        TorError::ConsensusFetch("Directory response had no HTTP status".to_string())
-    })?;
-    status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| {
-            TorError::ConsensusFetch("Directory response had an invalid HTTP status".to_string())
-        })?
-        .parse::<u16>()
-        .map_err(|e| {
-            TorError::ConsensusFetch(format!("Directory response status was invalid: {e}"))
-        })
-}
-
 fn select_microdescriptor_digests(consensus: &MdConsensus) -> Result<Vec<[u8; 32]>> {
     let mut middle_digests: Vec<[u8; 32]> = consensus
         .relays()
@@ -846,150 +750,9 @@ fn encode_microdescriptor_digest(digest: &[u8; 32]) -> String {
     STANDARD_NO_PAD.encode(digest)
 }
 
-async fn read_directory_response<R>(stream: &mut R) -> Result<Vec<u8>>
-where
-    R: futures::AsyncRead + Unpin,
-{
-    let mut response = Vec::new();
-    let mut buffer = [0_u8; 8192];
-    let mut metadata = None;
-
-    loop {
-        let read = stream
-            .read(&mut buffer)
-            .await
-            .map_err(|e| TorError::Network(format!("Failed to read directory response: {}", e)))?;
-        if read == 0 {
-            break;
-        }
-
-        response.extend_from_slice(&buffer[..read]);
-        if response.len() > MAX_DIRECTORY_RESPONSE_BYTES {
-            return Err(TorError::ConsensusFetch(format!(
-                "Directory response exceeded {} bytes",
-                MAX_DIRECTORY_RESPONSE_BYTES
-            )));
-        }
-
-        if metadata.is_none() {
-            metadata = directory_response_metadata(&response)?;
-        }
-        if let Some((body_start, Some(content_length))) = metadata {
-            let expected_length = body_start.checked_add(content_length).ok_or_else(|| {
-                TorError::ConsensusFetch("Directory Content-Length overflowed".to_string())
-            })?;
-            if response.len() >= expected_length {
-                response.truncate(expected_length);
-                break;
-            }
-        }
-    }
-
-    let (body_start, content_length) = directory_response_metadata(&response)?.ok_or_else(|| {
-        TorError::ConsensusFetch("Directory response had incomplete HTTP headers".to_string())
-    })?;
-    if let Some(content_length) = content_length {
-        let actual_length = response.len().saturating_sub(body_start);
-        if actual_length != content_length {
-            return Err(TorError::ConsensusFetch(format!(
-                "Directory response body was truncated (expected {}, received {})",
-                content_length, actual_length
-            )));
-        }
-    }
-
-    Ok(response)
-}
-
-fn directory_response_metadata(response: &[u8]) -> Result<Option<(usize, Option<usize>)>> {
-    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
-        if response.len() > 64 * 1024 {
-            return Err(TorError::ConsensusFetch(
-                "Directory response headers exceeded 64 KiB".to_string(),
-            ));
-        }
-        return Ok(None);
-    };
-    let body_start = header_end + 4;
-    let header_text = std::str::from_utf8(&response[..header_end]).map_err(|e| {
-        TorError::ConsensusFetch(format!("Directory response headers are not UTF-8: {}", e))
-    })?;
-    let content_length = header_text.lines().skip(1).find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case("content-length")
-            .then(|| value.trim().parse::<usize>().ok())
-            .flatten()
-    });
-
-    Ok(Some((body_start, content_length)))
-}
-
-fn decode_directory_response(response: &[u8]) -> Result<Vec<u8>> {
-    let (body_start, content_length) = directory_response_metadata(response)?.ok_or_else(|| {
-        TorError::ConsensusFetch("Directory response had incomplete HTTP headers".to_string())
-    })?;
-    let header_text = std::str::from_utf8(&response[..body_start - 4]).map_err(|e| {
-        TorError::ConsensusFetch(format!("Directory response headers are not UTF-8: {}", e))
-    })?;
-    let status = parse_directory_status(header_text)?;
-    if status != 200 {
-        return Err(TorError::DirectoryStatus(status));
-    }
-    let mut lines = header_text.lines();
-    lines.next();
-
-    let mut content_encoding = None;
-    for line in lines {
-        if let Some((name, value)) = line.split_once(':') {
-            if name.eq_ignore_ascii_case("content-encoding") {
-                content_encoding = Some(value.trim().to_ascii_lowercase());
-            }
-        }
-    }
-
-    let body_end = content_length
-        .and_then(|length| body_start.checked_add(length))
-        .unwrap_or(response.len());
-    if body_end > response.len() {
-        return Err(TorError::ConsensusFetch(
-            "Directory response body was truncated".to_string(),
-        ));
-    }
-    let encoded_body = &response[body_start..body_end];
-
-    match content_encoding.as_deref() {
-        None | Some("identity") => Ok(encoded_body.to_vec()),
-        Some("deflate") => {
-            let mut decoded = Vec::new();
-            ZlibDecoder::new(encoded_body)
-                .take((MAX_DIRECTORY_RESPONSE_BYTES + 1) as u64)
-                .read_to_end(&mut decoded)
-                .map_err(|e| {
-                    TorError::ConsensusFetch(format!(
-                        "Failed to decompress directory response: {}",
-                        e
-                    ))
-                })?;
-            if decoded.len() > MAX_DIRECTORY_RESPONSE_BYTES {
-                return Err(TorError::ConsensusFetch(format!(
-                    "Decompressed directory response exceeded {} bytes",
-                    MAX_DIRECTORY_RESPONSE_BYTES
-                )));
-            }
-            Ok(decoded)
-        }
-        Some(encoding) => Err(TorError::ConsensusFetch(format!(
-            "Directory returned unsupported Content-Encoding {}",
-            encoding
-        ))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flate2::{write::ZlibEncoder, Compression};
-    use std::io::Write;
 
     #[test]
     fn directory_cache_round_trips() {
@@ -1094,6 +857,56 @@ mod tests {
         assert!(error.to_string().contains("unsupported"), "{}", error);
     }
 
+    fn recording_manager() -> (DirectoryManager, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let manager = DirectoryManager::new(
+            Arc::new(RwLock::new(RelayManager::new(Vec::new()))),
+            None,
+            Some(DirectoryCallback(Arc::new(move |encoded: &str| {
+                recorder.lock().unwrap().push(encoded.to_string());
+            }))),
+        );
+        (manager, seen)
+    }
+
+    fn cache_of(consensus: &str) -> DirectoryCache {
+        DirectoryCache {
+            version: DIRECTORY_CACHE_VERSION,
+            consensus: consensus.to_string(),
+            certificates: "certificates".to_string(),
+            microdescriptors: "microdescriptors".to_string(),
+        }
+    }
+
+    /// What a caller is handed has to be the same thing `directory_cache_json`
+    /// hands it, or storing one and seeding from the other would not work.
+    #[test]
+    fn a_downloaded_directory_reaches_the_caller_as_a_seed() {
+        let (manager, seen) = recording_manager();
+
+        manager.announce(&cache_of("consensus"));
+
+        let announced = seen.lock().unwrap();
+        assert_eq!(announced.len(), 1);
+        assert_eq!(DirectoryCache::decode(&announced[0]).unwrap().consensus, "consensus");
+    }
+
+    /// The push and the pull have to agree: a caller that stores what it is
+    /// handed and one that exports the cache itself must end up with the same
+    /// seed, or only one of the two ways of keeping a directory would work.
+    #[tokio::test]
+    async fn what_is_announced_is_what_the_cache_exports() {
+        let (manager, seen) = recording_manager();
+        let cache = cache_of("consensus");
+
+        manager.announce(&cache);
+        *manager.cache.write().await = Some(cache);
+
+        let exported = manager.cache_json().await.unwrap().unwrap();
+        assert_eq!(seen.lock().unwrap().as_slice(), [exported]);
+    }
+
     #[test]
     fn directory_cache_rejects_a_seed_without_certificates() {
         let encoded = serde_json::json!({
@@ -1133,30 +946,6 @@ mod tests {
         assert!(!encoded.contains('='));
         assert!(!encoded.contains('-'));
         assert_eq!(STANDARD_NO_PAD.decode(encoded).unwrap(), digest);
-    }
-
-    #[test]
-    fn directory_response_decodes_deflate_content() {
-        let expected = b"network-status-version 3 microdesc\n";
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(expected).unwrap();
-        let compressed = encoder.finish().unwrap();
-        let mut response = format!(
-            "HTTP/1.0 200 OK\r\nContent-Encoding: deflate\r\nContent-Length: {}\r\n\r\n",
-            compressed.len()
-        )
-        .into_bytes();
-        response.extend_from_slice(&compressed);
-
-        assert_eq!(decode_directory_response(&response).unwrap(), expected);
-    }
-
-    #[test]
-    fn directory_response_rejects_http_errors() {
-        let response = b"HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-        let error = decode_directory_response(response).unwrap_err();
-
-        assert!(matches!(error, TorError::DirectoryStatus(404)));
     }
 }
 
