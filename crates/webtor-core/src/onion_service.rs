@@ -241,6 +241,15 @@ struct ServiceState {
     /// republish timer and introduction point maintenance — so a replacement
     /// and a scheduled republication cannot upload descriptors out of order.
     publishing: Mutex<()>,
+    /// Whether what the HSDirs hold has fallen behind what this service is
+    /// answering on: an introduction point retired or replaced, or a
+    /// publication that did not reach every time period the directory names.
+    ///
+    /// Shared rather than owned by the maintainer, because both background
+    /// loops change what a descriptor should say — the republish timer
+    /// reconciles too, on the fresh consensus it just downloaded — and only
+    /// one of them has a retry timer to come back on.
+    unpublished_change: AtomicBool,
     /// When the descriptor last went up, which is what [`UPLOAD_RATE_LIMIT`]
     /// is measured from.
     ///
@@ -279,6 +288,15 @@ impl ServiceState {
             .last_publication
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(system_time_now());
+    }
+
+    /// Whether the maintainer has nothing left to come back to.
+    async fn settled(&self) -> bool {
+        intro_points_settled(
+            self.unpublished_change.load(Ordering::Relaxed),
+            self.intro_points.read().await.len(),
+            self.target_intro_points,
+        )
     }
 
     /// How long a publication that is not on the republish timer has to wait,
@@ -486,16 +504,25 @@ async fn republish(state: &Arc<ServiceState>) -> Result<()> {
     // naming it.
     reconcile_intro_points(state).await?;
 
-    publish_everywhere(state).await
+    let published = publish_everywhere(state).await;
+    // Retrying belongs to the maintainer: it is the loop with a timer short
+    // enough to matter, where this one sleeps another interval. Its own wait
+    // is on the nudges alone whenever nothing is owed, so a change made here
+    // and not published has to wake it.
+    if state.unpublished_change.load(Ordering::Relaxed) {
+        let mut nudge = state.maintenance_tx.clone();
+        let _ = nudge.try_send(());
+    }
+    published
 }
 
 /// Sign the descriptor for every time period the directory names and store it
 /// on all of their rings.
 ///
 /// Unlike the first publication at launch, no single period decides whether
-/// the service exists: it is already running, and a period that fails here is
-/// tried again at the next interval. Failing all of them is still worth
-/// saying.
+/// the service exists: it is already running, and a period that fails here
+/// leaves `unpublished_change` set for the maintainer to come back to.
+/// Failing all of them is still worth saying.
 async fn publish_everywhere(state: &Arc<ServiceState>) -> Result<()> {
     // Whatever is left of the previous round's uploads has either finished or
     // run out its timeout many times over by now.
@@ -523,6 +550,13 @@ async fn publish_everywhere(state: &Arc<ServiceState>) -> Result<()> {
             ),
         }
     }
+    // Only a round that reached every period leaves nothing owed. A ring that
+    // was missed still holds whatever it held before — which, after a point
+    // has been retired, names one that no longer answers.
+    state
+        .unpublished_change
+        .store(stored < publications.len(), Ordering::Relaxed);
+
     if stored == 0 {
         return Err(TorError::Onion(
             "No time period accepted the republished descriptor".to_string(),
@@ -544,19 +578,12 @@ async fn maintain_intro_points(state: Arc<ServiceState>, mut nudges: mpsc::Recei
 
     let (min_delay, max_delay) = INTRO_RETRY_DELAY;
     let mut delay = min_delay;
-    // A change the HSDirs have not been told about yet. Reconciling is what
-    // sets it and only an upload that went through clears it: the reconcile
-    // after a failed upload has nothing left to change and would report no
-    // change at all, so without this the replacement would sit here answering
-    // while every stored descriptor still named the point it replaced.
-    let mut pending = false;
     loop {
-        // A shortfall or an unpublished change is something to come back to
-        // on the retry timer. With neither, there is nothing to do until a
-        // point ends — but a point can end while either is being waited out,
-        // so the nudges are watched throughout.
-        let established = state.intro_points.read().await.len();
-        if intro_points_settled(pending, established, state.target_intro_points) {
+        // A shortfall or a descriptor the HSDirs have not been given is
+        // something to come back to on the retry timer. With neither, there
+        // is nothing to do until a point ends — but a point can end while
+        // either is being waited out, so the nudges are watched throughout.
+        if state.settled().await {
             if nudges.next().await.is_none() {
                 // The service has closed the channel; nothing left to maintain.
                 return;
@@ -571,26 +598,22 @@ async fn maintain_intro_points(state: Arc<ServiceState>, mut nudges: mpsc::Recei
         let outcome = {
             let _publishing = state.publishing.lock().await;
             match reconcile_intro_points(&state).await {
-                Ok(changed) => {
-                    pending |= changed;
-                    if pending {
-                        // The wait comes after the reconcile, not before it:
-                        // a point that has stopped answering is retired and
-                        // replaced straight away, and it is only the upload
-                        // that announces it which is held to one a minute.
-                        // Anything that ends during the wait has already
-                        // queued its nudge and is dealt with on the next turn
-                        // of this loop.
-                        crate::retry::sleep(state.wait_before_publishing()).await;
-                        let published = publish_everywhere(&state).await;
-                        pending = published.is_err();
-                        published
-                    } else {
-                        // Every stored descriptor names exactly what is
-                        // answering, so there is nothing to tell the HSDirs.
-                        Ok(())
-                    }
+                // Whether this reconcile changed anything or a previous round
+                // left the last change unpublished, the answer is the same
+                // descriptor: whatever is answering now, on every ring.
+                Ok(()) if state.unpublished_change.load(Ordering::Relaxed) => {
+                    // The wait comes after the reconcile, not before it: a
+                    // point that has stopped answering is retired and
+                    // replaced straight away, and it is only the upload that
+                    // announces it which is held to one a minute. Anything
+                    // that ends during the wait has already queued its nudge
+                    // and is dealt with on the next turn of this loop.
+                    crate::retry::sleep(state.wait_before_publishing()).await;
+                    publish_everywhere(&state).await
                 }
+                // Every stored descriptor names exactly what is answering, so
+                // there is nothing to tell the HSDirs.
+                Ok(()) => Ok(()),
                 Err(error) => Err(error),
             }
         };
@@ -601,8 +624,7 @@ async fn maintain_intro_points(state: Arc<ServiceState>, mut nudges: mpsc::Recei
             );
         }
 
-        let established = state.intro_points.read().await.len();
-        delay = if intro_points_settled(pending, established, state.target_intro_points) {
+        delay = if state.settled().await {
             min_delay
         } else {
             grown_retry_delay(delay, max_delay)
@@ -679,6 +701,7 @@ impl OnionService {
             on_log,
             tunnels: RwLock::new(Vec::new()),
             publishing: Mutex::new(()),
+            unpublished_change: AtomicBool::new(false),
             last_publication: StdMutex::new(None),
             aborts: StdMutex::new(Vec::new()),
             upload_aborts: StdMutex::new(Vec::new()),
@@ -716,18 +739,25 @@ impl OnionService {
         );
         current_outcome?;
         state.record_publication();
+        let mut stored = 1_usize;
         for (publication, outcome) in neighbours.iter().zip(neighbour_outcomes) {
-            if let Err(error) = outcome {
-                state.log(
+            match outcome {
+                Ok(()) => stored += 1,
+                Err(error) => state.log(
                     &format!(
                         "The descriptor for time period {} was not published, so a client an \
                          interval out of step will not find this service: {error}",
                         publication.period.interval_num()
                     ),
                     LogType::Error,
-                );
+                ),
             }
         }
+        // A period the launch could not reach is the maintainer's to retry,
+        // in minutes rather than at the next republish.
+        state
+            .unpublished_change
+            .store(stored < publications.len(), Ordering::Relaxed);
 
         // Keep the introduction points answering. A relay that goes down, or
         // leaves the consensus, stays in every descriptor until something
@@ -839,8 +869,9 @@ impl Drop for OnionService {
 /// idempotent, so launch, a failed point and the republish timer can all call
 /// it and get the set the service should be advertising.
 ///
-/// Returns whether that set changed, which is what tells the caller the HSDirs
-/// are holding a descriptor naming something else.
+/// A set that changed leaves `unpublished_change` set: what the HSDirs hold
+/// now names something other than what answers, and whichever loop gets there
+/// first owes them a descriptor.
 ///
 /// Fails only when the service is left with no introduction point at all: the
 /// one state it cannot describe in a descriptor, and so the one worth failing
@@ -852,7 +883,7 @@ impl Drop for OnionService {
 /// the old descriptor, which then tries one of the two other points that
 /// descriptor names — the same thing that client does when a relay simply
 /// fails.
-async fn reconcile_intro_points(state: &Arc<ServiceState>) -> Result<bool> {
+async fn reconcile_intro_points(state: &Arc<ServiceState>) -> Result<()> {
     let known: HashSet<String> = state
         .relay_manager
         .read()
@@ -936,12 +967,15 @@ async fn reconcile_intro_points(state: &Arc<ServiceState>) -> Result<bool> {
         }
     }
 
+    if changed {
+        state.unpublished_change.store(true, Ordering::Relaxed);
+    }
     if state.intro_points.read().await.is_empty() {
         return Err(last_error.unwrap_or_else(|| {
             TorError::Onion("No relay would act as an introduction point".to_string())
         }));
     }
-    Ok(changed)
+    Ok(())
 }
 
 /// Whether an established introduction point is still worth advertising.
