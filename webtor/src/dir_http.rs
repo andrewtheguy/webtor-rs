@@ -18,7 +18,9 @@ use tor_proto::client::ClientTunnel;
 /// serving it is untrusted, so this caps an endless stream and a decompression
 /// bomb; it does not bound directory data supplied by the embedding page.
 const MAX_DIRECTORY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
-/// A response whose headers run past this is not one a directory sent.
+/// A response whose headers run past this is not one a directory sent. Every
+/// path here reads its headers through `directory_response_metadata`, so this
+/// is the one place the bound is applied.
 const MAX_DIRECTORY_HEADER_BYTES: usize = 8 * 1024;
 
 /// GET one document from the directory cache at the end of `tunnel`, with
@@ -110,11 +112,6 @@ where
             })?;
             return parse_directory_status(header_text);
         }
-        if response.len() > MAX_DIRECTORY_HEADER_BYTES {
-            return Err(TorError::ConsensusFetch(
-                "Directory response headers were too long".to_string(),
-            ));
-        }
         let read = stream.read(&mut buffer).await.map_err(|e| {
             TorError::Network(format!("Failed to read directory response: {e}"))
         })?;
@@ -201,10 +198,10 @@ where
 
 fn directory_response_metadata(response: &[u8]) -> Result<Option<(usize, Option<usize>)>> {
     let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
-        if response.len() > 64 * 1024 {
-            return Err(TorError::ConsensusFetch(
-                "Directory response headers exceeded 64 KiB".to_string(),
-            ));
+        if response.len() > MAX_DIRECTORY_HEADER_BYTES {
+            return Err(TorError::ConsensusFetch(format!(
+                "Directory response headers exceeded {MAX_DIRECTORY_HEADER_BYTES} bytes"
+            )));
         }
         return Ok(None);
     };
@@ -303,6 +300,24 @@ mod tests {
         response.extend_from_slice(&compressed);
 
         assert_eq!(decode_directory_response(&response).unwrap(), expected);
+    }
+
+    #[test]
+    fn headers_that_never_end_are_refused_rather_than_buffered() {
+        let response = vec![b'x'; MAX_DIRECTORY_HEADER_BYTES + 1];
+
+        let error = directory_response_metadata(&response).unwrap_err();
+
+        assert!(error.to_string().contains("headers exceeded"), "{error}");
+    }
+
+    /// The same call is how every path waits for the rest of a header block,
+    /// so a partial one has to come back as "not yet" and not as an error.
+    #[test]
+    fn headers_within_the_bound_are_waited_for() {
+        let partial = directory_response_metadata(b"HTTP/1.0 200 OK\r\n").unwrap();
+
+        assert!(partial.is_none());
     }
 
     #[test]
