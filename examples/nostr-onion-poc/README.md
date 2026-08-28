@@ -2,7 +2,7 @@
 
 A small Vite/React app that loads the locally built `webtor-wasm` package and
 proves a Nostr message can be sent and received through an onion relay without
-a proxy or backend.
+an external Tor daemon, application proxy, or backend.
 
 The proof uses one Tor client and two independent onion WebSockets. It opens a
 subscription on the first socket, waits for `EOSE`, publishes a freshly signed

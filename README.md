@@ -1,8 +1,9 @@
 # webtor-rs
 
 A browser Tor client, compiled to WASM, that reaches v3 onion services over
-`http://` and `ws://`. No exit, no TLS, no proxy: the page builds Tor circuits
-itself and speaks HTTP or RFC 6455 on them. It also runs v3 onion services the
+`http://` and `ws://`. No exit, no TLS, and no external Tor daemon or
+application proxy: the page builds Tor circuits itself and speaks HTTP or RFC
+6455 on them. It also runs v3 onion services the
 other way around — the page publishes its own `.onion` address and answers what
 clients send it.
 
@@ -39,16 +40,17 @@ Publishing a service runs the same machinery from the other end, in
 `webtor/src/onion_service.rs`: generate an identity keypair and derive the
 address from it, establish introduction points with `ESTABLISH_INTRO`, sign a
 descriptor naming them and upload it to the responsible HSDirs — for the
-current time period and for the ones either side of it, so that a client whose
-consensus places it in a neighbouring period still finds the service. That is
-then repeated every 60 to 120 minutes, against a freshly downloaded consensus,
-which is what keeps the address alive past the descriptor's own lifetime and
-across the rotation that moves every ring. Every
+current time period and whichever adjacent periods the directory's
+shared-random values support, so that a client whose consensus places it in a
+neighbouring period still finds the service. That is then repeated every 60 to
+120 minutes, or shortly after a period boundary when that comes first, against
+a freshly downloaded consensus. This keeps the address alive past the
+descriptor's own lifetime and across the rotation that moves every ring. Every
 `INTRODUCE2` that arrives afterwards is answered by building a circuit to the
 client's rendezvous point, completing the hs-ntor handshake as the responder,
 and sending `RENDEZVOUS1`; the streams the client then begins are handed to the
-caller. Nothing is stored: the identity key lives in the page and dies with the
-service, so every address is ephemeral.
+caller. Nothing is persisted: the identity key lives in the page and dies with
+the service, so every address is ephemeral.
 
 ## Using it
 
@@ -85,6 +87,8 @@ Bootstraps a client. Every option is optional.
 | --- | --- | --- |
 | `bridge` | `"websocket"` | `"websocket"` opens a direct WebSocket to the Snowflake bridge: one fixed endpoint, no broker, no volunteer proxy, no STUN. `"webrtc"` goes through a volunteer proxy brokered over HTTPS — harder to block, and it needs `stunUrls`. |
 | `stunUrls` | — | STUN servers for the `"webrtc"` bridge; required there and refused otherwise. |
+| `bridgeUrl` | — | WebSocket URL for a bridge to use instead of the public one. Valid only with the `"websocket"` bridge and must be supplied with `bridgeFingerprint`. |
+| `bridgeFingerprint` | — | The custom bridge's 40-hex-character RSA identity fingerprint. Valid only with the `"websocket"` bridge and must be supplied with `bridgeUrl`. |
 | `directorySeed` | — | A previous `directoryCache()`. Without one the client downloads the directory over a single bridge circuit, which is the slowest and least reliable part of a bootstrap. |
 | `connectionTimeoutMs` | `300000` | Bootstrap budget. |
 | `log` | `true` | Write bootstrap progress to the console. |
@@ -119,7 +123,7 @@ caller's question, and no third-party address is compiled into the wasm.
   port with nothing layered on top, for a service that speaks neither HTTP nor
   WebSocket. Resolves to an `OnionStream`.
 - `publishOnionService(options?)` — publish a v3 onion service from this page.
-  Options: `introPoints` (default 3, at most 6). Resolves once an HSDir has
+  Options: `introPoints` (default 3, from 1 through 6). Resolves once an HSDir has
   stored the descriptor, which is when clients can reach the address, to a
   service with `onionAddress`, `accept()` and `close()`. `accept()` resolves to
   the next client's `OnionStream`, or `null` once the service is closed;
@@ -140,8 +144,8 @@ Two free functions need no client and touch no network: `isOnionHost(host)` and
 
 ## Tests
 
-`tests/` is a self-contained project — it drives the built package in headless
-Chrome and needs nothing outside this repository.
+`tests/` drives the built package in headless Chrome. The API and live browser
+suites need no sibling checkout; the separate interoperability suite does.
 
 ```bash
 bun install       # install dependencies from bun.lock
@@ -211,5 +215,5 @@ webtor-wasm/  the wasm-bindgen surface packed for distribution
 subtle-tls/   the TLS 1.3 session the bridge channel runs inside (see its README)
 tests/        the browser test project
 examples/     standalone browser integrations
-scripts/      onion_ws_probe.py, a SOCKS-based cross-check
+scripts/      the SOCKS-based probe and an opt-in local WebSocket bridge
 ```

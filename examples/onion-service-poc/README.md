@@ -53,18 +53,21 @@ only in that tab's memory: closing the page destroys the address for good.
 ## What a run proves
 
 That a browser can be the *server* end of a Tor onion service: it signed an
-ESTABLISH_INTRO with a key it generated, three relays accepted it as
-introduction points, HSDirs accepted a descriptor signed by the blinded
-identity, and a client that knew nothing but the address completed the hs-ntor
-handshake against this tab and got bytes back.
+ESTABLISH_INTRO with a key it generated, the configured number of relays
+accepted it as introduction points, HSDirs accepted a descriptor signed by the
+blinded identity, and a client that knew nothing but the address completed the
+hs-ntor handshake against this tab and got bytes back.
 
-There is no proxy, no backend, no inbound port. Every circuit starts at a
-Snowflake bridge, which is also how the tab reaches the network at all.
+There is no external Tor daemon, application proxy, backend, or inbound port.
+Every circuit starts at a Snowflake bridge, which is also how the tab reaches
+the network at all.
 
 ## Limits
 
-Everything a real service does about persistence is missing on purpose: no
-identity key on disk, no descriptor re-upload as the time period rolls over, no
-introduction point rotation or replacement when one dies, and no replay cache
-for INTRODUCE2. A published descriptor lasts three hours; the service is
-expected to outlive nothing.
+The identity key is never written to disk, so closing the tab permanently ends
+the address. While the tab stays open, the library refreshes the directory and
+republishes descriptors for the current period and whichever neighbouring
+periods the directory supports every 60–120 minutes, or shortly after a period
+boundary. It does not rotate or replace an introduction point when its circuit
+dies, and it has no persistent INTRODUCE2 replay cache or other durable service
+state.

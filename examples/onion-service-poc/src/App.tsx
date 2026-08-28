@@ -78,7 +78,8 @@ export default function App() {
           This page generates a v3 onion identity, establishes its own
           introduction points, uploads a signed descriptor to the responsible
           HSDirs, and answers the streams clients open — all from WASM in the
-          browser. No proxy, no backend, no port forwarded.
+          browser. No external Tor daemon, application proxy, backend, or port
+          forwarded.
         </p>
       </header>
 

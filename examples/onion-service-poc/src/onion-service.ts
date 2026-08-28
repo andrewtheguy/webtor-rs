@@ -78,7 +78,7 @@ function page(address: string, served: number): string {
 <title>webtor onion service</title>
 <h1>Served from a browser tab.</h1>
 <p>This page came out of a Tor circuit that ends in someone's browser: no
-server, no proxy, no port forwarded.</p>
+server, no application proxy, no port forwarded.</p>
 <p>Address: <code>${address}</code></p>
 <p>Requests answered so far: ${served}</p>
 <p>Generated at ${new Date().toISOString()}</p>
