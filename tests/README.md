@@ -14,7 +14,7 @@ bun run build      # required first: the harness imports crates/webtor-wasm/pkg/
 bun run test       # tests/api.test.ts    — no network, ~1s
 bun run seed       # a directory snapshot, ~40 MiB, valid three hours
 bun run test:live  # tests/live.test.ts   — real onion services, ~1 minute
-bun run test:interop  # tools/interop-cli.ts — against ptransfer-cli, ~1 minute
+bun run test:interop  # tools/interop-cli.ts — against onion-cli-poc, ~1 minute
 ```
 
 `CHROME_PATH` points at a Chrome-family binary (default
@@ -36,21 +36,24 @@ headers, the schemes the client refuses, a WebSocket exchange, the
 case builds its own rendezvous — around five seconds — so the cost of the file
 is the bootstrap plus roughly that per case.
 
-**`tools/interop-cli.ts`** is the only one that needs something outside this
-repository: the `tor` proof of concept in the sibling `ptransfer-cli`, which
-publishes an ephemeral onion address and echoes back every line. It runs both
-halves against that known-good implementation — the page opens a raw stream to
-a service the CLI publishes, then publishes a service of its own for
-`ptransfer tor connect` to reach — so a failure names the side that is wrong
-rather than just "onion services do not work". `PTRANSFER_BIN` overrides the
-binary (default `../ptransfer-cli/target/release/ptransfer`) and `ONLY=client`
-or `ONLY=server` runs one direction.
+**`tools/interop-cli.ts`** is the only one that needs a second implementation:
+`reference/onion-cli-poc`, an Arti-based peer that publishes an ephemeral onion
+address and echoes back every line. It runs both halves against it — the page
+opens a raw stream to a service the CLI publishes, then publishes a service of
+its own for `onion-cli-poc connect` to reach — so a failure names the side that
+is wrong rather than just "onion services do not work". `ONION_CLI` overrides
+the binary (default `reference/onion-cli-poc/target/release/onion-cli-poc`) and
+`ONLY=client` or `ONLY=server` runs one direction.
 
-That proof of concept is what moves into `reference/onion-cli/`, so this suite
-stops depending on a sibling checkout. What must not move with it is the
-independence: `reference/` is outside the root Cargo workspace and shares no
-crate with `crates/`, because an implementation built from the same code could
-not tell either side it was wrong.
+That peer lives in this repository but shares no code with it: `reference/` is
+outside the root Cargo workspace and depends on no crate under `crates/`,
+because an implementation built from the same code could not tell either side
+it was wrong. It has to be built before this suite runs, and its manifest path
+is explicit for the same reason:
+
+```bash
+cargo build --release --manifest-path reference/onion-cli-poc/Cargo.toml
+```
 
 Environment: `DIRECTORY_SEED` (default `tests/.directory-seed.json`), `BRIDGE`
 (`websocket` or `webrtc`), `STUN_URLS` (comma-separated, for `webrtc`), and
