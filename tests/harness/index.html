@@ -8,6 +8,7 @@
   // exposes only plain JSON to the Node side.
   import init, {
     WebtorClient,
+    describeDirectory,
     isOnionHost,
     parseOnionUrl,
   } from '/webtor-wasm/pkg/webtor_wasm.js';
@@ -70,6 +71,51 @@
         await created.close();
         return 'created';
       }),
+    /**
+     * The same, with an `onLog` callback added here. A function cannot travel
+     * through CDP, so the sink a caller would supply is made in the page.
+     */
+    createRejectsWithLogger: (options) =>
+      rethrowing(async () => {
+        const created = await WebtorClient.create({ ...options, onLog: () => {} });
+        await created.close();
+        return 'created';
+      }),
+    /**
+     * Bootstrap with a sink of the page's own and return the lines it was
+     * given. Whether the bootstrap succeeds is beside the point — the caller's
+     * function either receives webtor's progress or it does not.
+     */
+    createLogging: (options) =>
+      rethrowing(async () => {
+        const lines = [];
+        try {
+          const created = await WebtorClient.create({
+            ...options,
+            onLog: (message, level) => lines.push(`${level}: ${message}`),
+          });
+          await created.close();
+        } catch {
+          // The failure is expected; the lines leading to it are what is asked
+          // for.
+        }
+        return lines;
+      }),
+    /**
+     * Read a seed's own account of itself. `instants` are epoch milliseconds
+     * to place in time periods, which is how the boundary a caller cares
+     * about is asserted from the Node side.
+     */
+    describeDirectory: (seed, instants = []) =>
+      rethrowing(async () => {
+        const described = describeDirectory(seed);
+        return {
+          validAfter: described.validAfter.toISOString(),
+          validUntil: described.validUntil.toISOString(),
+          timePeriod: described.timePeriod,
+          periods: instants.map((at) => described.timePeriodAt(at)),
+        };
+      }),
 
     // --- client lifecycle -------------------------------------------------
     /**
@@ -96,12 +142,16 @@
       rethrowing(async () => {
         const encoded = await client().directoryCache();
         const parsed = JSON.parse(encoded);
+        const described = describeDirectory(encoded);
         return {
           bytes: encoded.length,
           version: parsed.version,
           consensusBytes: parsed.consensus.length,
           certificateBytes: parsed.certificates.length,
           microdescriptorBytes: parsed.microdescriptors.length,
+          validUntil: described.validUntil.toISOString(),
+          timePeriod: described.timePeriod,
+          timePeriodNow: described.timePeriodAt(Date.now()),
         };
       }),
 

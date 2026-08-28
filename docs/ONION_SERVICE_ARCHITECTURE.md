@@ -70,6 +70,15 @@ placement from the consensus it installed; callers that require both peers to
 use the wall clock's current onion-service period may impose a stricter
 freshness rule before passing a seed to `create`.
 
+The rule is the caller's; reading the consensus to apply it is not.
+`describeDirectory(seed)` answers what a seed says about itself — its validity
+window, the time period it places descriptors in, and the period covering any
+instant — with no client, no network, and no trust claim, so an application
+imposing a stricter rule does not carry a second implementation of the
+placement arithmetic. Where the seed was stored is likewise outside webtor:
+`directoryCache()` returns a string and `directorySeed` accepts one, and no
+storage API is reachable from the wasm.
+
 ## Connecting to an Onion Service
 
 For `connectStream`, `fetch`, or `connectWebSocket`, the client:

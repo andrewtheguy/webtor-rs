@@ -6,11 +6,12 @@
 //! circuit is encrypted end to end. `https://` and `wss://` are therefore
 //! refused rather than tolerated.
 
-mod console_log;
+mod logging;
 mod options;
 
 use futures::future::{AbortHandle, Abortable};
 use futures::lock::Mutex;
+use logging::Logger;
 use options::error as option_error;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -42,6 +43,7 @@ const CLIENT_OPTIONS: &[&str] = &[
     "connectionTimeoutMs",
     "log",
     "logPrefix",
+    "onLog",
 ];
 const REQUEST_OPTIONS: &[&str] = &["method", "headers", "body", "timeoutMs"];
 const WEBSOCKET_OPTIONS: &[&str] = &["maxMessageBytes", "timeoutMs"];
@@ -70,20 +72,6 @@ fn check_fingerprint(fingerprint: String) -> Result<String, JsValue> {
 fn js_error(context: &str, error: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&format!("{context}: {error}"))
 }
-
-fn console_logger(prefix: String) -> impl Fn(&str, LogType) + Send + Sync + 'static {
-    move |message: &str, log_type: LogType| {
-        let rendered = JsValue::from_str(&format!("{prefix} {message}"));
-        match log_type {
-            LogType::Error => web_sys::console::error_1(&rendered),
-            LogType::Info | LogType::Success => web_sys::console::info_1(&rendered),
-        }
-    }
-}
-
-/// A log sink shared by the Tor client and this binding, so progress from
-/// both sides of the boundary lands in one place with one prefix.
-type Logger = Arc<dyn Fn(&str, LogType) + Send + Sync>;
 
 /// What `create` was told to do, once its option bag has been checked.
 struct ClientConfig {
@@ -156,12 +144,24 @@ fn read_client_config(raw: Option<js_sys::Object>) -> Result<ClientConfig, JsVal
         options::count(&bag, "connectionTimeoutMs", what)?.unwrap_or(DEFAULT_CONNECTION_TIMEOUT_MS);
     let mut options = options.with_connection_timeout(timeout);
 
-    let log: Logger = if options::boolean(&bag, "log", what)?.unwrap_or(true) {
-        let prefix =
-            options::string(&bag, "logPrefix", what)?.unwrap_or_else(|| DEFAULT_LOG_PREFIX.into());
-        Arc::new(console_logger(prefix))
-    } else {
-        Arc::new(|_: &str, _| {})
+    // Where the lines go is the caller's decision, not this binding's: an
+    // application with its own log wants them there, and the console is only
+    // the default because a page that has not said otherwise has nowhere else.
+    let console = options::boolean(&bag, "log", what)?;
+    let prefix = options::string(&bag, "logPrefix", what)?;
+    let log: Logger = match options::function(&bag, "onLog", what)? {
+        Some(callback) => {
+            if console.is_some() || prefix.is_some() {
+                return Err(option_error(
+                    "WebtorClient.create options \"log\" and \"logPrefix\" configure the console sink, which \"onLog\" replaces",
+                ));
+            }
+            logging::js_logger(callback)
+        }
+        None if console.unwrap_or(true) => {
+            logging::console_logger(prefix.unwrap_or_else(|| DEFAULT_LOG_PREFIX.into()))
+        }
+        None => logging::silent(),
     };
     let for_client = log.clone();
     options = options.with_on_log(move |message, log_type| for_client(message, log_type));
@@ -199,6 +199,82 @@ pub fn parse_onion_url(url: &str) -> Result<JsValue, JsValue> {
     Ok(object.into())
 }
 
+/// Read what a `directoryCache()` seed says about itself, with no client and
+/// no network: when its consensus is valid, and which onion service time
+/// period it places descriptors in.
+///
+/// Whether a seed is good enough to use is the caller's rule — a consensus
+/// stays valid for three hours while the time period it belongs to may have
+/// rotated in the meantime, and how much of that an application will tolerate
+/// is its own decision. This exists so making that decision does not mean
+/// parsing a Tor consensus by hand. It verifies nothing; `create` still
+/// revalidates any seed against the pinned directory authorities before
+/// installing a byte of it.
+#[wasm_bindgen(js_name = describeDirectory)]
+pub fn describe_directory(seed: &str) -> Result<DirectoryDescription, JsValue> {
+    webtor::describe_directory(seed)
+        .map(|inner| DirectoryDescription { inner })
+        .map_err(|error| js_error("Failed to read the Tor directory seed", error))
+}
+
+/// What one directory seed says about itself.
+#[wasm_bindgen]
+pub struct DirectoryDescription {
+    inner: webtor::DirectoryDescription,
+}
+
+#[wasm_bindgen]
+impl DirectoryDescription {
+    /// When the consensus became valid.
+    #[wasm_bindgen(getter, js_name = validAfter)]
+    pub fn valid_after(&self) -> js_sys::Date {
+        js_date(self.inner.valid_after())
+    }
+
+    /// When the consensus expires. A seed past this is refused, so it is the
+    /// deadline a bootstrap has to start within.
+    #[wasm_bindgen(getter, js_name = validUntil)]
+    pub fn valid_until(&self) -> js_sys::Date {
+        js_date(self.inner.valid_until())
+    }
+
+    /// The onion service time period this directory places descriptors in.
+    ///
+    /// Both peers of a transfer must be in the same one: a service publishes
+    /// to the HSDirs this number selects, and a client reading a directory
+    /// from a different period asks HSDirs the service never uploaded to,
+    /// which answer 404 without explaining why.
+    #[wasm_bindgen(getter, js_name = timePeriod)]
+    pub fn time_period(&self) -> f64 {
+        self.inner.time_period() as f64
+    }
+
+    /// The time period covering `at`, in epoch milliseconds as `Date.now()`
+    /// gives them. Comparing it with `timePeriod` is how a caller tells that
+    /// a still-valid consensus has outlived the ring it describes.
+    #[wasm_bindgen(js_name = timePeriodAt)]
+    pub fn time_period_at(&self, at: f64) -> Result<f64, JsValue> {
+        if !at.is_finite() || at < 0.0 {
+            return Err(option_error(
+                "DirectoryDescription.timePeriodAt takes epoch milliseconds, as Date.now() gives them",
+            ));
+        }
+        let at = std::time::UNIX_EPOCH + Duration::from_millis(at as u64);
+        self.inner
+            .time_period_at(at)
+            .map(|period| period as f64)
+            .map_err(|error| js_error("Failed to place that time in a period", error))
+    }
+}
+
+fn js_date(when: std::time::SystemTime) -> js_sys::Date {
+    let ms = when
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as f64)
+        .unwrap_or(0.0);
+    js_sys::Date::new(&JsValue::from_f64(ms))
+}
+
 fn set(object: &js_sys::Object, key: &str, value: &JsValue) {
     let _ = js_sys::Reflect::set(object, &JsValue::from_str(key), value);
 }
@@ -232,6 +308,10 @@ impl WebtorClient {
     /// - `connectionTimeoutMs`: bootstrap budget, default 300000.
     /// - `log`: write progress to the console, default `true`.
     /// - `logPrefix`: default `"[webtor]"`.
+    /// - `onLog`: `(message, level)` to take every line instead of the
+    ///   console, where `level` is `"info"`, `"success"`, `"warn"` or
+    ///   `"error"`. Replaces `log` and `logPrefix`, which configure the
+    ///   console sink, so passing it with either is an error.
     ///
     /// A caller that wants proof the client can complete a rendezvous before
     /// it uses it does that itself, with a `fetch` against a service it
@@ -241,9 +321,9 @@ impl WebtorClient {
     pub fn create(options: Option<js_sys::Object>) -> js_sys::Promise {
         future_to_promise(async move {
             console_error_panic_hook::set_once();
-            console_log::install();
             let config = read_client_config(options)?;
             let log = config.log;
+            logging::install(log.clone());
 
             let client = TorClient::new(config.options)
                 .await

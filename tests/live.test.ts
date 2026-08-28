@@ -133,6 +133,19 @@ describe('webtor-wasm over Tor', () => {
       cache.microdescriptorBytes > 100_000,
       `microdescriptors look too small: ${cache.microdescriptorBytes} bytes`,
     );
+    // What a caller reads before deciding to keep this seed: a client that
+    // just bootstrapped is by definition on the period in force now, and the
+    // exported cache has to say so or a peer seeded with it looks on the
+    // wrong HSDirs.
+    assert.equal(
+      cache.timePeriod,
+      cache.timePeriodNow,
+      'the exported directory places descriptors in a period that has passed',
+    );
+    assert.ok(
+      Date.parse(cache.validUntil) > Date.now(),
+      `the exported directory expired at ${cache.validUntil}`,
+    );
   }, CASE_TIMEOUT);
 
   it('GETs an onion site', async () => {

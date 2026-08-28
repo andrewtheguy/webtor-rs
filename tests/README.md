@@ -24,9 +24,10 @@ is why it needs one already installed.
 ## The three suites
 
 **`api.test.ts`** covers what answers without a circuit: `isOnionHost`,
-`parseOnionUrl`, and the option validation `WebtorClient.create` runs before it
-touches the network — unknown keys, wrong types, a bridge that needs STUN. It
-needs no Tor and no directory, so it is the one to run while editing.
+`parseOnionUrl`, `describeDirectory` against the consensus fixture in
+`webtor/testdata/`, and the option validation `WebtorClient.create` runs before
+it touches the network — unknown keys, wrong types, a bridge that needs STUN.
+It needs no Tor and no directory, so it is the one to run while editing.
 
 **`live.test.ts`** bootstraps one client and reuses it for every case:
 directory cache export, an HTTP GET, a server-chosen 4xx, caller-supplied

@@ -1,0 +1,31 @@
+network-status-version 3 microdesc
+vote-status consensus
+consensus-method 34
+valid-after 2020-08-27 13:00:00
+fresh-until 2020-08-27 14:00:00
+valid-until 2020-08-27 16:00:00
+voting-delay 300 300
+client-versions 
+server-versions 
+known-flags Authority Exit Fast Guard HSDir NoEdConsensus Running Stable V2Dir Valid
+recommended-client-protocols Cons=2 Desc=2 DirCache=2 HSDir=2 HSIntro=4 HSRend=2 Link=4-5 Microdesc=2 Relay=2
+recommended-relay-protocols Cons=2 Desc=2 DirCache=2 HSDir=2 HSIntro=4 HSRend=2 Link=4-5 Microdesc=2 Relay=2
+required-client-protocols Cons=2 Desc=2 DirCache=2 HSDir=2 HSIntro=4 HSRend=2 Link=4-5 Microdesc=2 Relay=2
+required-relay-protocols Cons=2 Desc=2 DirCache=2 HSDir=2 HSIntro=4 HSRend=2 Link=4-5 Microdesc=2 Relay=2
+dir-source testauth0 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA 127.0.0.1 127.0.0.1 7000 5000
+contact auth0@test.test
+vote-digest BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+r testrelay0 AAAAAAAAAAAAAAAAAAAAAAAAAAA 2020-08-27 12:40:41 127.0.0.1 5000 7000
+m AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+s Fast Guard HSDir Running Stable V2Dir Valid
+v Tor 0.4.8.10
+pr Cons=1-2 Desc=1-2 DirCache=1-2 HSDir=1-2 HSIntro=3-5 HSRend=1-2 Link=1-5 LinkAuth=1,3 Microdesc=1-2 Relay=1-4
+w Bandwidth=20
+directory-footer
+bandwidth-weights Wbd=3333 Wbe=0 Wbg=0 Wbm=10000 Wdb=10000 Web=10000 Wed=3333 Wee=10000 Weg=3333 Wem=10000 Wgb=10000 Wgd=3333 Wgg=10000 Wgm=10000 Wmb=10000 Wmd=3333 Wme=0 Wmg=0 Wmm=10000
+directory-signature sha256 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
+-----BEGIN SIGNATURE-----
+bm90IGEgc2lnbmF0dXJlOiB0aGlzIGZpeHR1cmUgaXMgcGFyc2VkLCBuZXZlciB2
+ZXJpZmllZCwgYmVjYXVzZSBkZXNjcmliaW5nIGEgc2VlZCBtYWtlcyBubyBjbGFp
+bSB0aGF0IGl0IGlzIGdlbnVpbmUuAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+-----END SIGNATURE-----
