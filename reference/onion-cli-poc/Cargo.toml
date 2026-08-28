@@ -1,0 +1,80 @@
+# Its own workspace, deliberately: see README.md. The root workspace excludes
+# `reference/`, and this project shares neither a Cargo.lock nor a dependency
+# version with the crates it is meant to be an independent check on.
+[workspace]
+
+[package]
+name = "onion-cli-poc"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Arti-based onion-service echo peer webtor is tested against"
+
+[[bin]]
+name = "onion-cli-poc"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "signal"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+env_logger = "0.11"
+log = "0.4"
+# Arti routes its own progress through `tracing`; this forwards it to `log` so
+# one `RUST_LOG` governs both.
+tracing = { version = "0.1", default-features = false, features = ["log"] }
+
+# Arti 2.5.1 == crates 0.45. This is the whole point of the project: a client
+# assembled the way Arti's own documentation says to assemble one, out of
+# `arti-client` and nothing hand-rolled, so that a disagreement with webtor is
+# a disagreement with Arti rather than with a second copy of webtor's ideas.
+#
+# `default-features = false` only to swap Arti's default native-tls for rustls,
+# which needs no OpenSSL on the build machine; `compression` and `flowctl-cc`
+# are Arti's own defaults, restored. The rest is the minimum for an onion
+# service and an onion client, and nothing here reaches the plain internet.
+arti-client = { version = "0.45", default-features = false, features = [
+    "tokio",
+    "rustls",
+    "compression",
+    "flowctl-cc",
+    "keymgr",
+    "onion-service-client",
+    "onion-service-service",
+    # The identity key stays in memory, so every `serve` publishes a fresh
+    # address and no key reaches disk. See README.md.
+    "ephemeral-keystore",
+    # What C tor and Arti both do for onion-service circuits by default.
+    "vanguards",
+    # Arti's directory cache is SQLite; bundling it keeps the binary from
+    # needing a system libsqlite3.
+    "static-sqlite",
+] }
+# `OnionServiceConfigBuilder`, `handle_rend_requests`, `StreamRequest`.
+tor-hsservice = "0.45"
+# The `Connected` cell that answers an accepted stream request.
+tor-cell = "0.45"
+# `HsId`, so an address is checked for the v3 suffix, base32, version and
+# checksum before anything is dialled.
+tor-hscrypto = "0.45"
+# Selecting the in-memory keystore: the kind (`tor-keymgr`) and the
+# `ExplicitOrAuto` wrapper the config setter takes (`tor-config`). Neither is
+# re-exported by arti-client.
+tor-config = "0.45"
+tor-keymgr = { version = "0.45", features = ["ephemeral-keystore"] }
+# `PreferredRuntime`, to name the type `create_bootstrapped` hands back.
+tor-rtcompat = { version = "0.45", default-features = false, features = ["tokio", "rustls"] }
+# Distinguishing "the peer hung up" from a real read failure; see src/echo.rs.
+tor-proto = "0.45"
+# Arti redacts onion addresses in `Display`; printing one in full is opt-in.
+safelog = "0.9"
+# tor-rtcompat's rustls backend takes the process-default CryptoProvider and
+# installs none of its own, so the binary picks one. aws-lc-rs, matching what
+# Arti falls back to.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

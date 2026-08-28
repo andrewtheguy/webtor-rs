@@ -135,8 +135,7 @@ pinned authorities before installing a byte of it.
 
 ## Tests
 
-`tests/` drives the built package in headless Chrome. The API and live browser
-suites need no sibling checkout; the separate interoperability suite does.
+`tests/` drives the built package in headless Chrome.
 
 ```bash
 bun install       # install dependencies from bun.lock
@@ -146,15 +145,20 @@ bun run seed      # fetch a directory snapshot to tests/.directory-seed.json
 bun run test:live # end to end against public onion services
 ```
 
-One test does reach outside the repository. `bun run test:interop` checks the
-two halves against a known-good implementation — the `tor` proof of concept in
-the sibling [ptransfer-cli](https://github.com/andrewtheguy/ptransfer-cli),
-which publishes an ephemeral onion address and echoes back every line. The page
-opens a raw stream to a service the CLI publishes, then publishes a service of
-its own for the CLI to connect to, so a failure says which side is wrong.
-Set `PTRANSFER_BIN` if the binary is not at
-`../ptransfer-cli/target/release/ptransfer`, and `ONLY=client` or `ONLY=server`
-to run one direction.
+`bun run test:interop` checks the two halves against a second implementation:
+[`reference/onion-cli-poc`](reference/onion-cli-poc), an Arti-based peer that
+publishes an ephemeral onion address and echoes back every line. The page opens
+a raw stream to a service the CLI publishes, then publishes a service of its own
+for the CLI to connect to, so a failure says which side is wrong. Build it first
+— it is outside the root workspace, so it needs its own manifest path:
+
+```bash
+cargo build --release --manifest-path reference/onion-cli-poc/Cargo.toml
+bun run test:interop
+```
+
+`ONION_CLI` overrides the binary and `ONLY=client` or `ONLY=server` runs one
+direction.
 
 The repository pins its Bun version in `package.json`. `bun run test` is a
 second or two. `bun run test:live` bootstraps a real Tor client
@@ -201,16 +205,16 @@ The current line is `0.0.1-alpha.*`.
 ## Layout
 
 ```
-crates/       the Rust workspace, one target: wasm32-unknown-unknown
-  webtor-core/  the Tor client: directory, circuits, onion rendezvous, HTTP, WebSocket
-  webtor-wasm/  the wasm-bindgen surface packed for distribution
-  subtle-tls/   the TLS 1.3 session the bridge channel runs inside (see its README)
-reference/    native peers webtor is tested *against*, each its own workspace
-  onion-cli/    an Arti-based onion service and client (placeholder)
-docs/         architecture, network-observation notes, and the roadmap
-tests/        the browser test project
-examples/     standalone browser integrations, over a shared seed store
-scripts/      the SOCKS-based probe and an opt-in local WebSocket bridge
+crates/            the Rust workspace, one target: wasm32-unknown-unknown
+  webtor-core/     the Tor client: directory, circuits, onion rendezvous, HTTP, WebSocket
+  webtor-wasm/     the wasm-bindgen surface packed for distribution
+  subtle-tls/      the TLS 1.3 session the bridge channel runs inside (see its README)
+reference/         native peers webtor is tested *against*, each its own workspace
+  onion-cli-poc/   an Arti-based onion-service echo peer
+docs/              architecture, network-observation notes, and the roadmap
+tests/             the browser test project
+examples/          standalone browser integrations, over a shared seed store
+scripts/           the SOCKS-based probe and an opt-in local WebSocket bridge
 ```
 
 `reference/` is excluded from the root workspace rather than being a member of

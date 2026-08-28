@@ -1,17 +1,17 @@
-// Browser ↔ ptransfer-cli interoperability over Tor onion services.
+// Browser ↔ onion-cli-poc interoperability over Tor onion services.
 //
-//   bun run build && bun run seed && bun tests/tools/interop-cli.ts
+//   bun run build && bun run seed && bun run test:interop
 //
-// Both directions are exercised against the CLI's `tor` proof of concept,
-// which publishes an ephemeral onion address and echoes back every line:
+// Both directions are exercised against reference/onion-cli-poc, an Arti-based
+// peer that publishes an ephemeral onion address and echoes back every line:
 //
-//   client  the page opens a raw stream to a service `ptransfer tor serve`
+//   client  the page opens a raw stream to a service `onion-cli-poc serve`
 //           publishes, and reads its echo back
-//   server  the page publishes a service, and `ptransfer tor connect` sends a
+//   server  the page publishes a service, and `onion-cli-poc connect` sends a
 //           line to it
 //
 // Environment:
-//   PTRANSFER_BIN   the CLI to drive (default ../ptransfer-cli/target/release/ptransfer)
+//   ONION_CLI       the CLI to drive (default reference/onion-cli-poc/target/release/onion-cli-poc)
 //   DIRECTORY_SEED  a directory snapshot, as in tests/live.test.ts
 //   ONLY            "client" or "server" to run just one direction
 
@@ -24,7 +24,8 @@ import { openHarness, type BrowserHarness } from '../support/browser.ts';
 import { REPO_ROOT } from '../support/server.ts';
 
 const CLI =
-  process.env.PTRANSFER_BIN ?? `${REPO_ROOT}/../ptransfer-cli/target/release/ptransfer`;
+  process.env.ONION_CLI ??
+  `${REPO_ROOT}/reference/onion-cli-poc/target/release/onion-cli-poc`;
 const SEED_PATH = process.env.DIRECTORY_SEED ?? `${REPO_ROOT}/tests/.directory-seed.json`;
 const ONLY = process.env.ONLY ?? '';
 const PORT = 9735;
@@ -75,7 +76,7 @@ async function waitFor(
 
 /** The page opens a raw stream to a service the CLI publishes. */
 async function pageAsClient(harness: BrowserHarness) {
-  const { child, lines } = run(['tor', 'serve'], 'serve');
+  const { child, lines } = run(['serve'], 'serve');
   try {
     await waitFor(lines, child, (line) => line === 'ready', 'serve never became ready');
     const address = lines
@@ -98,7 +99,7 @@ async function pageAsServer(harness: BrowserHarness) {
   await harness.call('serviceServeEcho');
 
   const { child, lines } = run(
-    ['tor', 'connect', `${published.address}:${PORT}`, '--message', 'hello-from-the-cli'],
+    ['connect', `${published.address}:${PORT}`, '--message', 'hello-from-the-cli'],
     'connect',
   );
   try {
