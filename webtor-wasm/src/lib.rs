@@ -6,11 +6,13 @@
 //! circuit is encrypted end to end. `https://` and `wss://` are therefore
 //! refused rather than tolerated.
 
+mod js_callback;
 mod logging;
 mod options;
 
 use futures::future::{AbortHandle, Abortable};
 use futures::lock::Mutex;
+use js_callback::JsCallback;
 use logging::Logger;
 use options::error as option_error;
 use std::cell::{Cell, RefCell};
@@ -44,6 +46,7 @@ const CLIENT_OPTIONS: &[&str] = &[
     "log",
     "logPrefix",
     "onLog",
+    "onDirectoryChange",
 ];
 const REQUEST_OPTIONS: &[&str] = &["method", "headers", "body", "timeoutMs"];
 const WEBSOCKET_OPTIONS: &[&str] = &["maxMessageBytes", "timeoutMs"];
@@ -170,6 +173,13 @@ fn read_client_config(raw: Option<js_sys::Object>) -> Result<ClientConfig, JsVal
     let log: Logger = traces.clone().unwrap_or_else(logging::silent);
     let for_client = log.clone();
     options = options.with_on_log(move |message, log_type| for_client(message, log_type));
+
+    // Where a refreshed directory is kept is the caller's, so all this does is
+    // hand the seed over the moment there is a newer one.
+    if let Some(callback) = options::function(&bag, "onDirectoryChange", what)? {
+        let sink = JsCallback::new(callback);
+        options = options.with_on_directory_change(move |encoded| sink.call(&[encoded]));
+    }
 
     Ok(ClientConfig {
         options,
@@ -318,6 +328,12 @@ impl WebtorClient {
     ///   console, where `level` is `"info"`, `"success"`, `"warn"` or
     ///   `"error"`. Replaces `log` and `logPrefix`, which configure the
     ///   console sink, so passing it with either is an error.
+    /// - `onDirectoryChange`: `(seed)` called with a new `directoryCache()`
+    ///   whenever this client downloads a directory, including the refreshes
+    ///   a published service does hours into its life. `directoryCache()` is
+    ///   a pull, so a caller that exports once after `create` stores the
+    ///   directory it started with; this is how it hears about a newer one.
+    ///   A `directorySeed` is never handed back, having come from the caller.
     ///
     /// A caller that wants proof the client can complete a rendezvous before
     /// it uses it does that itself, with a `fetch` against a service it

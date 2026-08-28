@@ -20,6 +20,7 @@
     nextSocket: 0,
     service: null,
     served: [],
+    directoryUpdates: [],
   };
 
   function show(line) {
@@ -134,9 +135,24 @@
           }
           settings.directorySeed = await response.text();
         }
+        // Recorded, not returned: a seed is tens of megabytes, so what
+        // crosses CDP is what `directoryUpdates` says about it.
+        settings.onDirectoryChange = (seed) => {
+          state.directoryUpdates.push(seed);
+          show(`directory update: ${seed.length} bytes`);
+        };
         state.client = await WebtorClient.create(settings);
         return { seconds: Number(((performance.now() - started) / 1000).toFixed(1)) };
       }),
+
+    /** Every directory `onDirectoryChange` was handed, described. */
+    directoryUpdates: () =>
+      rethrowing(async () =>
+        state.directoryUpdates.map((seed) => ({
+          bytes: seed.length,
+          timePeriod: describeDirectory(seed).timePeriod,
+        })),
+      ),
 
     directoryCache: () =>
       rethrowing(async () => {

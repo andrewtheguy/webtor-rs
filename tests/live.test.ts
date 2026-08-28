@@ -54,6 +54,9 @@ const CASE_TIMEOUT = 5 * 60_000;
 
 describe('webtor-wasm over Tor', () => {
   let harness: BrowserHarness;
+  // Set when the bootstrap was seeded, which decides whether this run had a
+  // directory download in it at all.
+  let seededFrom: string | null = null;
   const started = Date.now();
   const elapsed = () => `${((Date.now() - started) / 1000).toFixed(1)}s`;
 
@@ -91,6 +94,7 @@ describe('webtor-wasm over Tor', () => {
       options.bridgeFingerprint = BRIDGE_FINGERPRINT;
       console.log(`  using bridge ${BRIDGE_URL} (${BRIDGE_FINGERPRINT})`);
     }
+    seededFrom = seedUrl;
     const { seconds } = await harness.call('create', options, seedUrl);
     console.log(`  client ready in ${seconds}s`);
 
@@ -150,6 +154,33 @@ describe('webtor-wasm over Tor', () => {
       Date.parse(cache.validUntil) > Date.now(),
       `the exported directory expired at ${cache.validUntil}`,
     );
+  }, CASE_TIMEOUT);
+
+  it('hands a downloaded directory to the caller as it arrives', async () => {
+    const updates = await harness.call('directoryUpdates');
+
+    if (seededFrom) {
+      // Nothing changed: the directory in force is the one the caller
+      // supplied, and announcing it back would report a change that never
+      // happened.
+      assert.deepEqual(
+        updates,
+        [],
+        `a supplied seed was reported back: ${JSON.stringify(updates)}`,
+      );
+      return;
+    }
+
+    assert.equal(
+      updates.length,
+      1,
+      `one download, so one announcement: ${JSON.stringify(updates)}`,
+    );
+    // The push and the pull have to be the same directory, or a caller that
+    // stores what it is handed would seed the next run from something else.
+    const cache = await harness.call('directoryCache');
+    assert.equal(updates[0]?.bytes, cache.bytes);
+    assert.equal(updates[0]?.timePeriod, cache.timePeriod);
   }, CASE_TIMEOUT);
 
   it('GETs an onion site', async () => {

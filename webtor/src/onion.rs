@@ -15,7 +15,8 @@
 
 use crate::circuit::{make_circ_params, CircuitManager};
 use crate::config::{LogCallback, LogType};
-use crate::directory::{fetch_directory_document, DirectoryManager};
+use crate::dir_http::fetch_directory_document;
+use crate::directory::DirectoryManager;
 use crate::error::{Result, TorError};
 use crate::relay::{selection, Relay, RelayManager};
 use crate::retry::with_timeout;

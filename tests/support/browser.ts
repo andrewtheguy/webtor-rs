@@ -101,6 +101,10 @@ export interface HarnessCalls {
       timePeriodNow: number;
     };
   };
+  directoryUpdates: {
+    args: [];
+    result: { bytes: number; timePeriod: number }[];
+  };
   close: { args: []; result: string };
   fetch: {
     args: [url: string, options?: FetchOptions];

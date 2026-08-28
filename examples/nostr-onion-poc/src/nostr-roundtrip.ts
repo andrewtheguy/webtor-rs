@@ -4,7 +4,7 @@ import {
   generateSecretKey,
   verifyEvent,
 } from 'nostr-tools';
-import { loadDirectorySeed, saveDirectoryCache } from './directory-cache';
+import { directorySeedStore } from '../../shared/directory-cache';
 import { loadWebtor } from './webtor';
 
 export const ONION_RELAYS = [
@@ -52,7 +52,6 @@ interface OnionClient {
     options?: { timeoutMs: number },
   ): Promise<OnionSocket>;
   fetch(url: string, options?: { timeoutMs: number }): Promise<OnionResponse>;
-  directoryCache(): Promise<string>;
   close(): Promise<unknown>;
 }
 
@@ -316,12 +315,14 @@ async function proveOnRelay(
   }
 }
 
+const store = directorySeedStore('webtor-nostr-onion-poc');
+
 export async function runNostrRoundTrip(
   options: RoundTripOptions,
 ): Promise<RoundTripResult> {
   const started = performance.now();
   const onLog = options.onLog;
-  const directory = await loadDirectorySeed();
+  const directory = await store.load();
   onLog({
     level: 'info',
     message: 'Loading webtor WASM',
@@ -342,6 +343,18 @@ export async function runNostrRoundTrip(
     ...(options.bridge === 'webrtc' ? { stunUrls: STUN_URLS } : {}),
     directorySeed: directory.value,
     connectionTimeoutMs: 300_000,
+    // Every directory this client downloads, kept for the next run. A seed
+    // that came from here is never handed back, so this fires only when there
+    // is something new to store.
+    onDirectoryChange: (cache: string) => {
+      void store.save(cache).then((stored) => {
+        if (!stored) return;
+        onLog({
+          level: 'info',
+          message: 'Saved the validated directory in IndexedDB',
+        });
+      });
+    },
     logPrefix: '[nostr-onion-poc]',
   })) as OnionClient;
 
@@ -357,13 +370,6 @@ export async function runNostrRoundTrip(
       message: 'Tor client is verified',
       detail: `${VERIFY_URL} answered HTTP ${verified.status}`,
     });
-    const cache = await client.directoryCache();
-    await saveDirectoryCache(cache);
-    onLog({
-      level: 'info',
-      message: 'Saved the validated directory in IndexedDB',
-    });
-
     const secretKey = generateSecretKey();
     const marker = `webtor-poc:${crypto.randomUUID()}`;
     const event = finalizeEvent(

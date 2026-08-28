@@ -7,6 +7,7 @@
 //! sink that is belongs to the caller: the console under a prefix, a function
 //! of the caller's own, or nothing at all.
 
+use crate::js_callback::JsCallback;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, Once};
 use tracing::field::{Field, Visit};
@@ -44,37 +45,19 @@ pub(crate) fn console_logger(prefix: String) -> Logger {
 /// A sink the caller supplied, so an application can put Tor progress wherever
 /// the rest of its logging goes rather than only in the console.
 pub(crate) fn js_logger(callback: js_sys::Function) -> Logger {
-    let sink = JsSink(callback);
-    // Called through the whole struct on purpose: capturing the function field
-    // on its own would leave the closure without the Send and Sync that the
-    // struct is what carries.
-    Arc::new(move |message: &str, log_type: LogType| sink.emit(message, log_type))
+    let sink = JsCallback::new(callback);
+    // `sink.call` and not `sink.0`: precise capture would take the bare
+    // function into the closure and leave it without the Send and Sync that
+    // `JsCallback` is what carries.
+    Arc::new(move |message: &str, log_type: LogType| {
+        sink.call(&[message, level_name(log_type)])
+    })
 }
 
 /// Drop every line, for a caller that asked for no logging at all.
 pub(crate) fn silent() -> Logger {
     Arc::new(|_: &str, _| {})
 }
-
-/// A JS callback held where the Tor client wants `Send + Sync`.
-struct JsSink(js_sys::Function);
-
-impl JsSink {
-    fn emit(&self, message: &str, log_type: LogType) {
-        // A callback that throws is the caller's to see in its own stack, not
-        // a reason to fail the bootstrap it was reporting on.
-        let _ = self.0.call2(
-            &JsValue::NULL,
-            &JsValue::from_str(message),
-            &JsValue::from_str(level_name(log_type)),
-        );
-    }
-}
-
-// Browser WASM is single-threaded, while the client requires its log sink to
-// satisfy Send and Sync at the generic boundary.
-unsafe impl Send for JsSink {}
-unsafe impl Sync for JsSink {}
 
 /// Where `tracing` events go.
 ///

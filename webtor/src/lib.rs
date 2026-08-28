@@ -15,6 +15,7 @@ mod authority;
 mod circuit;
 mod client;
 mod config;
+mod dir_http;
 mod directory;
 mod error;
 mod http;
