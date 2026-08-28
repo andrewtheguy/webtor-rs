@@ -535,43 +535,61 @@ async fn publish_everywhere(state: &Arc<ServiceState>) -> Result<()> {
 /// answering, for as long as the service is up.
 ///
 /// A point whose circuit has ended wakes this through `nudges`; a shortfall
-/// that cannot be made up on the spot is retried on a growing delay, since
-/// what stopped a relay from taking an ESTABLISH_INTRO a moment ago is
+/// that cannot be made up on the spot, or an upload that did not go through,
+/// is retried on a growing delay, since what stopped a relay from taking an
+/// ESTABLISH_INTRO or an HSDir from storing a descriptor a moment ago is
 /// usually still true.
 async fn maintain_intro_points(state: Arc<ServiceState>, mut nudges: mpsc::Receiver<()>) {
     use futures::future::{select, Either};
 
     let (min_delay, max_delay) = INTRO_RETRY_DELAY;
     let mut delay = min_delay;
+    // A change the HSDirs have not been told about yet. Reconciling is what
+    // sets it and only an upload that went through clears it: the reconcile
+    // after a failed upload has nothing left to change and would report no
+    // change at all, so without this the replacement would sit here answering
+    // while every stored descriptor still named the point it replaced.
+    let mut pending = false;
     loop {
-        let short = state.intro_points.read().await.len() < state.target_intro_points;
-        if short {
-            // Still waiting on the nudges as well: another point can end
-            // while this one is waiting to be replaced.
+        // A shortfall or an unpublished change is something to come back to
+        // on the retry timer. With neither, there is nothing to do until a
+        // point ends — but a point can end while either is being waited out,
+        // so the nudges are watched throughout.
+        let established = state.intro_points.read().await.len();
+        if intro_points_settled(pending, established, state.target_intro_points) {
+            if nudges.next().await.is_none() {
+                // The service has closed the channel; nothing left to maintain.
+                return;
+            }
+        } else {
             let retry = Box::pin(crate::retry::sleep(delay));
             if let Either::Left((None, _)) = select(nudges.next(), retry).await {
                 return;
             }
-        } else if nudges.next().await.is_none() {
-            // The service has closed the channel; nothing left to maintain.
-            return;
         }
 
         let outcome = {
             let _publishing = state.publishing.lock().await;
             match reconcile_intro_points(&state).await {
-                // The descriptors already stored name exactly what is
-                // answering, so there is nothing to tell the HSDirs.
-                Ok(false) => Ok(()),
-                Ok(true) => {
-                    // The wait comes after the reconcile, not before it: a
-                    // point that has stopped answering is retired and
-                    // replaced straight away, and it is only the upload that
-                    // announces it which is held to one a minute. Anything
-                    // that ends during the wait has already queued its nudge
-                    // and is dealt with on the next turn of this loop.
-                    crate::retry::sleep(state.wait_before_publishing()).await;
-                    publish_everywhere(&state).await
+                Ok(changed) => {
+                    pending |= changed;
+                    if pending {
+                        // The wait comes after the reconcile, not before it:
+                        // a point that has stopped answering is retired and
+                        // replaced straight away, and it is only the upload
+                        // that announces it which is held to one a minute.
+                        // Anything that ends during the wait has already
+                        // queued its nudge and is dealt with on the next turn
+                        // of this loop.
+                        crate::retry::sleep(state.wait_before_publishing()).await;
+                        let published = publish_everywhere(&state).await;
+                        pending = published.is_err();
+                        published
+                    } else {
+                        // Every stored descriptor names exactly what is
+                        // answering, so there is nothing to tell the HSDirs.
+                        Ok(())
+                    }
                 }
                 Err(error) => Err(error),
             }
@@ -583,12 +601,20 @@ async fn maintain_intro_points(state: Arc<ServiceState>, mut nudges: mpsc::Recei
             );
         }
 
-        delay = if state.intro_points.read().await.len() < state.target_intro_points {
-            grown_retry_delay(delay, max_delay)
-        } else {
+        let established = state.intro_points.read().await.len();
+        delay = if intro_points_settled(pending, established, state.target_intro_points) {
             min_delay
+        } else {
+            grown_retry_delay(delay, max_delay)
         };
     }
+}
+
+/// Whether the maintainer has nothing left to come back to: the target number
+/// of introduction points is answering *and* the HSDirs have been told about
+/// them. Only then is waiting on the nudges alone the whole of the job.
+fn intro_points_settled(pending: bool, established: usize, target: usize) -> bool {
+    !pending && established >= target
 }
 
 /// The next retry delay after one that left the service still short.
@@ -1461,6 +1487,17 @@ mod tests {
         let consensus = HashSet::new();
         assert!(intro_point_is_usable(false, "aaaa", &consensus));
         assert!(!intro_point_is_usable(true, "aaaa", &consensus));
+    }
+
+    /// The whole job is done only when the points are up and the HSDirs have
+    /// been told: a replacement established but not published leaves the
+    /// maintainer on its retry timer, because the reconcile that follows has
+    /// nothing left to change and would report no change at all.
+    #[test]
+    fn an_unpublished_change_is_not_settled() {
+        assert!(intro_points_settled(false, 3, 3));
+        assert!(!intro_points_settled(true, 3, 3));
+        assert!(!intro_points_settled(false, 2, 3));
     }
 
     /// A network with no relay to spare is asked less and less often, up to a
