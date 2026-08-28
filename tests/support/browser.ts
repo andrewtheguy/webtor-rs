@@ -8,7 +8,7 @@ import { chromium } from 'playwright-core';
 import { REPO_ROOT, startServer } from './server.ts';
 
 const CHROME_PATH = process.env.CHROME_PATH ?? '/usr/bin/google-chrome';
-const PACKAGE = join(REPO_ROOT, 'webtor-wasm', 'pkg', 'webtor_wasm.js');
+const PACKAGE = join(REPO_ROOT, 'crates', 'webtor-wasm', 'pkg', 'webtor_wasm.js');
 
 async function requireFile(path: string, hint: string): Promise<void> {
   try {

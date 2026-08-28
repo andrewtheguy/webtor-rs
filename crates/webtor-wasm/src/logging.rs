@@ -14,7 +14,7 @@ use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Level, Metadata, Subscriber};
 use wasm_bindgen::prelude::*;
-use webtor::LogType;
+use webtor_core::LogType;
 
 /// A log sink shared by the Tor client and this binding, so progress from
 /// both sides of the boundary lands in one place.

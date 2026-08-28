@@ -1,7 +1,6 @@
 /node_modules/
 /target/
 *.tgz
-/webtor-wasm/LICENSE
 tmp/
 /tests/.directory-seed.json
 
@@ -9,4 +8,4 @@ tmp/
 __pycache__/
 *.py[cod]
 *$py.class
-webtor-wasm/pkg/
+/crates/webtor-wasm/pkg/

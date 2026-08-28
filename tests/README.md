@@ -10,7 +10,7 @@ this directory.
 ```bash
 bun install        # install dependencies from bun.lock
 bun run typecheck  # check all TypeScript without emitting JavaScript
-bun run build      # required first: the harness imports webtor-wasm/pkg/
+bun run build      # required first: the harness imports crates/webtor-wasm/pkg/
 bun run test       # tests/api.test.ts    — no network, ~1s
 bun run seed       # a directory snapshot, ~40 MiB, valid three hours
 bun run test:live  # tests/live.test.ts   — real onion services, ~1 minute
@@ -25,7 +25,7 @@ is why it needs one already installed.
 
 **`api.test.ts`** covers what answers without a circuit: `isOnionHost`,
 `parseOnionUrl`, `describeDirectory` against the consensus fixture in
-`webtor/testdata/`, and the option validation `WebtorClient.create` runs before
+`crates/webtor-core/testdata/`, and the option validation `WebtorClient.create` runs before
 it touches the network — unknown keys, wrong types, a bridge that needs STUN.
 It needs no Tor and no directory, so it is the one to run while editing.
 
@@ -45,6 +45,12 @@ a service the CLI publishes, then publishes a service of its own for
 rather than just "onion services do not work". `PTRANSFER_BIN` overrides the
 binary (default `../ptransfer-cli/target/release/ptransfer`) and `ONLY=client`
 or `ONLY=server` runs one direction.
+
+That proof of concept is what moves into `reference/onion-cli/`, so this suite
+stops depending on a sibling checkout. What must not move with it is the
+independence: `reference/` is outside the root Cargo workspace and shares no
+crate with `crates/`, because an implementation built from the same code could
+not tell either side it was wrong.
 
 Environment: `DIRECTORY_SEED` (default `tests/.directory-seed.json`), `BRIDGE`
 (`websocket` or `webrtc`), `STUN_URLS` (comma-separated, for `webrtc`), and
