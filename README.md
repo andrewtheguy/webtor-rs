@@ -10,47 +10,19 @@ clients send it.
 The Rust workspace builds `@andrewtheguy/webtor-wasm`, the package a web app
 installs.
 
-## Why there is no TLS
+## Architecture
 
-Every destination is an onion service, so no circuit is ever built to an exit.
-That removes the two things a browser cannot do well: there is no clearnet TLS
-to terminate inside WASM and no server certificate to validate. The onion
-address commits to the service key and the circuit is encrypted end to end, so
-`https://` and `wss://` are refused rather than tolerated — a TLS layer over an
-onion circuit would add nothing this client could check.
+Every destination is a v3 onion service, so webtor builds no exit circuits and
+accepts no TLS URL schemes. The onion address authenticates the service and the
+rendezvous circuit is encrypted end to end. The same client can connect to an
+existing service or publish an ephemeral service whose identity lives only in
+the page.
 
-## What a connection does
-
-Bootstrap opens the Snowflake bridge channel and installs a directory: the
-consensus plus microdescriptors for a sample of middle relays and for every
-relay with the HSDir flag, since the HSDir hash ring is computed from all of
-them. Connecting to a `.onion` then runs the onion client in
-`webtor/src/onion.rs`:
-
-1. compute the current time period and shared random value from the consensus,
-   blind the service key and pick the responsible HSDirs;
-2. build a circuit bridge → middle → HSDir and fetch the descriptor;
-3. build a circuit to a rendezvous point and establish a cookie there;
-4. build a circuit to one of the descriptor's introduction points and send an
-   `INTRODUCE1` carrying the rendezvous point and an hs-ntor handshake;
-5. finish the handshake with the `RENDEZVOUS2` the service delivers and extend
-   the rendezvous circuit by a virtual hop, then begin streams on it.
-
-Publishing a service runs the same machinery from the other end, in
-`webtor/src/onion_service.rs`: generate an identity keypair and derive the
-address from it, establish introduction points with `ESTABLISH_INTRO`, sign a
-descriptor naming them and upload it to the responsible HSDirs — for the
-current time period and whichever adjacent periods the directory's
-shared-random values support, so that a client whose consensus places it in a
-neighbouring period still finds the service. That is then repeated every 60 to
-120 minutes, or shortly after a period boundary when that comes first, against
-a freshly downloaded consensus. This keeps the address alive past the
-descriptor's own lifetime and across the rotation that moves every ring. Every
-`INTRODUCE2` that arrives afterwards is answered by building a circuit to the
-client's rendezvous point, completing the hs-ntor handshake as the responder,
-and sending `RENDEZVOUS1`; the streams the client then begins are handed to the
-caller. Nothing is persisted: the identity key lives in the page and dies with
-the service, so every address is ephemeral.
+[Onion-Service Architecture](docs/ONION_SERVICE_ARCHITECTURE.md) documents the
+Snowflake paths, directory bootstrap and cache contract, client rendezvous,
+service publication and republication, lifecycle, and Tor-level privacy
+boundary. Application protocols carried over a raw `OnionStream` are outside
+webtor's contract.
 
 ## Using it
 
@@ -213,6 +185,7 @@ The current line is `0.0.1-alpha.*`.
 webtor/       the Tor client: directory, circuits, onion rendezvous, HTTP, WebSocket
 webtor-wasm/  the wasm-bindgen surface packed for distribution
 subtle-tls/   the TLS 1.3 session the bridge channel runs inside (see its README)
+docs/         architecture and network-observation notes
 tests/        the browser test project
 examples/     standalone browser integrations
 scripts/      the SOCKS-based probe and an opt-in local WebSocket bridge
