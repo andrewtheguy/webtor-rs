@@ -21,8 +21,13 @@ export interface DirectorySeed {
 export interface DirectorySeedStore {
   /** The best seed on hand, and where it came from. */
   load(): Promise<DirectorySeed>;
-  /** Keep `cache` for the next load. Failures are reported, never thrown. */
-  save(cache: string): Promise<void>;
+  /**
+   * Keep `cache` for the next load. Resolves to whether it was stored:
+   * IndexedDB is missing in some contexts and refuses writes in others, and
+   * neither is worth failing a working Tor client over — but neither is
+   * something to report as a save, either.
+   */
+  save(cache: string): Promise<boolean>;
 }
 
 /**
@@ -74,8 +79,8 @@ export function directorySeedStore(name: string): DirectorySeedStore {
       return { value: undefined, source: 'Tor download' };
     },
 
-    async save(cache: string): Promise<void> {
-      if (!globalThis.indexedDB) return;
+    async save(cache: string): Promise<boolean> {
+      if (!globalThis.indexedDB) return false;
       let database: IDBDatabase | undefined;
       try {
         database = await openDatabase();
@@ -83,8 +88,10 @@ export function directorySeedStore(name: string): DirectorySeedStore {
         const complete = transactionComplete(transaction);
         transaction.objectStore(STORE_NAME).put(cache, CACHE_KEY);
         await complete;
+        return true;
       } catch (error) {
         console.info(`[${name}] Could not save directory cache:`, error);
+        return false;
       } finally {
         database?.close();
       }

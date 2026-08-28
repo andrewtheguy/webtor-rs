@@ -109,8 +109,9 @@ export async function startOnionService(
     // up, and downloading one over a single bridge circuit is the slowest part
     // of a cold start.
     onDirectoryChange: (cache: string) => {
-      void store.save(cache);
-      log('info', 'Stored a fresh Tor directory for the next start');
+      void store.save(cache).then((stored) => {
+        if (stored) log('info', 'Stored a fresh Tor directory for the next start');
+      });
     },
     logPrefix: '[onion-service-poc]',
   });

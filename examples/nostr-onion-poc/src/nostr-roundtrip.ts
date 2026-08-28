@@ -347,10 +347,12 @@ export async function runNostrRoundTrip(
     // that came from here is never handed back, so this fires only when there
     // is something new to store.
     onDirectoryChange: (cache: string) => {
-      void store.save(cache);
-      onLog({
-        level: 'info',
-        message: 'Saved the validated directory in IndexedDB',
+      void store.save(cache).then((stored) => {
+        if (!stored) return;
+        onLog({
+          level: 'info',
+          message: 'Saved the validated directory in IndexedDB',
+        });
       });
     },
     logPrefix: '[nostr-onion-poc]',
