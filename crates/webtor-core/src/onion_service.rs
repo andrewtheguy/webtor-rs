@@ -17,6 +17,11 @@
 //! 5. accept the `BEGIN` messages that arrive on that virtual hop and hand
 //!    each resulting stream to the caller.
 //!
+//! The introduction points are maintained rather than established once: one
+//! whose circuit ends, or whose relay leaves the consensus, is dropped, a
+//! replacement is established elsewhere, and the descriptor is published
+//! again naming the points that are actually answering.
+//!
 //! Everything lives in memory: the identity key is generated per call and
 //! never written anywhere, so every launch is a new address and closing the
 //! page ends the service.
@@ -35,6 +40,7 @@ use futures::channel::{mpsc, oneshot};
 use futures::future::{AbortHandle, Abortable};
 use futures::{SinkExt, StreamExt};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use safelog::DisplayRedacted;
@@ -100,6 +106,18 @@ const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_CONCURRENT_STREAMS: usize = 16;
 /// Depth of the queues between the reactors and the service task.
 const CHANNEL_DEPTH: usize = 8;
+/// How long the maintainer waits before trying again to reach the target
+/// number of introduction points, and how far that wait grows while it keeps
+/// failing. A service short of a point is still reachable through the ones it
+/// has, and a network with no relay to spare will not have one a second
+/// later, so retrying at the shortest interval forever would only add load.
+const INTRO_RETRY_DELAY: (Duration, Duration) =
+    (Duration::from_secs(30), Duration::from_secs(10 * 60));
+/// The least time between two descriptor uploads. Arti's publisher holds the
+/// same line at the same minute: without it a relay that takes an
+/// ESTABLISH_INTRO and drops the circuit straight back would turn one flapping
+/// point into a run of uploads to every HSDir.
+const UPLOAD_RATE_LIMIT: Duration = Duration::from_secs(60);
 
 /// What [`OnionService::launch`] was asked for.
 #[derive(Clone, Copy, Debug)]
@@ -145,9 +163,23 @@ struct Publication {
 /// An introduction point that has acknowledged our ESTABLISH_INTRO.
 struct EstablishedIntroPoint {
     /// Held so the circuit's reactor keeps running; INTRODUCE2 arrives here.
+    /// Never read: retiring the point drops it, and that is what stops the
+    /// reactor and withdraws the introduction point.
+    #[allow(dead_code)]
     tunnel: Arc<ClientTunnel>,
+    /// The relay carrying it: what a replacement avoids picking again, and
+    /// what a fresh consensus is checked against to see whether the relay is
+    /// still there at all.
+    relay: Relay,
     /// What the descriptor says about this introduction point.
     descriptor: IntroPointDesc,
+    /// Set by the watcher when this point's circuit has ended.
+    ///
+    /// A flag of our own rather than the circuit's `is_closed`, because the
+    /// watcher sets it before it wakes the maintainer: whatever the reactor
+    /// has published about itself by the time the maintainer runs, the point
+    /// that woke it is already marked.
+    ended: Arc<AtomicBool>,
 }
 
 /// A published onion service.
@@ -159,6 +191,11 @@ struct EstablishedIntroPoint {
 /// The descriptor is published for the current time period and the ones either
 /// side of it, and republished on a timer for as long as the service is up, so
 /// the address survives both the descriptor expiring and the rings rotating.
+///
+/// The introduction points named in it are watched for the same reason: one
+/// that stops answering is retired, replaced, and published again, so the
+/// address does not decay one point at a time behind a descriptor that still
+/// looks healthy.
 pub struct OnionService {
     address: String,
     incoming: Mutex<mpsc::Receiver<DataStream>>,
@@ -179,17 +216,37 @@ struct ServiceState {
     identity: HsIdKeypair,
     directory_manager: Arc<DirectoryManager>,
     relay_manager: Arc<RwLock<RelayManager>>,
-    /// What every descriptor advertises. Established once at launch.
-    intro_points: RwLock<Vec<IntroPointDesc>>,
+    /// What every descriptor advertises, and the circuits the introductions
+    /// arrive on. Kept up to strength by [`reconcile_intro_points`].
+    intro_points: RwLock<Vec<EstablishedIntroPoint>>,
+    /// How many introduction points to keep established.
+    target_intro_points: usize,
+    /// Where INTRODUCE2 goes. Held so that a point established long after
+    /// launch feeds the same queue as the ones launch established.
+    introduce_tx: mpsc::Sender<(Arc<IntroPointKeys>, Introduce2)>,
+    /// Wakes the maintainer when an introduction point's circuit has ended.
+    maintenance_tx: mpsc::Sender<()>,
     /// One per time period the descriptor has been published for, newest
     /// periods last. A client encrypts its INTRODUCE2 to the subcredential of
     /// the period it found the descriptor under, so every one still in reach
     /// of a live consensus has to be tried.
     subcredentials: RwLock<Vec<(TimePeriod, Subcredential)>>,
     on_log: Option<LogCallback>,
-    /// Introduction circuits and live client circuits. A tunnel's reactor
-    /// stops when its last handle is dropped, so they are held here.
+    /// Live client circuits. A tunnel's reactor stops when its last handle is
+    /// dropped, so they are held here. The introduction circuits are not
+    /// among them: those belong to `intro_points`, so that retiring a point
+    /// is what drops its circuit.
     tunnels: RwLock<Vec<Arc<ClientTunnel>>>,
+    /// Serialises the two things that change what the HSDirs hold — the
+    /// republish timer and introduction point maintenance — so a replacement
+    /// and a scheduled republication cannot upload descriptors out of order.
+    publishing: Mutex<()>,
+    /// When the descriptor last went up, which is what [`UPLOAD_RATE_LIMIT`]
+    /// is measured from.
+    ///
+    /// A `std` lock rather than an async one because nothing holds it across
+    /// an await.
+    last_publication: StdMutex<Option<SystemTime>>,
     /// Aborts the background tasks when the service is closed or dropped.
     ///
     /// A `std` lock rather than an async one because [`Drop`] has to take it,
@@ -216,6 +273,24 @@ fn abort_all(lock: &StdMutex<Vec<AbortHandle>>) {
 }
 
 impl ServiceState {
+    /// Note that a descriptor has just gone up, for [`UPLOAD_RATE_LIMIT`].
+    fn record_publication(&self) {
+        *self
+            .last_publication
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(system_time_now());
+    }
+
+    /// How long a publication that is not on the republish timer has to wait,
+    /// so that uploads stay at most one a minute.
+    fn wait_before_publishing(&self) -> Duration {
+        let last = *self
+            .last_publication
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        wait_before_publishing(last, system_time_now())
+    }
+
     fn log(&self, message: &str, log_type: LogType) {
         if let Some(callback) = &self.on_log {
             (callback.0)(message, log_type);
@@ -237,7 +312,13 @@ impl ServiceState {
     /// address works for a peer reading the same consensus as this service.
     async fn prepare_publications(&self) -> Result<Vec<Publication>> {
         let rings = self.directory_manager.hsdir_params().await?;
-        let intro_points = self.intro_points.read().await.clone();
+        let intro_points: Vec<IntroPointDesc> = self
+            .intro_points
+            .read()
+            .await
+            .iter()
+            .map(|point| point.descriptor.clone())
+            .collect();
         let relays = self.relay_manager.read().await.relays.clone();
         let now = system_time_now();
         let mut rng = rand::rng();
@@ -365,12 +446,10 @@ fn capped_republish_delay(
         .max(MIN_REPUBLISH_INTERVAL)
 }
 
-/// One republication: a current directory, then a descriptor on every ring it
-/// names.
+/// One republication: a current directory, introduction points that are still
+/// answering, then a descriptor on every ring the directory names.
 async fn republish(state: &Arc<ServiceState>) -> Result<()> {
-    // Whatever is left of the previous round's uploads has either finished or
-    // run out its timeout many times over by now.
-    abort_all(&state.upload_aborts);
+    let _publishing = state.publishing.lock().await;
 
     // The rings come from the consensus, so republishing against the one this
     // service started with would put the descriptor straight back onto the
@@ -401,7 +480,29 @@ async fn republish(state: &Arc<ServiceState>) -> Result<()> {
         }
     }
 
+    // The consensus that just arrived is also what says whether each
+    // introduction point is still a relay, so this is the moment to notice one
+    // that has left it — and the last moment before a descriptor goes out
+    // naming it.
+    reconcile_intro_points(state).await?;
+
+    publish_everywhere(state).await
+}
+
+/// Sign the descriptor for every time period the directory names and store it
+/// on all of their rings.
+///
+/// Unlike the first publication at launch, no single period decides whether
+/// the service exists: it is already running, and a period that fails here is
+/// tried again at the next interval. Failing all of them is still worth
+/// saying.
+async fn publish_everywhere(state: &Arc<ServiceState>) -> Result<()> {
+    // Whatever is left of the previous round's uploads has either finished or
+    // run out its timeout many times over by now.
+    abort_all(&state.upload_aborts);
+
     let publications = state.prepare_publications().await?;
+    state.record_publication();
     let outcomes = futures::future::join_all(
         publications
             .iter()
@@ -409,9 +510,6 @@ async fn republish(state: &Arc<ServiceState>) -> Result<()> {
     )
     .await;
 
-    // Unlike the first publication, none of these decides whether the service
-    // exists: it is already running, and a period that fails now is retried at
-    // the next interval.
     let mut stored = 0_usize;
     for (publication, outcome) in publications.iter().zip(outcomes) {
         match outcome {
@@ -431,6 +529,84 @@ async fn republish(state: &Arc<ServiceState>) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Watch the introduction points and keep the target number of them
+/// answering, for as long as the service is up.
+///
+/// A point whose circuit has ended wakes this through `nudges`; a shortfall
+/// that cannot be made up on the spot is retried on a growing delay, since
+/// what stopped a relay from taking an ESTABLISH_INTRO a moment ago is
+/// usually still true.
+async fn maintain_intro_points(state: Arc<ServiceState>, mut nudges: mpsc::Receiver<()>) {
+    use futures::future::{select, Either};
+
+    let (min_delay, max_delay) = INTRO_RETRY_DELAY;
+    let mut delay = min_delay;
+    loop {
+        let short = state.intro_points.read().await.len() < state.target_intro_points;
+        if short {
+            // Still waiting on the nudges as well: another point can end
+            // while this one is waiting to be replaced.
+            let retry = Box::pin(crate::retry::sleep(delay));
+            if let Either::Left((None, _)) = select(nudges.next(), retry).await {
+                return;
+            }
+        } else if nudges.next().await.is_none() {
+            // The service has closed the channel; nothing left to maintain.
+            return;
+        }
+
+        let outcome = {
+            let _publishing = state.publishing.lock().await;
+            match reconcile_intro_points(&state).await {
+                // The descriptors already stored name exactly what is
+                // answering, so there is nothing to tell the HSDirs.
+                Ok(false) => Ok(()),
+                Ok(true) => {
+                    // The wait comes after the reconcile, not before it: a
+                    // point that has stopped answering is retired and
+                    // replaced straight away, and it is only the upload that
+                    // announces it which is held to one a minute. Anything
+                    // that ends during the wait has already queued its nudge
+                    // and is dealt with on the next turn of this loop.
+                    crate::retry::sleep(state.wait_before_publishing()).await;
+                    publish_everywhere(&state).await
+                }
+                Err(error) => Err(error),
+            }
+        };
+        if let Err(error) = outcome {
+            state.log(
+                &format!("Could not restore the introduction points: {error}"),
+                LogType::Error,
+            );
+        }
+
+        delay = if state.intro_points.read().await.len() < state.target_intro_points {
+            grown_retry_delay(delay, max_delay)
+        } else {
+            min_delay
+        };
+    }
+}
+
+/// The next retry delay after one that left the service still short.
+fn grown_retry_delay(delay: Duration, max_delay: Duration) -> Duration {
+    (delay * 2).min(max_delay)
+}
+
+/// What is left of [`UPLOAD_RATE_LIMIT`] since the last publication.
+///
+/// A clock that has gone backwards since then counts as no wait at all: the
+/// limit is there to stop a flapping relay from generating uploads, and a
+/// service that stalled on a clock adjustment instead would be the worse
+/// failure.
+fn wait_before_publishing(last: Option<SystemTime>, now: SystemTime) -> Duration {
+    let Some(last) = last else {
+        return Duration::ZERO;
+    };
+    UPLOAD_RATE_LIMIT.saturating_sub(now.duration_since(last).unwrap_or(UPLOAD_RATE_LIMIT))
 }
 
 impl OnionService {
@@ -456,20 +632,28 @@ impl OnionService {
             .display_unredacted()
             .to_string();
 
-        // The descriptor goes to the ring of the period this consensus is in
-        // and to the rings either side of it. A peer whose own consensus has
-        // not turned over yet — or has turned over already — computes one of
-        // those neighbouring rings, and publishing to the current one alone
-        // would leave it looking at HSDirs that hold nothing.
+        let (introduce_tx, introduce_rx) = mpsc::channel(CHANNEL_DEPTH);
+        let (streams, stream_rx) = mpsc::channel(CHANNEL_DEPTH);
+        let stream_tx = streams.clone();
+        // One nudge is as good as several: the maintainer looks at every point
+        // whenever it wakes, so a second one queued behind the first would
+        // find nothing left to do.
+        let (maintenance_tx, maintenance_rx) = mpsc::channel(1);
+
         let state = Arc::new(ServiceState {
             circuit_manager,
             identity,
             directory_manager,
-            relay_manager: relay_manager.clone(),
+            relay_manager,
             intro_points: RwLock::new(Vec::new()),
+            target_intro_points: options.intro_points,
+            introduce_tx,
+            maintenance_tx,
             subcredentials: RwLock::new(Vec::new()),
             on_log,
             tunnels: RwLock::new(Vec::new()),
+            publishing: Mutex::new(()),
+            last_publication: StdMutex::new(None),
             aborts: StdMutex::new(Vec::new()),
             upload_aborts: StdMutex::new(Vec::new()),
         });
@@ -478,30 +662,18 @@ impl OnionService {
             LogType::Info,
         );
 
-        let (introduce_tx, introduce_rx) = mpsc::channel(CHANNEL_DEPTH);
-        let (streams, stream_rx) = mpsc::channel(CHANNEL_DEPTH);
-        let stream_tx = streams.clone();
+        // Establishing the first points is the same operation as replacing one
+        // later, and it fails the launch for the same reason the maintainer
+        // logs it: a service with no introduction point has nothing to put in
+        // a descriptor. Anything short of the target is left to the maintainer.
+        reconcile_intro_points(&state).await?;
 
-        let established = establish_intro_points(
-            &state,
-            &relay_manager,
-            options.intro_points,
-            introduce_tx,
-        )
-        .await?;
-        let descriptors: Vec<IntroPointDesc> = established
-            .iter()
-            .map(|point| point.descriptor.clone())
-            .collect();
-        {
-            let mut tunnels = state.tunnels.write().await;
-            for point in established {
-                tunnels.push(point.tunnel);
-            }
-        }
-
-        *state.intro_points.write().await = descriptors;
-
+        // The descriptor goes to the ring of the period this consensus is in
+        // and to the rings either side of it. A peer whose own consensus has
+        // not turned over yet — or has turned over already — computes one of
+        // those neighbouring rings, and publishing to the current one alone
+        // would leave it looking at HSDirs that hold nothing.
+        //
         // The first publication is the one that decides whether the address
         // works at all, so unlike a republish it is allowed to fail the launch.
         let publications = state.prepare_publications().await?;
@@ -517,6 +689,7 @@ impl OnionService {
             )
         );
         current_outcome?;
+        state.record_publication();
         for (publication, outcome) in neighbours.iter().zip(neighbour_outcomes) {
             if let Err(error) = outcome {
                 state.log(
@@ -529,6 +702,21 @@ impl OnionService {
                 );
             }
         }
+
+        // Keep the introduction points answering. A relay that goes down, or
+        // leaves the consensus, stays in every descriptor until something
+        // notices: reachability then decays one point at a time with nothing
+        // to see from the inside.
+        let (maintain_abort, maintain_registration) = AbortHandle::new_pair();
+        aborts_of(&state.aborts).push(maintain_abort);
+        let maintain_state = state.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = Abortable::new(
+                maintain_intro_points(maintain_state, maintenance_rx),
+                maintain_registration,
+            )
+            .await;
+        });
 
         // Keep it published. A descriptor expires, and the rings it sits on
         // rotate, so a service that uploads once quietly stops being reachable
@@ -582,6 +770,7 @@ impl OnionService {
         // First, so that an `accept` waiting for the next client wakes up and
         // gives up the lock it is holding on the receiver.
         self.shutdown();
+        self.state.intro_points.write().await.clear();
         self.state.tunnels.write().await.clear();
     }
 
@@ -616,22 +805,72 @@ impl Drop for OnionService {
     }
 }
 
-/// Build circuits to `count` distinct relays and establish an introduction
-/// point at each. Relays that fail are skipped; one working introduction
-/// point is enough to publish.
-async fn establish_intro_points(
-    state: &Arc<ServiceState>,
-    relay_manager: &Arc<RwLock<RelayManager>>,
-    count: usize,
-    introduce_tx: mpsc::Sender<(Arc<IntroPointKeys>, Introduce2)>,
-) -> Result<Vec<EstablishedIntroPoint>> {
-    let mut established = Vec::new();
-    let mut used: HashSet<String> = HashSet::new();
-    let mut last_error = None;
+/// Bring the introduction points back up to strength.
+///
+/// Retires the ones this service can no longer be reached through — a circuit
+/// that has ended, a relay that has left the consensus — and establishes
+/// replacements at relays none of the survivors are on. Both halves are
+/// idempotent, so launch, a failed point and the republish timer can all call
+/// it and get the set the service should be advertising.
+///
+/// Returns whether that set changed, which is what tells the caller the HSDirs
+/// are holding a descriptor naming something else.
+///
+/// Fails only when the service is left with no introduction point at all: the
+/// one state it cannot describe in a descriptor, and so the one worth failing
+/// a launch over.
+///
+/// A retired point's circuit is dropped with it, where Arti keeps a retired
+/// one answering until the last descriptor that named it has expired. What
+/// that costs is one wasted introduction attempt for a client still holding
+/// the old descriptor, which then tries one of the two other points that
+/// descriptor names — the same thing that client does when a relay simply
+/// fails.
+async fn reconcile_intro_points(state: &Arc<ServiceState>) -> Result<bool> {
+    let known: HashSet<String> = state
+        .relay_manager
+        .read()
+        .await
+        .relays
+        .iter()
+        .map(|relay| relay.fingerprint.clone())
+        .collect();
 
-    for _ in 0..count {
+    let mut changed = false;
+    // Fingerprints a replacement must not pick again: two of a service's
+    // introduction points on one relay would fail together, which is the
+    // thing this whole loop exists to spread out.
+    let mut used: HashSet<String> = HashSet::new();
+    {
+        let mut points = state.intro_points.write().await;
+        points.retain(|point| {
+            let ended = point.ended.load(Ordering::Relaxed);
+            if intro_point_is_usable(ended, &point.relay.fingerprint, &known) {
+                used.insert(point.relay.fingerprint.clone());
+                return true;
+            }
+            state.log(
+                &format!(
+                    "Introduction point {} is no longer advertised: {}",
+                    point.relay.nickname,
+                    if ended {
+                        "its circuit ended"
+                    } else {
+                        "its relay has left the consensus"
+                    }
+                ),
+                LogType::Warn,
+            );
+            changed = true;
+            false
+        });
+    }
+
+    let mut last_error = None;
+    let established = state.intro_points.read().await.len();
+    for _ in established..state.target_intro_points {
         let relay = {
-            let manager = relay_manager.read().await;
+            let manager = state.relay_manager.read().await;
             let mut criteria = selection::middle_relays();
             for fingerprint in &used {
                 criteria = criteria.without_fingerprint(fingerprint);
@@ -649,7 +888,7 @@ async fn establish_intro_points(
         let attempt = with_timeout(
             ESTABLISH_INTRO_TIMEOUT,
             "Introduction point setup",
-            establish_intro_point(state, &relay, introduce_tx.clone()),
+            establish_intro_point(state, &relay),
         )
         .await;
         match attempt {
@@ -658,7 +897,8 @@ async fn establish_intro_points(
                     &format!("Introduction point established at {}", relay.nickname),
                     LogType::Success,
                 );
-                established.push(point);
+                state.intro_points.write().await.push(point);
+                changed = true;
             }
             Err(error) => {
                 state.log(
@@ -670,20 +910,30 @@ async fn establish_intro_points(
         }
     }
 
-    if established.is_empty() {
+    if state.intro_points.read().await.is_empty() {
         return Err(last_error.unwrap_or_else(|| {
             TorError::Onion("No relay would act as an introduction point".to_string())
         }));
     }
-    Ok(established)
+    Ok(changed)
+}
+
+/// Whether an established introduction point is still worth advertising.
+///
+/// `known` is every relay the consensus lists. An empty one means the
+/// directory is what has gone missing rather than the relays, and retiring
+/// every point on that would be a service taking itself down over a refresh
+/// that failed.
+fn intro_point_is_usable(ended: bool, fingerprint: &str, known: &HashSet<String>) -> bool {
+    !ended && (known.is_empty() || known.contains(fingerprint))
 }
 
 /// One introduction point: a circuit to `relay`, an ESTABLISH_INTRO signed
-/// with a fresh session key, and a handler that forwards every INTRODUCE2.
+/// with a fresh session key, a handler that forwards every INTRODUCE2, and a
+/// watcher that reports the circuit's end.
 async fn establish_intro_point(
     state: &Arc<ServiceState>,
     relay: &Relay,
-    introduce_tx: mpsc::Sender<(Arc<IntroPointKeys>, Introduce2)>,
 ) -> Result<EstablishedIntroPoint> {
     let mut rng = rand::rng();
     let session_id = HsIntroPtSessionIdKeypair::from(ed25519::Keypair::generate(&mut rng));
@@ -726,7 +976,7 @@ async fn establish_intro_point(
             IntroPointHandler {
                 established: Some(established_sender),
                 keys: keys.clone(),
-                introduce: introduce_tx,
+                introduce: state.introduce_tx.clone(),
             },
             TargetHop::LastHop,
         )
@@ -749,7 +999,36 @@ async fn establish_intro_point(
             TorError::Internal(format!("Failed to describe the introduction point: {error}"))
         })?;
 
-    Ok(EstablishedIntroPoint { tunnel, descriptor })
+    // Without this the circuit would just stop: the relay's own end of it —
+    // a DESTROY, a channel that dropped, a protocol error the handler
+    // returned — reaches nothing that could act on it, and the descriptor
+    // would go on naming this point for as long as the service ran.
+    //
+    // The watcher holds no handle on the tunnel, so it cannot be what keeps
+    // the reactor alive: when the point is retired the circuit closes, and
+    // the watcher's own future is what resolves.
+    let ended = Arc::new(AtomicBool::new(false));
+    {
+        let closed = tunnel.wait_for_close();
+        let ended = ended.clone();
+        let mut nudge = state.maintenance_tx.clone();
+        let nickname = relay.nickname.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            closed.await;
+            debug!("Introduction circuit to {} ended", nickname);
+            ended.store(true, Ordering::Relaxed);
+            // Full means the maintainer has already been woken and has not
+            // run yet, and it will see this point when it does.
+            let _ = nudge.try_send(());
+        });
+    }
+
+    Ok(EstablishedIntroPoint {
+        tunnel,
+        relay: relay.clone(),
+        descriptor,
+        ended,
+    })
 }
 
 /// Encode and sign the descriptor that advertises `intro_points`.
@@ -1150,5 +1429,87 @@ mod tests {
     fn a_boundary_already_passed_still_waits() {
         let delay = capped_republish_delay(INTERVAL, TRANSITION, Duration::ZERO);
         assert_eq!(delay, MIN_REPUBLISH_INTERVAL);
+    }
+
+    fn consensus_of(fingerprints: &[&str]) -> HashSet<String> {
+        fingerprints.iter().map(|id| id.to_string()).collect()
+    }
+
+    /// The circuit ending is the signal the descriptor was missing: a point
+    /// that has stopped answering stops being advertised.
+    #[test]
+    fn an_introduction_point_whose_circuit_ended_is_retired() {
+        let consensus = consensus_of(&["aaaa", "bbbb"]);
+        assert!(!intro_point_is_usable(true, "aaaa", &consensus));
+    }
+
+    /// The other way an introduction point stops working without saying so:
+    /// the relay is still holding the circuit up but no client will build one
+    /// to it, because the consensus no longer lists it.
+    #[test]
+    fn an_introduction_point_off_the_consensus_is_retired() {
+        let consensus = consensus_of(&["aaaa", "bbbb"]);
+        assert!(intro_point_is_usable(false, "aaaa", &consensus));
+        assert!(!intro_point_is_usable(false, "cccc", &consensus));
+    }
+
+    /// A relay list this service could not refresh says nothing about its
+    /// introduction points, and a service that retired all of them over it
+    /// would take itself down for a failed download.
+    #[test]
+    fn an_empty_consensus_retires_nothing() {
+        let consensus = HashSet::new();
+        assert!(intro_point_is_usable(false, "aaaa", &consensus));
+        assert!(!intro_point_is_usable(true, "aaaa", &consensus));
+    }
+
+    /// A network with no relay to spare is asked less and less often, up to a
+    /// ceiling: a service short of a point is still reachable through the
+    /// ones it has.
+    #[test]
+    fn retries_back_off_to_a_ceiling() {
+        let (min_delay, max_delay) = INTRO_RETRY_DELAY;
+        let mut delay = min_delay;
+        for _ in 0..20 {
+            let grown = grown_retry_delay(delay, max_delay);
+            assert!(grown > delay || grown == max_delay);
+            delay = grown;
+        }
+        assert_eq!(delay, max_delay);
+    }
+
+    #[test]
+    fn the_first_publication_waits_for_nothing() {
+        assert_eq!(
+            wait_before_publishing(None, SystemTime::UNIX_EPOCH),
+            Duration::ZERO
+        );
+    }
+
+    /// Two introduction points failing one after the other are one upload, not
+    /// two: the second waits out what is left of the minute.
+    #[test]
+    fn a_second_publication_waits_out_the_limit() {
+        let last = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        assert_eq!(
+            wait_before_publishing(Some(last), last + Duration::from_secs(20)),
+            Duration::from_secs(40)
+        );
+        assert_eq!(
+            wait_before_publishing(Some(last), last + UPLOAD_RATE_LIMIT),
+            Duration::ZERO
+        );
+    }
+
+    /// A clock that has gone backwards must not stall the maintainer: the
+    /// limit exists to keep a flapping relay from generating uploads, not to
+    /// hold a descriptor back.
+    #[test]
+    fn a_clock_that_went_backwards_waits_for_nothing() {
+        let last = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        assert_eq!(
+            wait_before_publishing(Some(last), last - Duration::from_secs(30)),
+            Duration::ZERO
+        );
     }
 }

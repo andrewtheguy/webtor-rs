@@ -97,9 +97,11 @@ caller's question, and no third-party address is compiled into the wasm.
   port with nothing layered on top, for a service that speaks neither HTTP nor
   WebSocket. Resolves to an `OnionStream`.
 - `publishOnionService(options?)` — publish a v3 onion service from this page.
-  Options: `introPoints` (default 3, from 1 through 6). Resolves once an HSDir has
-  stored the descriptor, which is when clients can reach the address, to a
-  service with `onionAddress`, `accept()` and `close()`. `accept()` resolves to
+  Options: `introPoints` (default 3, from 1 through 6), which is how many the
+  service keeps established: one whose circuit ends, or whose relay leaves the
+  consensus, is replaced and the descriptor published again. Resolves once an
+  HSDir has stored the descriptor, which is when clients can reach the address,
+  to a service with `onionAddress`, `accept()` and `close()`. `accept()` resolves to
   the next client's `OnionStream`, or `null` once the service is closed;
   `close()` withdraws the introduction points and every client circuit, and so
   does freeing the service. The
