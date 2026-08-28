@@ -204,7 +204,7 @@ The current line is `0.0.1-alpha.*`.
 webtor/       the Tor client: directory, circuits, onion rendezvous, HTTP, WebSocket
 webtor-wasm/  the wasm-bindgen surface packed for distribution
 subtle-tls/   the TLS 1.3 session the bridge channel runs inside (see its README)
-docs/         architecture and network-observation notes
+docs/         architecture, network-observation notes, and the roadmap
 tests/        the browser test project
 examples/     standalone browser integrations, over a shared seed store
 scripts/      the SOCKS-based probe and an opt-in local WebSocket bridge
