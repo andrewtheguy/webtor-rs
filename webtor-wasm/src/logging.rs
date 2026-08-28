@@ -76,13 +76,22 @@ impl JsSink {
 unsafe impl Send for JsSink {}
 unsafe impl Sync for JsSink {}
 
-/// Where `tracing` events go. They name no client, and a page may hold more
-/// than one, so the most recently created client owns this.
+/// Where `tracing` events go.
+///
+/// A `tracing` event carries no client identity — the Arti crates emit these
+/// from code that knows nothing about which client's circuit it is running —
+/// so on a page holding more than one client there is nothing to route by,
+/// and the most recently created *logging* client owns this.
 static SINK: Mutex<Option<Logger>> = Mutex::new(None);
 
 /// Send `tracing` warnings and errors to `logger`, installing the subscriber
 /// the first time a client asks for one.
-pub(crate) fn install(logger: Logger) {
+///
+/// `None` leaves whatever is installed alone rather than replacing it with
+/// something that discards: a client created with logging off is saying where
+/// its own lines go, not silencing a client that is still reporting.
+pub(crate) fn install(logger: Option<Logger>) {
+    let Some(logger) = logger else { return };
     if let Ok(mut sink) = SINK.lock() {
         *sink = Some(logger);
     }

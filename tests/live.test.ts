@@ -133,14 +133,18 @@ describe('webtor-wasm over Tor', () => {
       cache.microdescriptorBytes > 100_000,
       `microdescriptors look too small: ${cache.microdescriptorBytes} bytes`,
     );
-    // What a caller reads before deciding to keep this seed: a client that
-    // just bootstrapped is by definition on the period in force now, and the
-    // exported cache has to say so or a peer seeded with it looks on the
-    // wrong HSDirs.
-    assert.equal(
-      cache.timePeriod,
-      cache.timePeriodNow,
-      'the exported directory places descriptors in a period that has passed',
+    // What a caller reads before deciding to keep this seed. A consensus is
+    // timely for three hours and a time period lasts a day, so an installed
+    // one is at most a period behind the wall clock — which is exactly the
+    // slack a service covers by publishing to the neighbouring rings. Further
+    // than that means the description is not describing this bootstrap.
+    // Requiring the current period here would be requiring a policy webtor
+    // does not hold, and would fail whenever a still-valid seed straddles a
+    // boundary.
+    assert.ok(
+      Math.abs(cache.timePeriod - cache.timePeriodNow) <= 1,
+      `the exported directory is in period ${cache.timePeriod}, but ` +
+        `${cache.timePeriodNow} is in force now`,
     );
     assert.ok(
       Date.parse(cache.validUntil) > Date.now(),

@@ -77,7 +77,11 @@ fn js_error(context: &str, error: impl std::fmt::Display) -> JsValue {
 struct ClientConfig {
     options: TorClientOptions,
     directory_seed: Option<String>,
+    /// Where this client's own lines go; discards them when logging is off.
     log: Logger,
+    /// The same sink, or `None` when the caller asked for no logging. Only a
+    /// client that reports anywhere claims the page's `tracing` events.
+    traces: Option<Logger>,
 }
 
 fn read_client_config(raw: Option<js_sys::Object>) -> Result<ClientConfig, JsValue> {
@@ -149,20 +153,21 @@ fn read_client_config(raw: Option<js_sys::Object>) -> Result<ClientConfig, JsVal
     // the default because a page that has not said otherwise has nowhere else.
     let console = options::boolean(&bag, "log", what)?;
     let prefix = options::string(&bag, "logPrefix", what)?;
-    let log: Logger = match options::function(&bag, "onLog", what)? {
+    let traces: Option<Logger> = match options::function(&bag, "onLog", what)? {
         Some(callback) => {
             if console.is_some() || prefix.is_some() {
                 return Err(option_error(
                     "WebtorClient.create options \"log\" and \"logPrefix\" configure the console sink, which \"onLog\" replaces",
                 ));
             }
-            logging::js_logger(callback)
+            Some(logging::js_logger(callback))
         }
-        None if console.unwrap_or(true) => {
-            logging::console_logger(prefix.unwrap_or_else(|| DEFAULT_LOG_PREFIX.into()))
-        }
-        None => logging::silent(),
+        None if console.unwrap_or(true) => Some(logging::console_logger(
+            prefix.unwrap_or_else(|| DEFAULT_LOG_PREFIX.into()),
+        )),
+        None => None,
     };
+    let log: Logger = traces.clone().unwrap_or_else(logging::silent);
     let for_client = log.clone();
     options = options.with_on_log(move |message, log_type| for_client(message, log_type));
 
@@ -171,6 +176,7 @@ fn read_client_config(raw: Option<js_sys::Object>) -> Result<ClientConfig, JsVal
         directory_seed: options::string(&bag, "directorySeed", what)?
             .filter(|seed| !seed.is_empty()),
         log,
+        traces,
     })
 }
 
@@ -323,7 +329,7 @@ impl WebtorClient {
             console_error_panic_hook::set_once();
             let config = read_client_config(options)?;
             let log = config.log;
-            logging::install(log.clone());
+            logging::install(config.traces);
 
             let client = TorClient::new(config.options)
                 .await
