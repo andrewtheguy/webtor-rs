@@ -10,34 +10,22 @@ already works for the case this client was built for — a page opens, publishes
 an address, moves bytes, closes — and every entry below is a place where "for
 hours" or "again tomorrow" turns out to be a different problem from "now".
 
-They are in the order they are worth doing, and the first is not a close
-call. Replacing a failed introduction point is something C tor and Arti both
-do, and a host that does not is not really a peer of theirs: it is the only
-entry here that degrades a service *while it is running*, silently, with the
-caller given nothing to react to. The two after it are limits on recovering
+They are in the order they are worth doing, and both are limits on recovering
 from something that has already visibly ended — a page closing, a channel
-dropping — which is a weaker kind of missing.
+dropping — rather than on something decaying quietly while the service runs.
+That is what makes them the weaker kind of missing: the caller is handed an
+ending it can react to.
 
-Two things that *are* handled, so nobody adds them here: a published service
+Three things that *are* handled, so nobody adds them here. A published service
 refreshes its directory and republishes its descriptor every 60–120 minutes,
 or shortly after an onion-service time period turns over if that comes first,
-which covers both descriptor expiry and the HSDir rings moving underneath it.
-A caller keeps the refreshed directory through `onDirectoryChange`.
-
-## Introduction points are established once
-
-`establish_intro_points` runs during `launch` and nothing runs it again. The
-republish loop re-signs a descriptor naming the *same* points every hour or
-two, so a relay that goes down, leaves the consensus, or drops its circuit
-stays advertised for as long as the service is up. Reachability decays one
-point at a time and nothing observes it: the descriptor is still stored, the
-address still resolves, and introductions simply stop arriving.
-
-C tor and Arti both watch their introduction points and replace one that has
-failed. The republish loop is the natural home for that — it already wakes on
-the right cadence and already holds the relay list — but it has no signal to
-act on, so the per-point circuit handler would first have to report its own
-end instead of just stopping.
+which covers both descriptor expiry and the HSDir rings moving underneath it;
+a caller keeps the refreshed directory through `onDirectoryChange`. And it
+watches the introduction points it advertises: one whose circuit ends, or
+whose relay has left the consensus by the time the directory is refreshed, is
+retired, replaced at a relay none of the others are on, and published again
+within the minute — so reachability does not decay a point at a time behind a
+descriptor that still looks healthy.
 
 ## A published address does not survive the page
 

@@ -134,9 +134,22 @@ wakes a pending `accept()` with `null`. Already-published descriptors remain on
 HSDirs until they expire, but without live introduction points they cannot
 reach the closed service.
 
-The current service keeps its original introduction points for its lifetime;
-it does not rotate or replace one whose circuit dies. It also has no persistent
-`INTRODUCE2` replay cache or other durable onion-service state.
+Introduction points are maintained for the same reason descriptors are. A
+point whose circuit ends says so — the circuit's end wakes the maintainer —
+and one whose relay has left the consensus is spotted when the directory is
+refreshed; either way it is retired, a replacement is established at a relay
+none of the others are on, and the descriptor goes back up naming what is
+actually answering. Uploads stay at most one a minute, so a relay that keeps
+dropping its circuit cannot turn into a run of uploads, and a shortfall that
+cannot be made up on the spot is retried on a delay that grows to ten minutes.
+A publication that reached only some of the time periods leaves the same work
+outstanding — the rings it missed still hold a descriptor naming the retired
+point — and is retried on that timer rather than at the next republication,
+whichever of the two loops made the change.
+
+A retired point's circuit is dropped with it, where Arti keeps a retired one
+answering until the last descriptor naming it has expired. It has no
+persistent `INTRODUCE2` replay cache or other durable onion-service state.
 
 ## Ownership Above the Stream
 

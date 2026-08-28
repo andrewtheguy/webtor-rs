@@ -68,6 +68,6 @@ The identity key is never written to disk, so closing the tab permanently ends
 the address. While the tab stays open, the library refreshes the directory and
 republishes descriptors for the current period and whichever neighbouring
 periods the directory supports every 60–120 minutes, or shortly after a period
-boundary. It does not rotate or replace an introduction point when its circuit
-dies, and it has no persistent INTRODUCE2 replay cache or other durable service
-state.
+boundary, and replaces an introduction point whose circuit dies or whose relay
+leaves the consensus. It has no persistent INTRODUCE2 replay cache or other
+durable service state.
