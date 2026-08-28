@@ -107,6 +107,22 @@ pub(crate) fn count(
     Ok(Some(number as u64))
 }
 
+/// A callback the caller supplies, such as a log sink.
+pub(crate) fn function(
+    bag: &Option<js_sys::Object>,
+    key: &str,
+    what: &str,
+) -> Result<Option<js_sys::Function>, JsValue> {
+    let value = raw(bag, key);
+    if !present(&value) {
+        return Ok(None);
+    }
+    value
+        .dyn_into::<js_sys::Function>()
+        .map(Some)
+        .map_err(|_| error(format!("{what} option {key:?} must be a function")))
+}
+
 pub(crate) fn string_array(
     bag: &Option<js_sys::Object>,
     key: &str,

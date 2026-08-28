@@ -65,6 +65,7 @@ Bootstraps a client. Every option is optional.
 | `connectionTimeoutMs` | `300000` | Bootstrap budget. |
 | `log` | `true` | Write bootstrap progress to the console. |
 | `logPrefix` | `"[webtor]"` | |
+| `onLog` | — | `(message, level)` to take every line instead of the console, where `level` is `"info"`, `"success"`, `"warn"` or `"error"`. It replaces the console sink that `log` and `logPrefix` configure, so passing it with either is an error. Arti's own warnings arrive here too; nothing else in a browser observes them. |
 
 An unknown option is an error, not a shrug: a misspelled `maxMessageBytes`
 would otherwise leave a limit un-enforced for minutes before anything noticed.
@@ -108,11 +109,25 @@ caller's question, and no third-party address is compiled into the wasm.
   persist and hand back as `directorySeed`. A seed is verified against the
   pinned directory authorities before any of it is installed, so it needs no
   trust of its own. The format is versioned; a seed from an older client is
-  rejected and a fresh directory downloaded.
+  rejected and a fresh directory downloaded. Where a seed is kept — IndexedDB,
+  a file served with the app, nowhere — is the caller's business; webtor holds
+  it in memory and touches no storage API.
 - `close()` — aborts calls still building circuits and tears the client down.
 
-Two free functions need no client and touch no network: `isOnionHost(host)` and
-`parseOnionUrl(url)`, which throws exactly what a request would.
+Three free functions need no client and touch no network: `isOnionHost(host)`,
+`parseOnionUrl(url)`, which throws exactly what a request would, and
+`describeDirectory(seed)`.
+
+`describeDirectory` reads a `directoryCache()` seed's own account of itself —
+`validAfter`, `validUntil`, `timePeriod`, and `timePeriodAt(epochMs)` — so a
+caller can decide whether a stored seed is still worth using without learning
+the consensus format. Whether it is worth using is the caller's rule, and there
+is a rule to have: a consensus stays valid for three hours, but the onion
+service time period it belongs to rotates on its own schedule, and a seed from
+the period before this one places every descriptor on HSDirs the other peer is
+not asking. `timePeriodAt(Date.now()) === timePeriod` is that check.
+Describing verifies nothing; `create` still revalidates any seed against the
+pinned authorities before installing a byte of it.
 
 ## Tests
 
@@ -185,7 +200,7 @@ The current line is `0.0.1-alpha.*`.
 webtor/       the Tor client: directory, circuits, onion rendezvous, HTTP, WebSocket
 webtor-wasm/  the wasm-bindgen surface packed for distribution
 subtle-tls/   the TLS 1.3 session the bridge channel runs inside (see its README)
-docs/         architecture and network-observation notes
+docs/         architecture, network-observation notes, and follow-ups
 tests/        the browser test project
 examples/     standalone browser integrations
 scripts/      the SOCKS-based probe and an opt-in local WebSocket bridge

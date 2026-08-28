@@ -58,6 +58,9 @@ pub struct TorClientOptions {
 pub enum LogType {
     Info,
     Success,
+    /// Something went wrong that the client is carrying on past, including
+    /// every `tracing` warning the Arti crates emit under it.
+    Warn,
     Error,
 }
 

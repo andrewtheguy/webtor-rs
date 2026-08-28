@@ -3,7 +3,7 @@
 use crate::authority::{authority_certs_path, parse_authority_certs, UncheckedConsensus};
 use crate::config::{LogCallback, LogType};
 use crate::error::{Result, TorError};
-use crate::onion::{HsDirParams, HsDirRings};
+use crate::onion::{HsDirParams, HsDirPlacement, HsDirRings};
 use crate::relay::{Relay, RelayManager};
 use crate::time::system_time_now;
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
@@ -14,9 +14,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use async_lock::RwLock;
 use tor_netdoc::doc::microdesc::MicrodescReader;
+use tor_checkable::{ExternallySigned, Timebound};
 use tor_netdoc::doc::netstatus::{MdConsensus, RelayWeight};
 use tor_netdoc::AllowAnnotations;
 use tor_proto::channel::Channel;
@@ -84,6 +85,75 @@ impl DirectoryCache {
             TorError::serialization(format!("Failed to serialize directory cache: {}", error))
         })
     }
+}
+
+/// What a directory says about itself: the window its consensus covers, and
+/// where that consensus places onion service descriptors.
+///
+/// Whether a directory is *good enough* is the caller's question — a seed can
+/// be perfectly valid and still sit in the period the network has just left,
+/// which is a policy call about how much slack an application will accept. But
+/// answering it means reading a consensus, and there is no reason for every
+/// caller to learn the document format to do that. This is the reading; the
+/// judgement stays outside.
+#[derive(Clone, Copy, Debug)]
+pub struct DirectoryDescription {
+    valid_after: SystemTime,
+    valid_until: SystemTime,
+    time_period: u64,
+    placement: HsDirPlacement,
+}
+
+impl DirectoryDescription {
+    /// When the consensus became valid.
+    pub fn valid_after(&self) -> SystemTime {
+        self.valid_after
+    }
+
+    /// When the consensus expires. A client refuses to install a seed past
+    /// this, so it is the deadline a caller has to beat.
+    pub fn valid_until(&self) -> SystemTime {
+        self.valid_until
+    }
+
+    /// The onion service time period the consensus itself falls in — the ring
+    /// this directory would place every descriptor on.
+    pub fn time_period(&self) -> u64 {
+        self.time_period
+    }
+
+    /// The time period `at` falls in, by this consensus's own division of
+    /// time. A caller compares it with [`Self::time_period`] to see whether
+    /// the directory still describes the ring the network is using.
+    pub fn time_period_at(&self, at: SystemTime) -> Result<u64> {
+        Ok(self.placement.period_at(at)?.interval_num())
+    }
+}
+
+/// Read what a `directory_cache_json` seed says about itself, without
+/// installing it or touching the network.
+///
+/// This checks nothing: the consensus is read as it is written, signatures
+/// and timeliness unexamined, because a description makes no claim that the
+/// directory is genuine. Only [`DirectoryManager::load_cache`] does, against
+/// the pinned authorities, and it does so whatever a caller concluded here.
+pub fn describe_directory(encoded: &str) -> Result<DirectoryDescription> {
+    let cache = DirectoryCache::decode(encoded)?;
+    let (_, _, timebound) = MdConsensus::parse(&cache.consensus).map_err(|error| {
+        TorError::serialization(format!("Failed to parse consensus: {}", error))
+    })?;
+    let consensus = timebound
+        .dangerously_assume_timely()
+        .dangerously_assume_wellsigned();
+
+    let lifetime = consensus.lifetime();
+    let placement = HsDirPlacement::of(&consensus);
+    Ok(DirectoryDescription {
+        valid_after: lifetime.valid_after(),
+        valid_until: lifetime.valid_until(),
+        time_period: placement.period_at(lifetime.valid_after())?.interval_num(),
+        placement,
+    })
 }
 
 #[derive(Debug)]
@@ -936,6 +1006,92 @@ mod tests {
         assert_eq!(decoded.consensus, "consensus");
         assert_eq!(decoded.certificates, "certificates");
         assert_eq!(decoded.microdescriptors, "microdescriptors");
+    }
+
+    /// A consensus with no relays in it, dated long enough ago that nothing
+    /// could mistake it for a timely one.
+    const CONSENSUS: &str = include_str!("../testdata/microdesc-consensus.txt");
+
+    fn seed_carrying(consensus: &str) -> String {
+        DirectoryCache {
+            version: DIRECTORY_CACHE_VERSION,
+            consensus: consensus.to_string(),
+            certificates: String::new(),
+            microdescriptors: String::new(),
+        }
+        .encode()
+        .unwrap()
+    }
+
+    fn at(unix_seconds: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(unix_seconds)
+    }
+
+    /// 2020-08-27 13:00:00 UTC, the fixture's `valid-after`.
+    const VALID_AFTER: u64 = 1_598_533_200;
+
+    #[test]
+    fn a_seed_describes_the_window_its_consensus_covers() {
+        let described = describe_directory(&seed_carrying(CONSENSUS)).unwrap();
+
+        assert_eq!(described.valid_after(), at(VALID_AFTER));
+        assert_eq!(described.valid_until(), at(VALID_AFTER + 3 * 60 * 60));
+    }
+
+    /// The fixture names no `hsdir_interval` and votes hourly, so its periods
+    /// are a day long and begin at noon UTC. That boundary is the whole reason
+    /// a caller asks: a seed from 11:00 places descriptors on the ring the
+    /// network left at noon, while still being a valid consensus.
+    #[test]
+    fn a_seed_places_descriptors_by_the_noon_boundary() {
+        let described = describe_directory(&seed_carrying(CONSENSUS)).unwrap();
+        let period = described.time_period();
+
+        assert_eq!(described.time_period_at(at(VALID_AFTER)).unwrap(), period);
+        assert_eq!(
+            described.time_period_at(at(VALID_AFTER + 10 * 60 * 60)).unwrap(),
+            period,
+            "23:00 the same day is still the period that began at noon"
+        );
+        assert_eq!(
+            described.time_period_at(at(VALID_AFTER - 2 * 60 * 60)).unwrap(),
+            period - 1,
+            "11:00 the same day is the period before it"
+        );
+        assert_eq!(
+            described.time_period_at(at(VALID_AFTER + 24 * 60 * 60)).unwrap(),
+            period + 1
+        );
+    }
+
+    /// Describing checks nothing, which is what makes it useful: a caller
+    /// deciding whether to keep a stored seed is holding an expired one more
+    /// often than not, and it still needs to say why it is throwing it away.
+    #[test]
+    fn a_long_expired_seed_still_describes_itself() {
+        assert!(describe_directory(&seed_carrying(CONSENSUS)).is_ok());
+    }
+
+    #[test]
+    fn a_seed_that_carries_no_consensus_cannot_be_described() {
+        let error = describe_directory(&seed_carrying("not a consensus\n")).unwrap_err();
+
+        assert!(error.to_string().contains("parse consensus"), "{}", error);
+    }
+
+    #[test]
+    fn a_seed_of_an_unknown_version_cannot_be_described() {
+        let encoded = serde_json::json!({
+            "version": DIRECTORY_CACHE_VERSION + 1,
+            "consensus": CONSENSUS,
+            "certificates": "",
+            "microdescriptors": ""
+        })
+        .to_string();
+
+        let error = describe_directory(&encoded).unwrap_err();
+
+        assert!(error.to_string().contains("unsupported"), "{}", error);
     }
 
     #[test]

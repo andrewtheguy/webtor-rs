@@ -330,6 +330,7 @@ impl TorClient {
         }
         match log_type {
             LogType::Info | LogType::Success => info!("{}", message),
+            LogType::Warn => warn!("{}", message),
             LogType::Error => error!("{}", message),
         }
     }

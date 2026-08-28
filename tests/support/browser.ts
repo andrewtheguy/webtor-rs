@@ -70,6 +70,20 @@ export interface HarnessCalls {
   isOnionHost: { args: [host: string]; result: boolean };
   parseOnionUrl: { args: [url: string]; result: OnionUrl };
   createRejects: { args: [options: Record<string, unknown>]; result: string };
+  createRejectsWithLogger: {
+    args: [options: Record<string, unknown>];
+    result: string;
+  };
+  createLogging: { args: [options: CreateOptions]; result: string[] };
+  describeDirectory: {
+    args: [seed: string, instants?: number[]];
+    result: {
+      validAfter: string;
+      validUntil: string;
+      timePeriod: number;
+      periods: number[];
+    };
+  };
   create: {
     args: [options: CreateOptions, seedUrl: string | null];
     result: { seconds: number };
@@ -82,6 +96,9 @@ export interface HarnessCalls {
       consensusBytes: number;
       certificateBytes: number;
       microdescriptorBytes: number;
+      validUntil: string;
+      timePeriod: number;
+      timePeriodNow: number;
     };
   };
   close: { args: []; result: string };

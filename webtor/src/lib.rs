@@ -37,6 +37,7 @@ mod webrtc_stream;
 mod websocket;
 
 pub use client::TorClient;
+pub use directory::{describe_directory, DirectoryDescription};
 pub use onion_service::{OnionService, OnionServiceOptions};
 pub use onion_url::{is_onion_host, OnionUrl};
 pub use onion_websocket::{WebSocketMessage, WebSocketReader, WebSocketWriter};

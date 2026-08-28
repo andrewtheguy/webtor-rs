@@ -108,6 +108,41 @@ pub(crate) struct HsDirRings {
     pub(crate) secondary: Vec<HsDirParams>,
 }
 
+/// How a consensus divides time into onion-service periods: how long one
+/// lasts and how far the first starts after the epoch.
+///
+/// Both numbers come out of the consensus and nothing else, so every party
+/// reading the same consensus places a descriptor on the same ring. Keeping
+/// them together is what lets [`crate::directory::describe_directory`] answer
+/// which period an instant falls in without a second copy of the rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HsDirPlacement {
+    length: Duration,
+    offset: Duration,
+}
+
+impl HsDirPlacement {
+    pub(crate) fn of(consensus: &MdConsensus) -> Self {
+        let minutes = consensus
+            .params()
+            .get("hsdir_interval")
+            .copied()
+            .unwrap_or(HSDIR_INTERVAL_DEFAULT_MINUTES)
+            .clamp(HSDIR_INTERVAL_BOUNDS.0, HSDIR_INTERVAL_BOUNDS.1);
+        Self {
+            length: Duration::from_secs(u64::from(minutes.unsigned_abs()) * 60),
+            offset: consensus.lifetime().voting_period() * VOTING_PERIODS_IN_OFFSET,
+        }
+    }
+
+    /// The time period `at` falls in.
+    pub(crate) fn period_at(&self, at: SystemTime) -> Result<TimePeriod> {
+        TimePeriod::new(self.length, at, self.offset).map_err(|error| {
+            TorError::Onion(format!("No onion service time period covers that time: {error}"))
+        })
+    }
+}
+
 impl HsDirParams {
     /// Derive the rings this consensus defines.
     ///
@@ -115,23 +150,10 @@ impl HsDirParams {
     /// of a missing shared random value: a disaster value for the current
     /// period, and nothing at all for the neighbours.
     pub(crate) fn compute(consensus: &MdConsensus) -> Result<HsDirRings> {
-        let minutes = consensus
-            .params()
-            .get("hsdir_interval")
-            .copied()
-            .unwrap_or(HSDIR_INTERVAL_DEFAULT_MINUTES)
-            .clamp(HSDIR_INTERVAL_BOUNDS.0, HSDIR_INTERVAL_BOUNDS.1);
-        let length = Duration::from_secs(u64::from(minutes.unsigned_abs()) * 60);
-
         let lifetime = consensus.lifetime();
         let valid_after = lifetime.valid_after();
         let voting_period = lifetime.voting_period();
-        let offset = voting_period * VOTING_PERIODS_IN_OFFSET;
-        let period = TimePeriod::new(length, valid_after, offset).map_err(|error| {
-            TorError::Onion(format!(
-                "Consensus valid-after does not fall in a time period: {error}"
-            ))
-        })?;
+        let period = HsDirPlacement::of(consensus).period_at(valid_after)?;
 
         let values = shared_random_values(consensus, valid_after, voting_period);
         Ok(rings_for(period, &values))
