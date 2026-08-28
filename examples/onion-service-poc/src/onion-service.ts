@@ -2,7 +2,7 @@
 // service from it, answer HTTP on the streams clients open, and — with the
 // same client — fetch the address back over the network.
 
-import { loadDirectorySeed, saveDirectoryCache } from './directory-cache';
+import { directorySeedStore } from '../../shared/directory-cache';
 import { loadWebtor } from './webtor';
 
 export type LogLevel = 'info' | 'success' | 'error';
@@ -85,6 +85,8 @@ server, no application proxy, no port forwarded.</p>
 `;
 }
 
+const store = directorySeedStore('webtor-onion-service-poc');
+
 export async function startOnionService(
   options: StartOptions,
 ): Promise<RunningService> {
@@ -92,7 +94,7 @@ export async function startOnionService(
     options.onLog({ at: Date.now(), level, message });
 
   const { WebtorClient } = await loadWebtor();
-  const seed = await loadDirectorySeed();
+  const seed = await store.load();
   log('info', `Tor directory: ${seed.source}`);
 
   const client = await WebtorClient.create({
@@ -102,16 +104,17 @@ export async function startOnionService(
       ? { bridgeUrl: BRIDGE_URL, bridgeFingerprint: BRIDGE_FINGERPRINT }
       : {}),
     ...(seed.value ? { directorySeed: seed.value } : {}),
+    // Keep every directory this client downloads, not just the one it started
+    // with: a published service refreshes the directory for as long as it is
+    // up, and downloading one over a single bridge circuit is the slowest part
+    // of a cold start.
+    onDirectoryChange: (cache: string) => {
+      void store.save(cache);
+      log('info', 'Stored a fresh Tor directory for the next start');
+    },
     logPrefix: '[onion-service-poc]',
   });
   log('success', 'Tor client bootstrapped');
-
-  // Keep the validated directory for the next load; downloading it over a
-  // single bridge circuit is the slowest part of a cold start.
-  void client
-    .directoryCache()
-    .then((cache: string) => saveDirectoryCache(cache))
-    .catch(() => undefined);
 
   let service;
   try {

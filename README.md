@@ -206,6 +206,6 @@ webtor-wasm/  the wasm-bindgen surface packed for distribution
 subtle-tls/   the TLS 1.3 session the bridge channel runs inside (see its README)
 docs/         architecture and network-observation notes
 tests/        the browser test project
-examples/     standalone browser integrations
+examples/     standalone browser integrations, over a shared seed store
 scripts/      the SOCKS-based probe and an opt-in local WebSocket bridge
 ```
