@@ -1,5 +1,5 @@
 // Serves the repository over loopback so a page can import the built
-// `webtor-wasm/pkg/` and fetch a directory seed without a bundler.
+// `crates/webtor-wasm/pkg/` and fetch a directory seed without a bundler.
 
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';

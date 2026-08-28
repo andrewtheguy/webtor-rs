@@ -140,7 +140,7 @@ suites need no sibling checkout; the separate interoperability suite does.
 
 ```bash
 bun install       # install dependencies from bun.lock
-bun run build     # wasm-pack the package into webtor-wasm/pkg/
+bun run build     # wasm-pack the package into crates/webtor-wasm/pkg/
 bun run test      # API suite: URL helpers and option validation, no network
 bun run seed      # fetch a directory snapshot to tests/.directory-seed.json
 bun run test:live # end to end against public onion services
@@ -201,11 +201,20 @@ The current line is `0.0.1-alpha.*`.
 ## Layout
 
 ```
-webtor/       the Tor client: directory, circuits, onion rendezvous, HTTP, WebSocket
-webtor-wasm/  the wasm-bindgen surface packed for distribution
-subtle-tls/   the TLS 1.3 session the bridge channel runs inside (see its README)
+crates/       the Rust workspace, one target: wasm32-unknown-unknown
+  webtor-core/  the Tor client: directory, circuits, onion rendezvous, HTTP, WebSocket
+  webtor-wasm/  the wasm-bindgen surface packed for distribution
+  subtle-tls/   the TLS 1.3 session the bridge channel runs inside (see its README)
+reference/    native peers webtor is tested *against*, each its own workspace
+  onion-cli/    an Arti-based onion service and client (placeholder)
 docs/         architecture, network-observation notes, and the roadmap
 tests/        the browser test project
 examples/     standalone browser integrations, over a shared seed store
 scripts/      the SOCKS-based probe and an opt-in local WebSocket bridge
 ```
+
+`reference/` is excluded from the root workspace rather than being a member of
+it. Its point is to be an implementation that shares nothing with `crates/` —
+so an interop failure names a side — and it builds a native Tor client whose
+dependencies belong in none of the WASM builds. `cargo` commands at the root
+therefore do not see it; build one explicitly with `--manifest-path`.

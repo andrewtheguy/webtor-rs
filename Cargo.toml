@@ -1,8 +1,14 @@
 [workspace]
 members = [
-    "webtor",
-    "webtor-wasm"
+    "crates/subtle-tls",
+    "crates/webtor-core",
+    "crates/webtor-wasm",
 ]
+# `reference/` holds implementations webtor is tested *against*, not with. They
+# share no code with the crates above and build a whole Tor client of their own,
+# so keeping them out of this workspace is what stops a `cargo clippy` here from
+# resolving and compiling tokio and the full Arti tree. Each is its own project.
+exclude = ["reference"]
 resolver = "2"
 
 [workspace.package]

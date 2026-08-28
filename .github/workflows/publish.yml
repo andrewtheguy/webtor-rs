@@ -65,12 +65,12 @@ jobs:
       - run: bun run build
 
       - run: bun pm pack
-        working-directory: webtor-wasm/pkg
+        working-directory: crates/webtor-wasm/pkg
 
       - uses: actions/upload-artifact@v4
         with:
           name: wasm-pkg
-          path: webtor-wasm/pkg/*.tgz
+          path: crates/webtor-wasm/pkg/*.tgz
           if-no-files-found: error
 
   publish:

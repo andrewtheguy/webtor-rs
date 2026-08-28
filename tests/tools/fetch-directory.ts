@@ -38,7 +38,7 @@ const CONSENSUS_PATH = '/tor/status-vote/current/consensus-microdesc.z';
 
 /**
  * v3 identity fingerprints of the directory authorities, matching the pinned
- * set in `webtor/src/authority.rs`. A signature from anyone else is ignored,
+ * set in `crates/webtor-core/src/authority.rs`. A signature from anyone else is ignored,
  * and the consensus needs a strict majority of these to be installable.
  */
 const AUTHORITY_V3IDENTS = new Set([

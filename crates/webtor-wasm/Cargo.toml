@@ -1,8 +1,8 @@
 [package]
 name = "webtor-wasm"
-version = "0.0.1-alpha.15"
+version = "0.0.1-alpha.16"
 edition.workspace = true
-license-file = "../LICENSE"
+license-file = "LICENSE"
 description = "Browser Tor client for http:// and ws:// onion services"
 
 [lib]
@@ -18,7 +18,7 @@ wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
 web-sys = { workspace = true }
 tracing = { workspace = true }
-webtor = { path = "../webtor" }
+webtor-core = { path = "../webtor-core" }
 
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]

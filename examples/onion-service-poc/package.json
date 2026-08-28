@@ -12,7 +12,7 @@
     "tor:directory": "bun ../../tests/tools/fetch-directory.ts public/tor-directory.json"
   },
   "dependencies": {
-    "@andrewtheguy/webtor-wasm": "file:../../webtor-wasm/pkg",
+    "@andrewtheguy/webtor-wasm": "file:../../crates/webtor-wasm/pkg",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },

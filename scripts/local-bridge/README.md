@@ -3,7 +3,7 @@
 The public Snowflake bridge is the slowest thing in a cold start, and not
 because of the WebRTC rendezvous: webtor fetches the consensus, the authority
 certificates and every HSDir microdescriptor **one hop from the bridge**
-(`create_firsthop_fast` in `webtor/src/directory.rs`). That is megabytes across
+(`create_firsthop_fast` in `crates/webtor-core/src/directory.rs`). That is megabytes across
 a shared volunteer bridge. Run your own and the same download is local.
 
 The container is the real `snowflake-server` in front of a real tor bridge, so

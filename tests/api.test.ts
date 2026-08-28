@@ -26,7 +26,7 @@ const CACHE_VERSION = 3;
  */
 async function fixtureSeed(): Promise<string> {
   const consensus = await readFile(
-    join(REPO_ROOT, 'webtor', 'testdata', 'microdesc-consensus.txt'),
+    join(REPO_ROOT, 'crates', 'webtor-core', 'testdata', 'microdesc-consensus.txt'),
     'utf8',
   );
   return JSON.stringify({

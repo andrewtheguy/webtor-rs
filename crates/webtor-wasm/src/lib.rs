@@ -23,7 +23,7 @@ use std::time::Duration;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 use futures::{AsyncReadExt, AsyncWriteExt};
-use webtor::{
+use webtor_core::{
     onion_websocket, DataReader, DataWriter, HttpRequest, HttpResponse, LogType, OnionService,
     OnionServiceOptions, OnionUrl, TorClient, TorClientOptions, WebSocketMessage,
     WebSocketReader, WebSocketWriter,
@@ -193,7 +193,7 @@ fn read_client_config(raw: Option<js_sys::Object>) -> Result<ClientConfig, JsVal
 /// Whether `host` is a v3 onion address.
 #[wasm_bindgen(js_name = isOnionHost)]
 pub fn is_onion_host(host: &str) -> bool {
-    webtor::is_onion_host(host)
+    webtor_core::is_onion_host(host)
 }
 
 /// Parse an onion URL, throwing the same error a request would.
@@ -228,7 +228,7 @@ pub fn parse_onion_url(url: &str) -> Result<JsValue, JsValue> {
 /// installing a byte of it.
 #[wasm_bindgen(js_name = describeDirectory)]
 pub fn describe_directory(seed: &str) -> Result<DirectoryDescription, JsValue> {
-    webtor::describe_directory(seed)
+    webtor_core::describe_directory(seed)
         .map(|inner| DirectoryDescription { inner })
         .map_err(|error| js_error("Failed to read the Tor directory seed", error))
 }
@@ -236,7 +236,7 @@ pub fn describe_directory(seed: &str) -> Result<DirectoryDescription, JsValue> {
 /// What one directory seed says about itself.
 #[wasm_bindgen]
 pub struct DirectoryDescription {
-    inner: webtor::DirectoryDescription,
+    inner: webtor_core::DirectoryDescription,
 }
 
 #[wasm_bindgen]
@@ -385,7 +385,7 @@ impl WebtorClient {
             };
             let timeout = options::count(&bag, "timeoutMs", "fetch")?
                 .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS);
-            let response = webtor::with_timeout(
+            let response = webtor_core::with_timeout(
                 Duration::from_millis(timeout),
                 "Onion HTTP request",
                 client.send(request),
@@ -424,7 +424,7 @@ impl WebtorClient {
             }
 
             log(&format!("Opening an onion stream to {url}..."), LogType::Info);
-            let socket = webtor::with_timeout(
+            let socket = webtor_core::with_timeout(
                 Duration::from_millis(timeout),
                 "Onion WebSocket",
                 async {
