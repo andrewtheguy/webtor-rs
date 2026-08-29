@@ -19,7 +19,10 @@ in 40 s. Against the public bridge the same seedless bootstrap takes minutes.
 
 `bridge.sh` wraps the container commands. It works with podman or docker and
 uses whichever one answers `info`, podman first; `CONTAINER_ENGINE=docker` (or
-`podman`) names one instead.
+`podman`) names one instead. The engine has to be on this machine: the bridge
+is published on the engine host's loopback, so a `DOCKER_HOST`,
+`CONTAINER_HOST` or docker context that points elsewhere is refused rather
+than starting a bridge `ws://localhost:8080/` cannot reach.
 
 ```bash
 scripts/local-bridge/bridge.sh start     # builds the image if it is missing

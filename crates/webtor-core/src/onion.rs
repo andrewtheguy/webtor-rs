@@ -41,7 +41,7 @@ use tor_cell::relaycell::hs::intro_payload::{IntroduceHandshakePayload, OnionKey
 use tor_cell::relaycell::hs::{
     AuthKeyType, EstablishRendezvous, Introduce1, IntroduceAck, Rendezvous2,
 };
-use tor_cell::relaycell::msg::{AnyRelayMsg, Body};
+use tor_cell::relaycell::msg::{AnyRelayMsg, Body, EndReason};
 use tor_cell::relaycell::RelayMsg;
 use tor_checkable::Timebound;
 use tor_hscrypto::pk::{HsBlindId, HsId, HsIdKey};
@@ -484,11 +484,35 @@ struct ServiceState {
     tunnel: Option<Arc<ClientTunnel>>,
 }
 
+impl ServiceState {
+    /// Whether anything here would save the next connect work: a live
+    /// circuit, or a descriptor still usable in `time_period`. With no
+    /// directory installed a descriptor cannot be judged, so it is kept.
+    fn worth_keeping(&self, time_period: Option<TimePeriod>, now: SystemTime) -> bool {
+        self.tunnel.as_ref().is_some_and(|tunnel| !tunnel.is_closed())
+            || self.descriptor.as_ref().is_some_and(|cached| {
+                time_period.is_none_or(|period| cached.validity.holds_at(period, now))
+            })
+    }
+}
+
 /// Whether a failed `BEGIN` was the service's answer rather than the
-/// circuit's failure. An `END` came over the circuit from the service, so
-/// the circuit works and a fresh rendezvous would only be refused again.
+/// circuit's failure. These `END` reasons describe what the service found
+/// when it tried its own backend, so the circuit that carried them works and
+/// a fresh rendezvous would only be refused again. Every other reason — a
+/// `DESTROY`, a protocol error, a resource limit — is about the path, and so
+/// is any failure that is not an `END` at all.
 fn stream_refused_by_service(error: &tor_proto::Error) -> bool {
-    matches!(error, tor_proto::Error::EndReceived(_))
+    matches!(
+        error,
+        tor_proto::Error::EndReceived(
+            EndReason::EXITPOLICY
+                | EndReason::CONNECTREFUSED
+                | EndReason::RESOLVEFAILED
+                | EndReason::CONNRESET
+                | EndReason::DONE
+        )
+    )
 }
 
 pub(crate) struct OnionConnector {
@@ -595,12 +619,23 @@ impl OnionConnector {
         if let Some(found) = self.services.read().await.get(host) {
             return found.clone();
         }
-        self.services
-            .write()
+        // A new service is the moment to let go of old ones with nothing left
+        // to reuse, so the map holds what a page is talking to rather than
+        // everything it ever did. One mid-connect (its lock held) is kept.
+        let time_period = self
+            .directory_manager
+            .hsdir_params()
             .await
-            .entry(host.to_string())
-            .or_default()
-            .clone()
+            .ok()
+            .map(|rings| rings.current.time_period());
+        let now = system_time_now();
+        let mut services = self.services.write().await;
+        services.retain(|_, service| {
+            service
+                .try_lock()
+                .is_none_or(|state| state.worth_keeping(time_period, now))
+        });
+        services.entry(host.to_string()).or_default().clone()
     }
 
     /// Build a rendezvous circuit to the service: from its kept descriptor
@@ -1215,15 +1250,44 @@ mod tests {
         assert!(!unbounded.holds_at(period_at(41), expires));
     }
 
-    /// An `END` from the service means the circuit carried the answer and is
-    /// worth keeping; anything else about a failed `BEGIN` is the circuit's.
+    /// An `END` about the service's own backend means the circuit carried
+    /// the answer and is worth keeping; an `END` about the path, or no `END`
+    /// at all, is the circuit's failure.
     #[test]
     fn only_a_service_refusal_keeps_the_circuit() {
-        use tor_cell::relaycell::msg::EndReason;
-        assert!(stream_refused_by_service(&tor_proto::Error::EndReceived(
-            EndReason::EXITPOLICY
-        )));
+        for reason in [
+            EndReason::EXITPOLICY,
+            EndReason::CONNECTREFUSED,
+            EndReason::RESOLVEFAILED,
+            EndReason::CONNRESET,
+            EndReason::DONE,
+        ] {
+            assert!(
+                stream_refused_by_service(&tor_proto::Error::EndReceived(reason)),
+                "{reason:?}"
+            );
+        }
+        for reason in [
+            EndReason::DESTROY,
+            EndReason::TORPROTOCOL,
+            EndReason::RESOURCELIMIT,
+            EndReason::MISC,
+        ] {
+            assert!(
+                !stream_refused_by_service(&tor_proto::Error::EndReceived(reason)),
+                "{reason:?}"
+            );
+        }
         assert!(!stream_refused_by_service(&tor_proto::Error::CircuitClosed));
         assert!(!stream_refused_by_service(&tor_proto::Error::NotConnected));
+    }
+
+    /// A service with neither a circuit nor a descriptor is not worth a map
+    /// entry, whatever the period.
+    #[test]
+    fn an_empty_service_state_is_not_kept() {
+        let state = ServiceState::default();
+        assert!(!state.worth_keeping(Some(period_at(42)), SystemTime::UNIX_EPOCH));
+        assert!(!state.worth_keeping(None, SystemTime::UNIX_EPOCH));
     }
 }

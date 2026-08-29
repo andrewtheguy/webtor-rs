@@ -332,10 +332,14 @@
     workerLogs: () => rethrowing(async () => [...state.workerLogs]),
     workerClose: () =>
       rethrowing(async () => {
-        const closed = await inWorker('close', {});
-        state.worker.terminate();
-        state.worker = null;
-        return closed;
+        try {
+          return await inWorker('close', {});
+        } finally {
+          // A close that rejects still leaves a worker to take down, or the
+          // next case's `inWorker` reuses one with a broken client in it.
+          state.worker?.terminate();
+          state.worker = null;
+        }
       }),
 
     // --- onion service ----------------------------------------------------

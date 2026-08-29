@@ -28,6 +28,32 @@ engine() {
 }
 ENGINE=$(engine)
 
+# The bridge is published on the engine host's loopback and announced as
+# ws://localhost, so the engine has to be running on this machine: a remote
+# endpoint would start a bridge nothing here can reach. An empty endpoint is
+# the engine's own default socket; podman's machine and docker's desktop VM
+# both forward from this machine's loopback, which is what the tcp://localhost
+# and tcp://127.* cases allow.
+endpoint() {
+    case "$ENGINE" in
+        docker) echo "${DOCKER_HOST:-$(docker context inspect -f '{{.Endpoints.docker.Host}}' 2>/dev/null || true)}" ;;
+        *) echo "${CONTAINER_HOST:-}" ;;
+    esac
+}
+require_local_engine() {
+    host=$(endpoint)
+    case "$host" in
+        ""|unix://*|npipe://*|tcp://localhost:*|tcp://127.*) ;;
+        *)
+            echo "$ENGINE talks to $host, not to this machine: the bridge would be" >&2
+            echo "published on that host's loopback, where ws://localhost:$PORT/ cannot" >&2
+            echo "reach it. Point the engine at a local endpoint." >&2
+            exit 1
+            ;;
+    esac
+}
+require_local_engine
+
 running() {
     [ "$("$ENGINE" inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = "true" ]
 }
