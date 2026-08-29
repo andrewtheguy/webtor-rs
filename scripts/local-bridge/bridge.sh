@@ -7,36 +7,88 @@ CONTAINER=webtor-bridge
 PORT=8080
 HERE=$(unset CDPATH; cd -- "$(dirname -- "$0")" && pwd)
 
+# podman or docker: the commands used here are the same in both, apart from
+# podman's `container exists` and `image exists`, which `inspect` stands in
+# for. CONTAINER_ENGINE names one outright; otherwise the first of the two
+# that answers `info` is taken, since a podman binary with no machine behind
+# it is on PATH and useless on many desktops.
+engine() {
+    if [ -n "${CONTAINER_ENGINE:-}" ]; then
+        echo "$CONTAINER_ENGINE"
+        return
+    fi
+    for candidate in podman docker; do
+        if "$candidate" info >/dev/null 2>&1; then
+            echo "$candidate"
+            return
+        fi
+    done
+    echo "neither podman nor docker is usable here; set CONTAINER_ENGINE to one that is" >&2
+    exit 1
+}
+ENGINE=$(engine)
+
+# The bridge is published on the engine host's loopback and announced as
+# ws://localhost, so the engine has to be running on this machine: a remote
+# endpoint would start a bridge nothing here can reach. An empty endpoint is
+# the engine's own default socket; podman's machine and docker's desktop VM
+# both forward from this machine's loopback, which is what the tcp://localhost
+# and tcp://127.* cases allow.
+endpoint() {
+    case "$ENGINE" in
+        docker) echo "${DOCKER_HOST:-$(docker context inspect -f '{{.Endpoints.docker.Host}}' 2>/dev/null || true)}" ;;
+        *) echo "${CONTAINER_HOST:-}" ;;
+    esac
+}
+require_local_engine() {
+    host=$(endpoint)
+    case "$host" in
+        ""|unix://*|npipe://*|tcp://localhost:*|tcp://127.*) ;;
+        *)
+            echo "$ENGINE talks to $host, not to this machine: the bridge would be" >&2
+            echo "published on that host's loopback, where ws://localhost:$PORT/ cannot" >&2
+            echo "reach it. Point the engine at a local endpoint." >&2
+            exit 1
+            ;;
+    esac
+}
+require_local_engine
+
 running() {
-    [ "$(podman inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = "true" ]
+    [ "$("$ENGINE" inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = "true" ]
 }
 
 exists() {
-    podman container exists "$CONTAINER" 2>/dev/null
+    "$ENGINE" inspect --type container "$CONTAINER" >/dev/null 2>&1
+}
+
+image_exists() {
+    "$ENGINE" image inspect "$IMAGE" >/dev/null 2>&1
 }
 
 build() {
-    podman build -t "$IMAGE" "$HERE"
+    # -f: docker looks for a Dockerfile unless told otherwise.
+    "$ENGINE" build -t "$IMAGE" -f "$HERE/Containerfile" "$HERE"
 }
 
 # Only answerable while the bridge is up: the identity lives in the container,
 # which --rm takes away on stop.
 fingerprint() {
     running || return 1
-    podman exec "$CONTAINER" awk '{print $2}' /var/lib/tor/fingerprint
+    "$ENGINE" exec "$CONTAINER" awk '{print $2}' /var/lib/tor/fingerprint
 }
 
 start() {
     if running; then
         echo "$CONTAINER is already running" >&2
     else
-        podman image exists "$IMAGE" || build
-        exists && podman rm -f "$CONTAINER" >/dev/null
+        image_exists || build
+        exists && "$ENGINE" rm -f "$CONTAINER" >/dev/null
         # --rm: nothing about a test bridge is worth keeping between runs, and
         # a stale identity outliving the container it belongs to is a trap.
         # Localhost only: this bridge has no anonymity story and no business
         # being reachable from the rest of the network.
-        podman run -d --rm --name "$CONTAINER" \
+        "$ENGINE" run -d --rm --name "$CONTAINER" \
             -p "127.0.0.1:$PORT:$PORT" \
             "$IMAGE" >/dev/null
     fi
@@ -79,18 +131,18 @@ env_lines() {
 
 stop() {
     exists || { echo "$CONTAINER does not exist" >&2; return 0; }
-    podman stop "$CONTAINER" >/dev/null
+    "$ENGINE" stop "$CONTAINER" >/dev/null
     # --rm clears it on stop; sweep up anything that lingered, such as a
     # container that was created but never ran and so never made that promise.
     if exists; then
-        podman rm -f "$CONTAINER" >/dev/null 2>&1 || true
+        "$ENGINE" rm -f "$CONTAINER" >/dev/null 2>&1 || true
     fi
     echo "stopped; its identity and directory cache went with it" >&2
 }
 
 status() {
     if running; then
-        if podman logs "$CONTAINER" 2>&1 | grep -q 'Bootstrapped 100%'; then
+        if "$ENGINE" logs "$CONTAINER" 2>&1 | grep -q 'Bootstrapped 100%'; then
             echo "running, bootstrapped"
         else
             echo "running, still bootstrapping"
@@ -111,7 +163,7 @@ case "${1:-}" in
     status) status ;;
     env) env_lines "export " ;;
     fingerprint) fingerprint ;;
-    logs) podman logs -f "$CONTAINER" ;;
+    logs) "$ENGINE" logs -f "$CONTAINER" ;;
     *)
         echo "usage: $0 {build|start|stop|restart|status|env|fingerprint|logs}" >&2
         exit 2

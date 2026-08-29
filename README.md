@@ -5,7 +5,10 @@ A browser Tor client, compiled to WASM, that reaches v3 onion services over
 application proxy: the page builds Tor circuits itself and speaks HTTP or RFC
 6455 on them. It also runs v3 onion services the
 other way around — the page publishes its own `.onion` address and answers what
-clients send it.
+clients send it. The client runs wherever the page puts it: a window, a
+dedicated or shared worker, or a service worker, with the default `"websocket"`
+bridge; the `"webrtc"` bridge needs `RTCPeerConnection`, which only a window
+has.
 
 The Rust workspace builds `@andrewtheguy/webtor-wasm`, the package a web app
 installs.
@@ -96,6 +99,13 @@ caller's question, and no third-party address is compiled into the wasm.
 - `connectStream(address, port)` — a raw stream to an onion address and virtual
   port with nothing layered on top, for a service that speaks neither HTTP nor
   WebSocket. Resolves to an `OnionStream`.
+
+  All three pay for the rendezvous once per service, not once per call: the
+  first stream to an address fetches its descriptor and builds the rendezvous
+  circuit, and every later stream to the same address begins on that circuit
+  while it lives, as Tor Browser's do. The descriptor is kept for the lifetime
+  it declares. A circuit that has died is replaced on the next call, and a
+  kept descriptor none of whose introduction points answer is fetched again.
 - `publishOnionService(options?)` — publish a v3 onion service from this page.
   Options: `introPoints` (default 3, from 1 through 6), which is how many the
   service keeps established: one whose circuit ends, or whose relay leaves the

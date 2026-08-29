@@ -18,6 +18,7 @@ mod config;
 mod dir_http;
 mod directory;
 mod error;
+mod global_scope;
 mod http;
 mod kcp_stream;
 mod onion;

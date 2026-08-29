@@ -21,7 +21,7 @@ chmod 700 /var/lib/tor
     echo "==================================================================="
 ) &
 
-# tor takes over PID 1 so `podman stop` reaches it directly. Held as a
+# tor takes over PID 1 so the engine's `stop` reaches it directly. Held as a
 # background child instead, it never sees the SIGTERM and every stop costs the
 # ten second wait for SIGKILL.
 exec tor -f /etc/tor/torrc

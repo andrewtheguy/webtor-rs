@@ -32,9 +32,13 @@ It needs no Tor and no directory, so it is the one to run while editing.
 **`live.test.ts`** bootstraps one client and reuses it for every case:
 directory cache export, an HTTP GET, a server-chosen 4xx, caller-supplied
 headers, the schemes the client refuses, a WebSocket exchange, the
-`maxMessageBytes` limit, and finally that a closed client refuses work. Each
-case builds its own rendezvous — around five seconds — so the cost of the file
-is the bootstrap plus roughly that per case.
+`maxMessageBytes` limit, a second client bootstrapped inside a dedicated
+worker — where there is no `window`, as in a service worker — that GETs one
+site twice to show the second stream begins on the kept circuit, and finally
+that a closed client refuses work. The first case to reach a service builds
+its rendezvous — around five seconds — and the ones after it to the same
+service begin streams on that circuit, so the cost of the file is the
+bootstrap plus roughly that per distinct service.
 
 **`tools/interop-cli.ts`** is the only one that needs a second implementation:
 `reference/onion-cli-poc`, an Arti-based peer that publishes an ephemeral onion

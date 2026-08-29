@@ -128,6 +128,16 @@ export interface HarnessCalls {
     result: { closed: boolean; matched?: string; seen: string[] };
   };
   wsClose: { args: [id: number]; result: string };
+  workerCreate: {
+    args: [options: CreateOptions, seedUrl: string | null];
+    result: { seconds: number };
+  };
+  workerFetch: {
+    args: [url: string, options?: FetchOptions];
+    result: { status: number; byteLength: number; seconds: number };
+  };
+  workerLogs: { args: []; result: string[] };
+  workerClose: { args: []; result: string };
   servicePublish: {
     args: [options?: OnionServiceOptions];
     result: { address: string; seconds: number };

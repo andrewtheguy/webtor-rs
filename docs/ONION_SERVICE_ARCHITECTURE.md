@@ -100,6 +100,16 @@ For `connectStream`, `fetch`, or `connectWebSocket`, the client:
 5. verifies the service's `RENDEZVOUS2`, extends the rendezvous circuit by its
    virtual hs-ntor hop, and begins streams on it.
 
+Steps 1 through 5 run once per service rather than once per stream. The
+descriptor is kept for the lifetime it declares and dropped at a time period
+turnover, since the subcredential it was fetched under belongs to that period;
+the rendezvous circuit carries every later stream to the same service, as Tor
+Browser's does. Concurrent connects to one service wait for the same
+rendezvous. A kept circuit that fails a new `BEGIN` for any reason other than
+an `END` from the service is replaced by a fresh rendezvous once, and a kept
+descriptor none of whose introduction points answer is fetched again before
+the connect fails.
+
 The raw API stops at the resulting byte stream. `fetch` layers one HTTP/1.1
 exchange on it, while `connectWebSocket` performs the RFC 6455 upgrade and owns
 WebSocket framing, masking, fragmentation, and control frames.

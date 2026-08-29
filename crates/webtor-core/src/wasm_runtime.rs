@@ -46,22 +46,17 @@ impl WasmSleep {
     fn new(duration: Duration) -> Self {
         let (tx, rx) = futures::channel::oneshot::channel();
 
-        use wasm_bindgen::prelude::*;
-        use wasm_bindgen::JsCast;
+        // `setTimeout` takes a signed 32-bit delay and treats an overflow as
+        // zero, which would turn a very long sleep into a busy loop.
+        let millis = u32::try_from(duration.as_millis().min(i32::MAX as u128)).unwrap_or(i32::MAX as u32);
 
-        let millis = i32::try_from(duration.as_millis().min(i32::MAX as u128)).unwrap_or(i32::MAX);
-
-        let closure = Closure::once(move || {
+        // The oneshot is what makes this future `Send`, as `SleepProvider`
+        // requires; the timer itself is a JavaScript object and cannot be.
+        // gloo schedules on `globalThis`, so this sleeps in a worker as well.
+        gloo_timers::callback::Timeout::new(millis, move || {
             let _ = tx.send(());
-        });
-
-        let window = web_sys::window().expect("should have a window in this context");
-        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-            closure.as_ref().unchecked_ref(),
-            millis,
-        );
-
-        closure.forget();
+        })
+        .forget();
 
         Self { rx }
     }
