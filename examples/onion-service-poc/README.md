@@ -1,13 +1,15 @@
-# Onion service proof
+# Onion messaging proof
 
 A small Vite/React app that loads the locally built `webtor-wasm` package and
-publishes a v3 onion service **from the browser tab**. The page generates the
-service identity, establishes its own introduction points, uploads a signed
-descriptor to the responsible HSDirs, and answers HTTP on the streams clients
-open on the rendezvous circuits.
+passes messages between two browser tabs over Tor. Each tab picks a side:
 
-It is the other half of the client this repository already ships: same Tor
-client, same Snowflake bridge, opposite direction.
+- **Listen for messages** publishes a v3 onion service **from the tab**: it
+  generates the service identity, establishes its own introduction points,
+  uploads a signed descriptor to the responsible HSDirs, and reads the
+  messages clients POST to it on the rendezvous circuits.
+- **Send a message** POSTs to an address the other side printed, through a Tor
+  client bootstrapped in the tab over Snowflake — or, when the page is open in
+  Tor Browser, through the browser's own Tor.
 
 ## Run it
 
@@ -21,10 +23,14 @@ bun install
 bun run dev
 ```
 
-Open the printed local URL and select **Publish onion service**. The first
-bootstrap can take several minutes because the browser may need to download Tor
-directory data over Snowflake; publishing then costs one circuit per
-introduction point plus one per HSDir.
+Open the printed local URL in one tab, choose **Listen for messages** and
+**Publish onion service**. The first bootstrap can take several minutes because
+the browser may need to download Tor directory data over Snowflake; publishing
+then costs one circuit per introduction point plus one per HSDir.
+
+Open it again in a second tab (or another browser, or another machine), choose
+**Send a message**, paste the address, write something, and send. The message
+shows up in the listening tab.
 
 For a faster first run, create a current directory snapshot before starting
 Vite:
@@ -37,18 +43,28 @@ The generated `public/tor-directory.json` is intentionally ignored: a
 microdescriptor consensus is valid for only a few hours, so rebuild it shortly
 before testing rather than committing it.
 
-## What to do with the address
+## The wire
 
-The page prints `http://<address>.onion/`. Reach it from anywhere:
+A message is `POST http://<address>.onion/message` with a `text/plain` body of
+up to 64 KiB; the listener answers `200` with a running count. Anything else on
+the address gets a small HTML page. So a shell works as the sending side too:
 
-- **Fetch it back through Tor** in the page — the same client connects to the
-  service over the network, so the whole round trip happens in one tab.
-- Open the address in Tor Browser.
-- `curl --socks5-hostname 127.0.0.1:9050 http://<address>.onion/` through a
-  local Tor daemon.
+```bash
+curl --socks5-hostname 127.0.0.1:9050 -d hello http://<address>.onion/message
+```
 
-The service answers only while the tab is open, and the identity key exists
-only in that tab's memory: closing the page destroys the address for good.
+Every answer carries `Access-Control-Allow-Origin: *`, which is what lets a
+sending page in Tor Browser read the reply with the browser's `fetch`.
+
+## Sending from Tor Browser
+
+The sending side probes on load whether the browser's own `fetch` reaches
+`.onion` (an opaque request to torproject.org's onion, which fails fast
+elsewhere) and, when it does, defaults **Send via** to the browser's Tor. The
+listener then runs on its tab's Snowflake client while the message arrives
+from a second, unrelated Tor client: proof that the address is reachable from
+outside its own circuits, without the sending tab bootstrapping a client of
+its own.
 
 ## What a run proves
 
@@ -56,7 +72,7 @@ That a browser can be the *server* end of a Tor onion service: it signed an
 ESTABLISH_INTRO with a key it generated, the configured number of relays
 accepted it as introduction points, HSDirs accepted a descriptor signed by the
 blinded identity, and a client that knew nothing but the address completed the
-hs-ntor handshake against this tab and got bytes back.
+hs-ntor handshake against this tab and delivered bytes.
 
 There is no external Tor daemon, application proxy, backend, or inbound port.
 Every circuit starts at a Snowflake bridge, which is also how the tab reaches
@@ -64,10 +80,11 @@ the network at all.
 
 ## Limits
 
-The identity key is never written to disk, so closing the tab permanently ends
-the address. While the tab stays open, the library refreshes the directory and
-republishes descriptors for the current period and whichever neighbouring
-periods the directory supports every 60–120 minutes, or shortly after a period
-boundary, and replaces an introduction point whose circuit dies or whose relay
-leaves the consensus. It has no persistent INTRODUCE2 replay cache or other
-durable service state.
+The identity key is never written to disk, so closing the listening tab
+permanently ends the address. While it stays open, the library refreshes the
+directory and republishes descriptors for the current period and whichever
+neighbouring periods the directory supports every 60–120 minutes, or shortly
+after a period boundary, and replaces an introduction point whose circuit dies
+or whose relay leaves the consensus. It has no persistent INTRODUCE2 replay
+cache or other durable service state. Messages are held in the listening tab's
+memory only.

@@ -297,3 +297,36 @@ button:focus-visible {
 .level-error {
   color: #e9b7b7;
 }
+
+.sides {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 34px;
+}
+
+.field-wide {
+  grid-column: 1 / -1;
+}
+
+.field input,
+.field textarea {
+  padding: 12px 14px;
+  border: 1px solid #35332d;
+  border-radius: 10px;
+  background: #1b1a16;
+  color: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9rem;
+}
+
+.field textarea {
+  font-family: inherit;
+  resize: vertical;
+}
+
+.field input:focus-visible,
+.field textarea:focus-visible {
+  outline: 2px solid #a5e995;
+  outline-offset: 2px;
+}
