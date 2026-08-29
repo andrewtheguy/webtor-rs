@@ -6,14 +6,11 @@ import {
   type Delivery,
   type SendVia,
 } from './sender';
-import { browserReachesOnion } from './tor-browser';
+import { browserReachesOnion, type Probe } from './tor-browser';
 import type { Bridge, LogEntry } from './tor-client';
 
 /** Which end of the conversation this tab is. */
 type Side = 'listen' | 'send';
-
-/** Whether the browser's own `fetch` reaches `.onion`, i.e. Tor Browser. */
-type BrowserTor = 'probing' | 'available' | 'unavailable';
 
 type ListenState = 'idle' | 'publishing' | 'live' | 'failed';
 
@@ -208,7 +205,7 @@ function SendSide() {
   const [bridge, setBridge] = useState<Bridge>('websocket');
   const [addressInput, setAddressInput] = useState('');
   const [message, setMessage] = useState('');
-  const [browserTor, setBrowserTor] = useState<BrowserTor>('probing');
+  const [probe, setProbe] = useState<Probe | 'probing'>('probing');
   const [via, setVia] = useState<SendVia>('webtor');
   const [sending, setSending] = useState(false);
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -216,18 +213,21 @@ function SendSide() {
   const [failure, setFailure] = useState<string | null>(null);
 
   // Prefer the browser's Tor when there is one: in Tor Browser it is already
-  // bootstrapped, and it spares the tab a Snowflake client of its own.
+  // bootstrapped, and it spares the tab a Snowflake client of its own. The
+  // probe only picks the default; it can be wrong, so the choice stays open.
+  const [probeRun, setProbeRun] = useState(0);
   useEffect(() => {
     let cancelled = false;
-    void browserReachesOnion().then((reachable) => {
+    setProbe('probing');
+    void browserReachesOnion().then((result) => {
       if (cancelled) return;
-      setBrowserTor(reachable ? 'available' : 'unavailable');
-      if (reachable) setVia('browser');
+      setProbe(result);
+      if (result.reachable) setVia('browser');
     });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [probeRun]);
 
   const address = normalizeAddress(addressInput);
   const ready = address != null && message.trim() !== '' && !sending;
@@ -275,14 +275,29 @@ function SendSide() {
             onChange={(event) => setVia(event.target.value as SendVia)}
           >
             <option value="webtor">This tab's Tor client (Snowflake)</option>
-            <option value="browser" disabled={browserTor !== 'available'}>
-              {browserTor === 'probing'
+            <option value="browser">
+              {probe === 'probing'
                 ? "The browser's own Tor (checking…)"
-                : browserTor === 'available'
-                  ? "The browser's own Tor (Tor Browser)"
-                  : "The browser's own Tor (not Tor Browser)"}
+                : probe.reachable
+                  ? "The browser's own Tor (reached an onion)"
+                  : "The browser's own Tor (probe failed)"}
             </option>
           </select>
+          {probe !== 'probing' && (
+            <span className="hint">
+              {probe.reachable
+                ? `The browser reached torproject.org's onion in ${probe.seconds}s.`
+                : `The browser could not reach torproject.org's onion: ${probe.reason}. ` +
+                  'A send through it may still work in a Tor browser.'}{' '}
+              <button
+                type="button"
+                className="link"
+                onClick={() => setProbeRun((run) => run + 1)}
+              >
+                Check again
+              </button>
+            </span>
+          )}
         </label>
         {via === 'webtor' && (
           <BridgeField
