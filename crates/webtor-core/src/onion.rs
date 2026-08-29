@@ -12,6 +12,11 @@
 //!
 //! Streams then begin on the virtual hop. The onion address commits to the
 //! service key, so the circuit is authenticated end to end without TLS.
+//!
+//! All three phases are paid once per service, not once per stream: the
+//! descriptor is kept for the lifetime it declares and the rendezvous circuit
+//! carries every later stream to the same service, the way Tor Browser's do.
+//! A page and its assets cost one rendezvous.
 
 use crate::circuit::{make_circ_params, CircuitManager};
 use crate::config::{LogCallback, LogType};
@@ -25,12 +30,12 @@ use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 use digest::Digest;
 use futures::channel::oneshot;
 use rand::seq::SliceRandom;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use async_lock::RwLock;
+use async_lock::{Mutex, RwLock};
 use tor_bytes::Writeable;
 use tor_cell::relaycell::hs::intro_payload::{IntroduceHandshakePayload, OnionKey};
 use tor_cell::relaycell::hs::{
@@ -441,13 +446,59 @@ impl MsgHandler for IntroduceHandler {
     }
 }
 
+/// A service descriptor a client fetched, and the terms it stays usable on.
+///
+/// A descriptor is good for the lifetime it declares, a few hours as a rule,
+/// and C tor and Arti both keep one that long rather than ask an HSDir again
+/// for every stream. The subcredential every introduction is authenticated
+/// with is a function of the time period the descriptor was fetched under, so
+/// a period turnover ends its use as well.
+struct CachedDescriptor {
+    descriptor: HsDesc,
+    subcredential: Subcredential,
+    validity: DescriptorValidity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DescriptorValidity {
+    time_period: TimePeriod,
+    /// When the descriptor's own lifetime ends, if it declares one.
+    expires: Option<SystemTime>,
+}
+
+impl DescriptorValidity {
+    fn holds_at(&self, time_period: TimePeriod, now: SystemTime) -> bool {
+        self.time_period == time_period && self.expires.is_none_or(|end| now < end)
+    }
+}
+
+/// What the connector keeps for one onion service between streams.
+#[derive(Default)]
+struct ServiceState {
+    descriptor: Option<CachedDescriptor>,
+    /// The rendezvous circuit, with its virtual hop to the service. Every
+    /// further stream to the service begins on it, as Tor Browser's do, so a
+    /// page of twenty assets costs one rendezvous rather than twenty. The
+    /// tunnel's reactor stops when its last handle is dropped, which is what
+    /// replacing or clearing this does to it.
+    tunnel: Option<Arc<ClientTunnel>>,
+}
+
+/// Whether a failed `BEGIN` was the service's answer rather than the
+/// circuit's failure. An `END` came over the circuit from the service, so
+/// the circuit works and a fresh rendezvous would only be refused again.
+fn stream_refused_by_service(error: &tor_proto::Error) -> bool {
+    matches!(error, tor_proto::Error::EndReceived(_))
+}
+
 pub(crate) struct OnionConnector {
     circuit_manager: Arc<CircuitManager>,
     directory_manager: Arc<DirectoryManager>,
     relay_manager: Arc<RwLock<RelayManager>>,
-    /// Rendezvous tunnels with live streams. A tunnel's reactor stops when
-    /// its last handle is dropped, so these are held until the client closes.
-    tunnels: RwLock<Vec<Arc<ClientTunnel>>>,
+    /// Per-service state, each behind a lock of its own: concurrent connects
+    /// to one service wait for the same rendezvous instead of each building
+    /// their own, and connects to a different service do not wait at all.
+    services: RwLock<HashMap<String, Arc<Mutex<ServiceState>>>>,
     on_log: Option<LogCallback>,
 }
 
@@ -462,7 +513,7 @@ impl OnionConnector {
             circuit_manager,
             directory_manager,
             relay_manager,
-            tunnels: RwLock::new(Vec::new()),
+            services: RwLock::new(HashMap::new()),
             on_log,
         }
     }
@@ -476,22 +527,140 @@ impl OnionConnector {
     }
 
     /// Open a stream to `host:port`, where `host` is a v3 onion address.
+    ///
+    /// The first stream to a service fetches its descriptor and builds a
+    /// rendezvous circuit; later ones begin on that circuit while it lives.
     pub(crate) async fn connect(&self, host: &str, port: u16) -> Result<DataStream> {
         let hsid = HsId::from_str(host)
             .map_err(|error| TorError::Onion(format!("Invalid onion address {host}: {error}")))?;
         let id_key = HsIdKey::try_from(hsid)
             .map_err(|error| TorError::Onion(format!("Invalid onion address {host}: {error}")))?;
+        let service = self.service(host).await;
 
+        let mut retried = false;
+        loop {
+            let (tunnel, kept) = {
+                let mut state = service.lock().await;
+                match state.tunnel.as_ref().filter(|tunnel| !tunnel.is_closed()) {
+                    Some(tunnel) => (tunnel.clone(), true),
+                    None => {
+                        let tunnel = self.rendezvous(host, &id_key, &mut state).await?;
+                        state.tunnel = Some(tunnel.clone());
+                        (tunnel, false)
+                    }
+                }
+            };
+            if kept {
+                self.log(
+                    &format!("Beginning a stream on the kept circuit to {host}"),
+                    LogType::Info,
+                );
+            }
+            match tunnel.begin_stream(host, port, None).await {
+                Ok(stream) => return Ok(stream),
+                // A kept circuit can have died since its last stream without
+                // `is_closed` saying so yet. One retry over a fresh rendezvous
+                // covers that; a second failure is the answer.
+                Err(error) if kept && !retried && !stream_refused_by_service(&error) => {
+                    retried = true;
+                    let mut state = service.lock().await;
+                    if state
+                        .tunnel
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &tunnel))
+                    {
+                        state.tunnel = None;
+                    }
+                    self.log(
+                        &format!(
+                            "The kept circuit to {host} could not begin a stream ({error}); building another rendezvous"
+                        ),
+                        LogType::Warn,
+                    );
+                }
+                Err(error) => {
+                    return Err(TorError::Onion(format!(
+                        "Failed to begin stream to {host}:{port}: {error}"
+                    )))
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn close(&self) {
+        self.services.write().await.clear();
+    }
+
+    async fn service(&self, host: &str) -> Arc<Mutex<ServiceState>> {
+        if let Some(found) = self.services.read().await.get(host) {
+            return found.clone();
+        }
+        self.services
+            .write()
+            .await
+            .entry(host.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// Build a rendezvous circuit to the service: from its kept descriptor
+    /// while that is usable, and from a freshly fetched one otherwise.
+    async fn rendezvous(
+        &self,
+        host: &str,
+        id_key: &HsIdKey,
+        state: &mut ServiceState,
+    ) -> Result<Arc<ClientTunnel>> {
         // A client looks in the period its own consensus is in, and nowhere
         // else: the service is the side that covers the neighbouring periods.
         let params = self.directory_manager.hsdir_params().await?.current;
+        let now = system_time_now();
+        let mut from_cache = state
+            .descriptor
+            .as_ref()
+            .is_some_and(|cached| cached.validity.holds_at(params.time_period(), now));
+        if !from_cache {
+            state.descriptor = Some(self.fetch_descriptor(host, id_key, &params).await?);
+        }
+        loop {
+            let cached = state
+                .descriptor
+                .as_ref()
+                .expect("a descriptor was fetched or found usable above");
+            match self.rendezvous_through_any(cached).await {
+                Ok(tunnel) => return Ok(tunnel),
+                // Every introduction point in a kept descriptor failed. A
+                // service that has rebuilt its introduction circuits since
+                // published a new descriptor, so ask for one before giving up.
+                Err(error) if from_cache => {
+                    self.log(
+                        &format!(
+                            "No kept introduction point for {host} answered ({error}); fetching the descriptor again"
+                        ),
+                        LogType::Warn,
+                    );
+                    from_cache = false;
+                    state.descriptor = Some(self.fetch_descriptor(host, id_key, &params).await?);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Fetch and check the service's descriptor for `params`' time period.
+    async fn fetch_descriptor(
+        &self,
+        host: &str,
+        id_key: &HsIdKey,
+        params: &HsDirParams,
+    ) -> Result<CachedDescriptor> {
         let (blind_key, subcredential) = id_key
             .compute_blinded_key(params.time_period())
             .map_err(|error| TorError::Onion(format!("Key blinding failed: {error}")))?;
         let blind_id: HsBlindId = blind_key.id();
 
         let relays = self.relay_manager.read().await.relays.clone();
-        let hsdirs = select_hsdirs(&relays, &blind_id, &params);
+        let hsdirs = select_hsdirs(&relays, &blind_id, params);
         if hsdirs.is_empty() {
             return Err(TorError::Onion(
                 "The directory has no HSDir relays to fetch the descriptor from".to_string(),
@@ -502,28 +671,92 @@ impl OnionConnector {
             &format!("Fetching the onion service descriptor for {host}"),
             LogType::Info,
         );
-        let descriptor = self
-            .fetch_descriptor(&hsdirs, &blind_id, &subcredential)
+        let (descriptor, expires) = self
+            .download_descriptor(&hsdirs, &blind_id, &subcredential)
             .await?;
         if descriptor.requires_intro_authentication() {
             return Err(TorError::Onion(
                 "The onion service requires client authorization".to_string(),
             ));
         }
-        let mut intro_points: Vec<&IntroPointDesc> = descriptor.intro_points().iter().collect();
-        if intro_points.is_empty() {
+        if descriptor.intro_points().is_empty() {
             return Err(TorError::Onion(
                 "The onion service descriptor lists no introduction points".to_string(),
             ));
         }
-        intro_points.shuffle(&mut rand::rng());
         self.log(
             &format!(
                 "Onion service descriptor loaded with {} introduction points",
-                intro_points.len()
+                descriptor.intro_points().len()
             ),
             LogType::Success,
         );
+        Ok(CachedDescriptor {
+            descriptor,
+            subcredential,
+            validity: DescriptorValidity {
+                time_period: params.time_period(),
+                expires,
+            },
+        })
+    }
+
+    /// The descriptor and the end of its declared lifetime, from the first
+    /// HSDir that serves it.
+    async fn download_descriptor(
+        &self,
+        hsdirs: &[Relay],
+        blind_id: &HsBlindId,
+        subcredential: &Subcredential,
+    ) -> Result<(HsDesc, Option<SystemTime>)> {
+        let path = format!("/tor/hs/3/{}", STANDARD_NO_PAD.encode(blind_id.as_ref()));
+        let mut last_error = None;
+        for hsdir in hsdirs.iter().take(MAX_HSDIR_ATTEMPTS) {
+            debug!("Fetching onion descriptor from HSDir {}", hsdir.nickname);
+            let attempt = async {
+                let (tunnel, _) = self
+                    .circuit_manager
+                    .build_tunnel_to(&hsdir.as_circ_target()?)
+                    .await?;
+                let text = fetch_directory_document(&Arc::new(tunnel), &path).await?;
+                let now = system_time_now();
+                let bound = HsDesc::parse_decrypt_validate(&text, blind_id, subcredential, None)
+                    .map_err(|error| {
+                        TorError::Onion(format!("Descriptor was rejected: {error}"))
+                    })?;
+                let expires = bound.bounds().end();
+                let descriptor = bound.if_valid_at(&now).map_err(|error| {
+                    TorError::Onion(format!("Descriptor is not currently valid: {error}"))
+                })?;
+                Ok((descriptor, expires))
+            };
+            match with_timeout(DESCRIPTOR_TIMEOUT, "Onion descriptor fetch", attempt).await {
+                Ok(found) => return Ok(found),
+                Err(error) => {
+                    self.log(
+                        &format!(
+                            "HSDir {} did not serve the descriptor: {error}",
+                            hsdir.nickname
+                        ),
+                        LogType::Error,
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| TorError::Onion("No HSDir was reachable".to_string())))
+    }
+
+    /// A rendezvous circuit through whichever of the descriptor's
+    /// introduction points answers first.
+    async fn rendezvous_through_any(
+        &self,
+        cached: &CachedDescriptor,
+    ) -> Result<Arc<ClientTunnel>> {
+        let mut intro_points: Vec<&IntroPointDesc> =
+            cached.descriptor.intro_points().iter().collect();
+        intro_points.shuffle(&mut rand::rng());
 
         let mut last_error = None;
         for (attempt, intro_point) in intro_points
@@ -533,10 +766,10 @@ impl OnionConnector {
             .enumerate()
         {
             match self
-                .rendezvous_with(host, port, intro_point, subcredential)
+                .rendezvous_with(intro_point, cached.subcredential)
                 .await
             {
-                Ok(stream) => return Ok(stream),
+                Ok(tunnel) => return Ok(tunnel),
                 Err(error) => {
                     self.log(
                         &format!(
@@ -554,63 +787,14 @@ impl OnionConnector {
         }))
     }
 
-    pub(crate) async fn close(&self) {
-        self.tunnels.write().await.clear();
-    }
-
-    async fn fetch_descriptor(
-        &self,
-        hsdirs: &[Relay],
-        blind_id: &HsBlindId,
-        subcredential: &Subcredential,
-    ) -> Result<HsDesc> {
-        let path = format!("/tor/hs/3/{}", STANDARD_NO_PAD.encode(blind_id.as_ref()));
-        let mut last_error = None;
-        for hsdir in hsdirs.iter().take(MAX_HSDIR_ATTEMPTS) {
-            debug!("Fetching onion descriptor from HSDir {}", hsdir.nickname);
-            let attempt = async {
-                let (tunnel, _) = self
-                    .circuit_manager
-                    .build_tunnel_to(&hsdir.as_circ_target()?)
-                    .await?;
-                let text = fetch_directory_document(&Arc::new(tunnel), &path).await?;
-                let now = system_time_now();
-                let descriptor =
-                    HsDesc::parse_decrypt_validate(&text, blind_id, subcredential, None)
-                        .map_err(|error| {
-                            TorError::Onion(format!("Descriptor was rejected: {error}"))
-                        })?;
-                descriptor.if_valid_at(&now).map_err(|error| {
-                    TorError::Onion(format!("Descriptor is not currently valid: {error}"))
-                })
-            };
-            match with_timeout(DESCRIPTOR_TIMEOUT, "Onion descriptor fetch", attempt).await {
-                Ok(descriptor) => return Ok(descriptor),
-                Err(error) => {
-                    self.log(
-                        &format!(
-                            "HSDir {} did not serve the descriptor: {error}",
-                            hsdir.nickname
-                        ),
-                        LogType::Error,
-                    );
-                    last_error = Some(error);
-                }
-            }
-        }
-        Err(last_error
-            .unwrap_or_else(|| TorError::Onion("No HSDir was reachable".to_string())))
-    }
-
     /// One complete attempt: a fresh rendezvous point, an introduction
-    /// through `intro_point`, and the stream on the resulting circuit.
+    /// through `intro_point`, and the resulting circuit with its virtual hop
+    /// to the service, ready to begin streams on.
     async fn rendezvous_with(
         &self,
-        host: &str,
-        port: u16,
         intro_point: &IntroPointDesc,
         subcredential: Subcredential,
-    ) -> Result<DataStream> {
+    ) -> Result<Arc<ClientTunnel>> {
         self.log("Establishing an onion rendezvous point", LogType::Info);
         let rendezvous = with_timeout(
             RENDEZVOUS_TIMEOUT,
@@ -658,16 +842,7 @@ impl OnionConnector {
                 TorError::Onion(format!("Failed to add the onion service hop: {error}"))
             })?;
         self.log("Onion service circuit established", LogType::Success);
-
-        let tunnel = Arc::new(tunnel);
-        let stream = tunnel
-            .begin_stream(host, port, None)
-            .await
-            .map_err(|error| {
-                TorError::Onion(format!("Failed to begin stream to {host}:{port}: {error}"))
-            })?;
-        self.tunnels.write().await.push(tunnel);
-        Ok(stream)
+        Ok(Arc::new(tunnel))
     }
 
     async fn establish_rendezvous(&self) -> Result<Rendezvous> {
@@ -1015,5 +1190,40 @@ mod tests {
             start_of_day_containing(noon),
             SystemTime::UNIX_EPOCH + Duration::from_secs(3 * 86400)
         );
+    }
+
+    /// A kept descriptor serves until its own lifetime ends or the time
+    /// period turns over, whichever is first: the subcredential it was
+    /// fetched under belongs to that period alone.
+    #[test]
+    fn kept_descriptor_ends_with_lifetime_or_period() {
+        let period = period_at(42);
+        let expires = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let validity = DescriptorValidity {
+            time_period: period,
+            expires: Some(expires),
+        };
+        assert!(validity.holds_at(period, expires - Duration::from_secs(1)));
+        assert!(!validity.holds_at(period, expires));
+        assert!(!validity.holds_at(period_at(43), expires - Duration::from_secs(1)));
+
+        let unbounded = DescriptorValidity {
+            time_period: period,
+            expires: None,
+        };
+        assert!(unbounded.holds_at(period, expires + ONE_DAY));
+        assert!(!unbounded.holds_at(period_at(41), expires));
+    }
+
+    /// An `END` from the service means the circuit carried the answer and is
+    /// worth keeping; anything else about a failed `BEGIN` is the circuit's.
+    #[test]
+    fn only_a_service_refusal_keeps_the_circuit() {
+        use tor_cell::relaycell::msg::EndReason;
+        assert!(stream_refused_by_service(&tor_proto::Error::EndReceived(
+            EndReason::EXITPOLICY
+        )));
+        assert!(!stream_refused_by_service(&tor_proto::Error::CircuitClosed));
+        assert!(!stream_refused_by_service(&tor_proto::Error::NotConnected));
     }
 }

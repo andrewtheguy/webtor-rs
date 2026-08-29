@@ -21,6 +21,10 @@
     service: null,
     served: [],
     directoryUpdates: [],
+    worker: null,
+    workerLogs: [],
+    workerCalls: new Map(),
+    nextWorkerCall: 0,
   };
 
   function show(line) {
@@ -56,6 +60,42 @@
   function client() {
     if (!state.client) throw new Error('No client; call create first');
     return state.client;
+  }
+
+  /**
+   * Start `worker.js` and resolve once its module has instantiated the wasm.
+   * Its log lines are kept here, since a test cannot read a worker's console,
+   * and shown too so a live run's progress stays visible.
+   */
+  function startWorker() {
+    return new Promise((resolve, reject) => {
+      const worker = new Worker('/tests/harness/worker.js', { type: 'module' });
+      worker.onerror = (event) => reject(new Error(`worker: ${event.message}`));
+      worker.onmessage = ({ data }) => {
+        if (data.type === 'ready') {
+          resolve(worker);
+        } else if (data.type === 'log') {
+          state.workerLogs.push(data.line);
+          show(`worker ${data.line}`);
+        } else {
+          const pending = state.workerCalls.get(data.id);
+          state.workerCalls.delete(data.id);
+          if (!pending) return;
+          if (data.error != null) pending.reject(new Error(data.error));
+          else pending.resolve(data.result);
+        }
+      };
+    });
+  }
+
+  /** Run one method in the worker and return what it answers. */
+  async function inWorker(method, args) {
+    state.worker ??= await startWorker();
+    const id = state.nextWorkerCall++;
+    return new Promise((resolve, reject) => {
+      state.workerCalls.set(id, { resolve, reject });
+      state.worker.postMessage({ id, method, args });
+    });
   }
 
   // Top-level await: the harness only appears once the module is usable, and
@@ -281,6 +321,21 @@
         } finally {
           await stream.close().catch(() => {});
         }
+      }),
+
+    // --- a client in a dedicated worker -----------------------------------
+    workerCreate: (options, seedUrl) =>
+      rethrowing(() => inWorker('create', { options, seedUrl })),
+    workerFetch: (url, options) =>
+      rethrowing(() => inWorker('fetch', { url, options })),
+    /** Every log line the worker's client has emitted so far. */
+    workerLogs: () => rethrowing(async () => [...state.workerLogs]),
+    workerClose: () =>
+      rethrowing(async () => {
+        const closed = await inWorker('close', {});
+        state.worker.terminate();
+        state.worker = null;
+        return closed;
       }),
 
     // --- onion service ----------------------------------------------------

@@ -354,6 +354,57 @@ describe('webtor-wasm over Tor', () => {
     }
   }, CASE_TIMEOUT);
 
+  // A second client, bootstrapped where there is no `window`: a dedicated
+  // worker has the global scope a service worker has, so a client that
+  // bootstraps and completes a rendezvous here runs in a service-worker
+  // gateway too. Two GETs to one service, because the second is meant to
+  // begin on the circuit the first built rather than rendezvous again.
+  it('runs in a dedicated worker and reuses the circuit to a service', async () => {
+    const options: CreateOptions = { bridge: BRIDGE };
+    if (BRIDGE === 'webrtc') options.stunUrls = STUN_URLS;
+    if (BRIDGE_URL && BRIDGE_FINGERPRINT) {
+      options.bridgeUrl = BRIDGE_URL;
+      options.bridgeFingerprint = BRIDGE_FINGERPRINT;
+    }
+    const created = await harness.call('workerCreate', options, seededFrom);
+    console.log(`  worker client ready in ${created.seconds}s`);
+
+    try {
+      const { target, result: first } = await firstReachable(HTTP_TARGETS, (url) =>
+        harness.call('workerFetch', url, { timeoutMs: ATTEMPT_TIMEOUT_MS }),
+      );
+      assert.equal(first.status, 200);
+      assert.ok(first.byteLength > 0, 'first body is empty');
+
+      const second = await harness.call('workerFetch', target, {
+        timeoutMs: ATTEMPT_TIMEOUT_MS,
+      });
+      console.log(
+        `  worker GETs took ${first.seconds}s, then ${second.seconds}s on the kept circuit`,
+      );
+      assert.equal(second.status, 200);
+      assert.ok(second.byteLength > 0, 'second body is empty');
+
+      const logs = await harness.call('workerLogs');
+      const descriptorFetches = logs.filter(
+        (line) =>
+          line.includes('Fetching the onion service descriptor') &&
+          line.includes(new URL(target).host),
+      );
+      assert.equal(
+        descriptorFetches.length,
+        1,
+        `one descriptor fetch for two streams:\n${logs.join('\n')}`,
+      );
+      assert.ok(
+        logs.some((line) => line.includes('kept circuit')),
+        `the second stream began on the kept circuit:\n${logs.join('\n')}`,
+      );
+    } finally {
+      await harness.call('workerClose').catch(() => {});
+    }
+  }, CASE_TIMEOUT);
+
   // Last: it takes the client away.
   it('refuses work once closed', async () => {
     assert.equal(await harness.call('close'), 'closed');

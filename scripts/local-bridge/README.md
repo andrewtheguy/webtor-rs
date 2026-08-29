@@ -17,7 +17,9 @@ in 40 s. Against the public bridge the same seedless bootstrap takes minutes.
 
 ## Run it
 
-`bridge.sh` wraps the podman commands:
+`bridge.sh` wraps the container commands. It works with podman or docker and
+uses whichever one answers `info`, podman first; `CONTAINER_ENGINE=docker` (or
+`podman`) names one instead.
 
 ```bash
 scripts/local-bridge/bridge.sh start     # builds the image if it is missing

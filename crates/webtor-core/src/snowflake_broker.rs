@@ -1,6 +1,7 @@
 //! Browser client for Snowflake's volunteer-proxy broker.
 
 use crate::error::{Result, TorError};
+use crate::global_scope::fetch_with_request;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 use wasm_bindgen::JsCast;
@@ -110,9 +111,10 @@ async fn fetch(url: &str, body: &[u8]) -> Result<Vec<u8>> {
         .set("Content-Type", "application/x-www-form-urlencoded")
         .map_err(|error| TorError::network(format!("Failed to set broker headers: {error:?}")))?;
 
-    let window = web_sys::window()
-        .ok_or_else(|| TorError::Internal("Browser window is unavailable".to_string()))?;
-    let value = JsFuture::from(window.fetch_with_request(&request))
+    let pending = fetch_with_request(&request).map_err(|error| {
+        TorError::Internal(format!("Snowflake broker request could not be started: {error:?}"))
+    })?;
+    let value = JsFuture::from(pending)
         .await
         .map_err(|error| TorError::network(format!("Snowflake broker request failed: {error:?}")))?;
     let response: Response = value
