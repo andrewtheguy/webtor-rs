@@ -14,6 +14,9 @@ function webtorWasmDirectory(): string {
 export default defineConfig({
   plugins: [react()],
   server: {
+    // Reachable through a Cloudflare quick tunnel (`cloudflared tunnel --url`),
+    // which is how the page gets opened in Tor Browser on another machine.
+    allowedHosts: ['.trycloudflare.com'],
     fs: {
       // Both live outside this example: the seed store is shared with the
       // other one, and bun installs the local WASM package as a symlink.
