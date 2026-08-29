@@ -56,11 +56,14 @@ curl --socks5-hostname 127.0.0.1:9050 -d hello http://<address>.onion/message
 Every answer carries `Access-Control-Allow-Origin: *`, which is what lets a
 sending page in Tor Browser read the reply with the browser's `fetch`.
 
-## Sending from Tor Browser
+## Sending from Tor Browser or Onion Browser
 
 The sending side probes on load whether the browser's own `fetch` reaches
 `.onion` (an opaque request to torproject.org's onion, which fails fast
 elsewhere) and, when it does, defaults **Send via** to the browser's Tor. The
+probe only picks the default: it can miss (a slow first rendezvous, or a
+browser that reports the failure oddly), so the option stays selectable, the
+page says why the probe failed, and **Check again** reruns it. The
 listener then runs on its tab's Snowflake client while the message arrives
 from a second, unrelated Tor client: proof that the address is reachable from
 outside its own circuits, without the sending tab bootstrapping a client of

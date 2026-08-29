@@ -330,3 +330,13 @@ button:focus-visible {
   outline: 2px solid #a5e995;
   outline-offset: 2px;
 }
+
+button.link {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: #a5e995;
+  font: inherit;
+  text-decoration: underline;
+}
