@@ -9,7 +9,7 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -b",
-    "tor:directory": "bun ../../tests/tools/fetch-directory.ts public/tor-directory.json"
+    "tor:directory": "bun ../directory-server-ts/src/build.ts --seed public/tor-directory.json"
   },
   "dependencies": {
     "@andrewtheguy/webtor-wasm": "file:../../crates/webtor-wasm/pkg",

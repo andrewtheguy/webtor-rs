@@ -1,0 +1,43 @@
+# One backend for the onion gateway's directory endpoints, in Rust. The
+# gateway's service worker asks its root host for a fresh Tor directory seed
+# (see examples/onion-gateway/README.md, "The directory endpoints"); this
+# builds one from a directory authority, keeps it fresh in the background, and
+# serves it. Any server that answers the same two URLs does as well — this is
+# the example, not the only shape.
+[package]
+name = "webtor-directory-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Example backend that builds and serves fresh Tor directory seeds for the onion gateway"
+
+[[bin]]
+name = "webtor-directory-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "tower-log"] }
+base64 = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+flate2 = "1"
+futures = { workspace = true }
+hex = { workspace = true }
+# Plain HTTP only: directory authorities serve their DirPort without TLS, and
+# there is nothing else to talk to.
+reqwest = { version = "0.12", default-features = false }
+serde = { workspace = true }
+serde_json = "1"
+tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "fs", "signal"] }
+tower-http = { version = "0.6", features = ["fs", "cors", "trace"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+webtor-core = { path = "../../crates/webtor-core" }
+# Seed names carry a content hash, so two builds of one consensus that differ
+# in their microdescriptors never share a URL the browser may have cached.
+sha2 = "0.10"
+
+[dev-dependencies]
+http-body-util = "0.1"
