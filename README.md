@@ -187,8 +187,8 @@ scripts/local-onion/onion.sh start && eval "$(scripts/local-onion/onion.sh env)"
 bun run test:dynamic
 ```
 
-The onion gateway, in the [`onion-gateway`](../onion-gateway) repository
-beside this one, has a browser test against the same site, `bun run test:e2e`
+The onion gateway, in the [`onion-gateway`](https://github.com/andrewtheguy/onion-gateway)
+repository, has a browser test against the same site, `bun run test:e2e`
 in its `gateway` directory, which drives the service worker from the install
 through a form sign-in.
 
@@ -218,24 +218,25 @@ signed event received by the subscriber.
 
 ## Browser onion gateway
 
-The [`onion-gateway`](../onion-gateway) repository, expected beside this one,
+The [`onion-gateway`](https://github.com/andrewtheguy/onion-gateway) repository
 browses static onion sites through a service worker, the way the IPFS
 service-worker gateway browses IPFS: `http://<address>.onion.intor.localhost:5173/path`
 gives each onion an origin of its own, and a worker on that origin bootstraps
 a Tor client and answers every request there from the onion. It shows the
 client running where there is no `window`, and a page's whole load —
 document, styles, images, scripts — arriving over one kept rendezvous circuit.
-It installs the WASM package from `crates/webtor-wasm/pkg` here, so `bun run
-build` comes first.
+It installs the WASM package from a release of this repository (see
+[Releases](#releases)), not from the checkout, so nothing here has to be built
+first.
 
 The worker takes its Tor directory from a backend, over two plain HTTP URLs
 any server can answer (the contract is in the gateway's README), and that
-repository holds two backends. `directory-server` is a Rust binary that builds
-a seed from a directory authority, rebuilds it as each hourly consensus is
-published, and serves it; it depends on `webtor-core` here by path, and its
-`snapshot` subcommand is what `bun run seed` runs. `directory-server-ts`
-answers the same contract from TypeScript with no refresh loop, and the
-examples here build their `public/tor-directory.json` with its build script.
+repository holds two backends, neither of which depends on the crates here.
+`directory-server` is a Rust binary that builds a seed from a directory
+authority with Arti's document crates, rebuilds it as each hourly consensus
+is published, and serves it. `directory-server-ts` answers the same contract
+from TypeScript with no refresh loop, and the examples here build their
+`public/tor-directory.json` with its build script.
 
 ## Releases
 
@@ -267,8 +268,6 @@ reference/         native peers webtor is tested *against*, each its own workspa
 docs/              architecture, network-observation notes, and the roadmap
 tests/             the browser test project
 examples/          standalone browser integrations
-  directory-server/     a native Rust backend: builds fresh directory seeds and serves the gateway's directory endpoints
-  directory-server-ts/  the same endpoints from Bun, with the seed built by hand through `bun run tor:directory`
 scripts/           the SOCKS-based probe, plus a local WebSocket bridge and a dynamic onion site, each in a container
 ```
 

@@ -2,8 +2,8 @@
 
 Drives the built `webtor-wasm` package in headless Chrome. Self-contained:
 `playwright-core` is a devDependency of this repository, the pages are served
-from a loopback port here, and the directory snapshot is built by
-`webtor-directory-server` from the `onion-gateway` repository beside this one.
+from a loopback port here, and the directory snapshot is built by a tool in
+this directory.
 
 ## Running
 
@@ -86,13 +86,9 @@ is the other way to make the directory download cheap — see below.
 
 ## The directory snapshot
 
-`bun run seed` runs `webtor-directory-server snapshot` from the `onion-gateway`
-repository beside this one (`../onion-gateway`), which fetches the
-microdesc consensus, the authority certificates that check its signatures, and
-every microdescriptor in it from a directory authority, puts them through the
-checks the client applies to a seed, and writes them in the shape
-`directorySeed` accepts. The same builder runs on a schedule inside that
-binary's `serve` mode, which is how the onion gateway stays seeded. The
+`bun run seed` fetches the microdesc consensus, the authority certificates that
+check its signatures, and every microdescriptor in it from a directory
+authority, and writes them in the shape `directorySeed` accepts. The
 certificates travel with the snapshot because the client verifies the consensus
 against the pinned directory authorities before installing a relay from it, and
 a seed arrives with no circuit behind it to vouch for it. Without a snapshot the browser downloads the directory over a single Snowflake
