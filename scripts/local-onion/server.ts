@@ -29,6 +29,15 @@ function escape(text: string): string {
     .replaceAll('"', '&quot;');
 }
 
+/** A percent-encoded value decoded, or as it came when it is not one. */
+function decoded(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 /** The `Cookie` header as a map, last value winning for a repeated name. */
 export function parseCookies(header: string | null): Record<string, string> {
   const cookies: Record<string, string> = {};
@@ -36,7 +45,7 @@ export function parseCookies(header: string | null): Record<string, string> {
     const separator = pair.indexOf('=');
     if (separator === -1) continue;
     const name = pair.slice(0, separator).trim();
-    if (name !== '') cookies[name] = decodeURIComponent(pair.slice(separator + 1).trim());
+    if (name !== '') cookies[name] = decoded(pair.slice(separator + 1).trim());
   }
   return cookies;
 }

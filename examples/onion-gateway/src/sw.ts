@@ -314,6 +314,36 @@ function refererFor(request: Request): string | null {
   }
 }
 
+/**
+ * The request body, whole, or `null` once it has run past
+ * `MAX_REQUEST_BYTES`. It is read a chunk at a time and the stream cancelled
+ * as soon as the limit is crossed, so a body far past it costs the worker no
+ * more memory than the limit itself.
+ */
+async function readBody(request: Request): Promise<Uint8Array | null> {
+  if (request.body === null) return new Uint8Array(0);
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_REQUEST_BYTES) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
 async function answer(request: Request, target: string): Promise<Response> {
   const onion = gateway!.onion;
   const navigation = request.mode === 'navigate';
@@ -348,13 +378,14 @@ async function answer(request: Request, target: string): Promise<Response> {
 
   let body: Uint8Array | undefined;
   if (carriesBody) {
-    body = new Uint8Array(await request.arrayBuffer());
-    if (body.byteLength > MAX_REQUEST_BYTES) {
-      const detail = `The request body is ${body.byteLength} bytes; this gateway forwards up to ${MAX_REQUEST_BYTES}.`;
+    const read = await readBody(request);
+    if (read === null) {
+      const detail = `The request body is over ${MAX_REQUEST_BYTES} bytes, the most this gateway forwards.`;
       return navigation
         ? htmlResponse(413, errorPage(onion, 'Request too large', detail))
         : textResponse(413, detail);
     }
+    body = read;
   }
 
   const headers: Record<string, string> = {};

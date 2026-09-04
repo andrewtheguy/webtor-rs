@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import {
   type Cookie,
   cookieHeader,
+  cookieJar,
   defaultPath,
   parseSetCookie,
   pathMatches,
@@ -120,5 +121,15 @@ describe('withCookie and cookieHeader', () => {
     expect(jar).toHaveLength(180);
     expect(jar.some((c) => c.name === 'c0')).toBe(false);
     expect(jar.some((c) => c.name === 'newest')).toBe(true);
+  });
+});
+
+describe('cookieJar', () => {
+  it('keeps every cookie when responses set them at the same time', async () => {
+    // No IndexedDB here, so the jar lives in memory; what is under test is
+    // that two sets in flight together do not each start from the same jar.
+    const jar = cookieJar('webtor-onion-gateway-cookies-test', HOST);
+    await Promise.all([jar.set(['a=1; Path=/'], '/'), jar.set(['b=2; Path=/'], '/')]);
+    expect(await jar.headerFor('/')).toBe('a=1; b=2');
   });
 });

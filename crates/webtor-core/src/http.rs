@@ -138,9 +138,9 @@ where
         }
         response.extend_from_slice(&buffer[..count]);
         if framing.is_none() {
-            framing = split_headers(&response).map(|(header_end, headers)| {
-                body_framing(header_end, &headers)
-            });
+            framing = split_headers(&response)
+                .map(|(header_end, headers)| body_framing(header_end, &headers))
+                .transpose()?;
         }
         if response_is_complete(&framing, &response, &mut scanned) {
             break;
@@ -161,16 +161,37 @@ enum BodyFraming {
     UntilClose,
 }
 
-fn body_framing(header_end: usize, headers: &[(String, String)]) -> BodyFraming {
-    if header_value(headers, "transfer-encoding")
-        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
-    {
-        return BodyFraming::Chunked;
+/// How the body ends, from every framing header in arrival order, RFC 7230
+/// §3.3.3. `Transfer-Encoding` wins over `Content-Length`, and only a *final*
+/// `chunked` coding frames the body; any other final coding leaves the close
+/// to end it. A `Content-Length` counts only when every value given, across
+/// repeated headers and comma-separated lists alike, parses and agrees:
+/// conflicting lengths are how a response is smuggled past a parser that
+/// reads one and a server that honours another, so they are refused.
+fn body_framing(header_end: usize, headers: &[(String, String)]) -> Result<BodyFraming> {
+    if let Some(last) = header_list(headers, "transfer-encoding").last() {
+        return Ok(if last.eq_ignore_ascii_case("chunked") {
+            BodyFraming::Chunked
+        } else {
+            BodyFraming::UntilClose
+        });
     }
-    match header_value(headers, "content-length").and_then(|value| value.parse::<usize>().ok()) {
-        Some(length) => BodyFraming::Length(header_end + 4 + length),
-        None => BodyFraming::UntilClose,
+    let mut lengths = header_list(headers, "content-length");
+    let Some(first) = lengths.next() else {
+        return Ok(BodyFraming::UntilClose);
+    };
+    let length = first.parse::<usize>().map_err(|_| {
+        TorError::http_request(format!("Invalid HTTP Content-Length: {first}"))
+    })?;
+    if lengths.any(|other| other.parse::<usize>().ok() != Some(length)) {
+        return Err(TorError::http_request(
+            "Conflicting HTTP Content-Length values",
+        ));
     }
+    (header_end + 4)
+        .checked_add(length)
+        .map(BodyFraming::Length)
+        .ok_or_else(|| TorError::http_request(format!("HTTP Content-Length too large: {length}")))
 }
 
 /// Whether the response is whole, so that reading can stop without waiting
@@ -201,6 +222,21 @@ fn response_is_complete(
         }
         Some(BodyFraming::UntilClose) | None => false,
     }
+}
+
+/// Every member of every header called `name`, which is lowercase here: a
+/// framing header may be repeated, and each value may itself be a
+/// comma-separated list, and both say the same thing.
+fn header_list<'a>(
+    headers: &'a [(String, String)],
+    name: &'a str,
+) -> impl Iterator<Item = &'a str> + 'a {
+    headers
+        .iter()
+        .filter(move |(header, _)| header == name)
+        .flat_map(|(_, value)| value.split(','))
+        .map(str::trim)
+        .filter(|member| !member.is_empty())
 }
 
 /// The first value of the header called `name`, which is lowercase here.
@@ -244,19 +280,20 @@ fn parse_response(data: &[u8]) -> Result<HttpResponse> {
 
     let mut body = data[header_end + 4..].to_vec();
 
-    if header_value(&headers, "transfer-encoding")
-        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
-    {
-        body = decode_chunked_body(&body)?;
-    } else if let Some(length) =
-        header_value(&headers, "content-length").and_then(|value| value.parse::<usize>().ok())
-    {
-        if body.len() < length {
-            return Err(TorError::http_request(
-                "HTTP response ended before Content-Length",
-            ));
+    // The same decision the reading loop made, so what is parsed is what was
+    // waited for.
+    match body_framing(header_end, &headers)? {
+        BodyFraming::Chunked => body = decode_chunked_body(&body)?,
+        BodyFraming::Length(total) => {
+            let length = total - (header_end + 4);
+            if body.len() < length {
+                return Err(TorError::http_request(
+                    "HTTP response ended before Content-Length",
+                ));
+            }
+            body.truncate(length);
         }
-        body.truncate(length);
+        BodyFraming::UntilClose => {}
     }
 
     debug!("Parsed HTTP response with status {}", status);
@@ -448,6 +485,11 @@ mod tests {
         assert_eq!(response.header("set-cookie"), Some("a=1; Path=/"));
     }
 
+    /// The framing a header block decides on, or `None` short of a whole one.
+    fn framing_of(head: &[u8]) -> Option<BodyFraming> {
+        split_headers(head).map(|(end, headers)| body_framing(end, &headers).unwrap())
+    }
+
     /// Run one exchange over an in-memory stream: the request is written over
     /// the zeroed prefix, and what follows it is read back as the response.
     fn exchange(response: &[u8], max_response_bytes: usize) -> Result<HttpResponse> {
@@ -482,7 +524,7 @@ mod tests {
     fn a_content_length_response_is_complete_without_a_close() {
         let head = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
         let mut scanned = 0;
-        let framing = split_headers(head).map(|(end, headers)| body_framing(end, &headers));
+        let framing = framing_of(head);
         assert_eq!(framing, Some(BodyFraming::Length(head.len() + 5)));
         assert!(!response_is_complete(&framing, head, &mut scanned));
 
@@ -494,7 +536,7 @@ mod tests {
     #[test]
     fn a_chunked_response_is_complete_at_its_terminating_chunk() {
         let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
-        let framing = split_headers(head).map(|(end, headers)| body_framing(end, &headers));
+        let framing = framing_of(head);
         assert_eq!(framing, Some(BodyFraming::Chunked));
 
         let mut scanned = 0;
@@ -511,7 +553,7 @@ mod tests {
     #[test]
     fn a_terminator_inside_chunk_data_does_not_end_the_response() {
         let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
-        let framing = split_headers(head).map(|(end, headers)| body_framing(end, &headers));
+        let framing = framing_of(head);
 
         let mut scanned = 0;
         let mut response = head.to_vec();
@@ -522,11 +564,48 @@ mod tests {
         assert!(response_is_complete(&framing, &response, &mut scanned));
     }
 
+    /// `Transfer-Encoding` may arrive split across fields; only the final
+    /// coding decides, and a `chunked` that is not final frames nothing.
+    #[test]
+    fn split_transfer_encoding_fields_frame_by_their_final_coding() {
+        let chunked_last = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert_eq!(framing_of(chunked_last), Some(BodyFraming::Chunked));
+        let listed = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, Chunked\r\n\r\n";
+        assert_eq!(framing_of(listed), Some(BodyFraming::Chunked));
+        let chunked_first = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\nContent-Length: 3\r\n\r\n";
+        assert_eq!(framing_of(chunked_first), Some(BodyFraming::UntilClose));
+    }
+
+    /// Two lengths that disagree, or one that is not a number, are not a
+    /// framing at all, and the response is refused rather than read by either.
+    #[test]
+    fn conflicting_or_invalid_content_lengths_are_refused() {
+        let agreeing = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5, 5\r\n\r\nhello";
+        assert_eq!(framing_of(agreeing), Some(BodyFraming::Length(agreeing.len())));
+        assert_eq!(parse_response(agreeing).unwrap().bytes(), b"hello");
+
+        let conflicting = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!";
+        let (end, headers) = split_headers(conflicting).unwrap();
+        let error = body_framing(end, &headers).unwrap_err();
+        assert!(error.to_string().contains("Conflicting"), "{error}");
+        assert!(parse_response(conflicting).is_err());
+        assert!(exchange(conflicting, 1024).is_err());
+
+        let listed = b"HTTP/1.1 200 OK\r\nContent-Length: 5, 6\r\n\r\nhello!";
+        assert!(parse_response(listed).is_err());
+
+        let invalid = b"HTTP/1.1 200 OK\r\nContent-Length: five\r\n\r\nhello";
+        let (end, headers) = split_headers(invalid).unwrap();
+        let error = body_framing(end, &headers).unwrap_err();
+        assert!(error.to_string().contains("Invalid HTTP Content-Length"), "{error}");
+        assert!(exchange(invalid, 1024).is_err());
+    }
+
     /// Without either framing header only the stream closing ends the body.
     #[test]
     fn an_unframed_response_waits_for_the_close() {
         let response = b"HTTP/1.1 200 OK\r\nServer: x\r\n\r\nbody";
-        let framing = split_headers(response).map(|(end, headers)| body_framing(end, &headers));
+        let framing = framing_of(response);
         assert_eq!(framing, Some(BodyFraming::UntilClose));
         assert!(!response_is_complete(&framing, response, &mut 0));
     }

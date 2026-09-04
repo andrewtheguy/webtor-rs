@@ -27,6 +27,10 @@ describe('parseCookies', () => {
     });
     expect(parseCookies(null)).toEqual({});
   });
+
+  it('keeps a value that is not percent-encoded as it came', () => {
+    expect(parseCookies('visits=%; ok=1')).toEqual({ visits: '%', ok: '1' });
+  });
 });
 
 describe('the home page', () => {

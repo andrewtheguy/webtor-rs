@@ -155,19 +155,23 @@ describe('the onion gateway against a dynamic onion site', () => {
     await page.goto(`${origin}/`);
     const deadline = Date.now() + REACHABLE_DEADLINE_MS;
     for (;;) {
-      const heading = page.locator('h1');
-      await heading.waitFor({ timeout: FIRST_PAGE_TIMEOUT_MS });
+      // Either the site, or a failure box the gateway has shown: the error
+      // page's, or the bootstrap page's once a bootstrap fails. Anything in
+      // between — the install, the bootstrap page and the moment it announces
+      // the client is up and reloads — is waited through.
       await page.waitForFunction(
         () => {
-          const h1 = document.querySelector('h1')?.textContent ?? '';
-          return h1 === 'Sample onion' || (!h1.includes('Connecting') && !h1.includes('Onion sites'));
+          if (document.querySelector('h1')?.textContent === 'Sample onion') return true;
+          const failure = document.querySelector<HTMLElement>('.failure');
+          return failure !== null && !failure.hidden;
         },
         undefined,
         { timeout: FIRST_PAGE_TIMEOUT_MS },
       );
-      const shown = await heading.innerText();
+      const shown = await page.locator('h1').innerText();
       if (shown === 'Sample onion') break;
-      say(`gateway showed "${shown}": ${await page.locator('.failure').innerText()}`);
+      const reason = await page.locator('.failure').innerText().catch(() => '(gone)');
+      say(`gateway showed "${shown}": ${reason}`);
       assert.ok(Date.now() < deadline, `the onion never answered; last page was "${shown}"`);
       await new Promise((resolve) => setTimeout(resolve, 5_000));
       await page.reload();

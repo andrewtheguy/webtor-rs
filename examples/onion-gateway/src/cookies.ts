@@ -151,7 +151,7 @@ export function cookieJar(name: string, host: string): CookieJar {
   const KEY = 'jar';
 
   let loaded: Promise<Cookie[]> | null = null;
-  /** Writes in the order they were asked for, each after the last. */
+  /** Changes in the order they were asked for, each after the last. */
   let writing: Promise<void> = Promise.resolve();
 
   function openDatabase(): Promise<IDBDatabase> {
@@ -217,16 +217,22 @@ export function cookieJar(name: string, host: string): CookieJar {
 
     async set(setCookies, requestPath) {
       if (setCookies.length === 0) return;
-      const now = Date.now();
-      let cookies = await jar();
-      for (const header of setCookies) {
-        const cookie = parseSetCookie(header, host, requestPath, now);
-        if (cookie) cookies = withCookie(cookies, cookie, now);
-      }
-      loaded = Promise.resolve(cookies);
-      const snapshot = cookies.map((cookie) => ({ ...cookie }));
-      writing = writing.then(() => save(snapshot));
-      await writing;
+      // The whole read-modify-write goes through the queue, not just the
+      // write: two responses arriving together would otherwise each start
+      // from the same jar and the second would put back a jar without the
+      // first's cookies.
+      const done = writing.then(async () => {
+        const now = Date.now();
+        let cookies = await jar();
+        for (const header of setCookies) {
+          const cookie = parseSetCookie(header, host, requestPath, now);
+          if (cookie) cookies = withCookie(cookies, cookie, now);
+        }
+        loaded = Promise.resolve(cookies);
+        await save(cookies.map((cookie) => ({ ...cookie })));
+      });
+      writing = done.catch(() => undefined);
+      await done;
     },
   };
 }
