@@ -1,12 +1,14 @@
 # Onion gateway
 
-A Vite/React app that browses static onion sites through a service worker,
+A Vite/React app that browses plain-HTTP onion sites through a service worker,
 the way [`ipfs/service-worker-gateway`](https://github.com/ipfs/service-worker-gateway)
 browses IPFS content: each site gets an origin of its own, and a service
 worker on that origin runs a Tor client compiled to WASM. Every request the
-page makes — the document, its style sheets, images, scripts — is fetched from
-the onion over circuits the worker builds itself. No external Tor daemon,
-application proxy, or backend is involved.
+page makes — the document, its style sheets, images, scripts, the forms it
+submits and the API calls its scripts make — is carried to the onion over
+circuits the worker builds itself, and the cookies the onion sets come back
+with the next one. No external Tor daemon, application proxy, or backend is
+involved.
 
 ```
 http://<address>.onion.intor.localhost:5173/some/path
@@ -73,31 +75,51 @@ own, such as `scripts/local-bridge`.
    and bootstraps a client over the Snowflake WebSocket bridge. Every
    directory the client later downloads is stored for the next start.
 4. **Serve.** Once the client is ready the page reloads itself, and from then
-   on every request on the origin is one `client.fetch` of the same path on
-   `http://<address>.onion`. The status, headers and body come back as a
-   `Response`; a `Location` on an onion is rewritten so a redirect stays inside
-   the gateway.
+   on every request on the origin is one `client.fetch` of the same method,
+   path and body on `http://<address>.onion`, with the onion's cookies on it.
+   The status, headers and body come back as a `Response`; a `Location` on an
+   onion is rewritten so a redirect stays inside the gateway, and a
+   `Set-Cookie` goes into the worker's jar.
 
 The client bootstraps only in the worker, and only the worker touches the
 onion. Pages on the origin see ordinary responses — with the onion's own
 `Content-Security-Policy`, `X-Frame-Options` and the rest passed through —
 and the browser gives each onion the isolation it gives any origin: its own
-cookies, storage, and worker.
+storage, worker, and the jar of cookies that worker keeps.
 
 ## What the gateway does and does not forward
 
-- **Methods.** `GET` and `HEAD`, which is what static content needs. Anything
-  else is answered `405` by the gateway. A `HEAD` is sent as a `GET` and the
-  body dropped here, because the client frames a response by its
-  `Content-Length` and a `HEAD` response never delivers those bytes.
-- **Request headers.** `Accept`, `Accept-Language` and `Range`. Conditional
-  headers are not forwarded, for the same reason: a `304` carries a
-  `Content-Length` with no body.
+- **Methods.** Any, with the request body: a form `POST`, a `PUT` or `DELETE`
+  from a script, `multipart/form-data` uploads included. A body is buffered
+  whole in the worker, up to 32 MiB; anything larger is answered `413`. A
+  `HEAD` is sent as a `GET` and the body dropped here, because the client
+  frames a response by its `Content-Length` and a `HEAD` response never
+  delivers those bytes.
+- **Request headers.** Everything the page sent, `Content-Type`,
+  `Authorization`, `Range` and custom headers included, except three kinds.
+  Conditional headers are not forwarded, because a `304` carries a
+  `Content-Length` with no body; connection-level ones (`Connection`,
+  `Content-Length`, `Transfer-Encoding`, `Upgrade` and the like) are set by the
+  client; and `Accept-Encoding`, `Origin`, `Referer` and `Cookie` are set by
+  the worker in the onion's terms, since the browser adds its own versions
+  only after a worker has answered, naming the gateway. `Origin` is
+  `http://<address>.onion` on any request with a body and `Referer` the
+  page's own URL translated to the onion, which is what a CSRF check
+  comparing them with `Host` expects.
+- **Cookies.** The browser keeps none for a worker's responses, so the worker
+  keeps them: every `Set-Cookie` an onion sends goes into a jar in the
+  origin's IndexedDB, and the cookies whose path matches go out on each
+  request as `Cookie`. `Expires`, `Max-Age` and `Path` are honoured; `Domain`
+  may name only the onion itself; `Secure` is accepted, since the circuit is
+  the secure channel; `HttpOnly` and `SameSite` change nothing, since no page
+  can read the jar and no request reaches it from another site. Session
+  cookies live until the onion expires them or the origin's storage is
+  cleared, because a worker has no notion of a browser session.
 - **Response headers.** Everything except the connection-level ones
-  (`Connection`, `Content-Length`, `Transfer-Encoding`, `Keep-Alive`). A
-  gzip- or deflate-compressed body is decompressed in the worker, since the
-  browser inflates only what came off its own network stack. `Set-Cookie` is
-  dropped by the browser on any response a worker constructs.
+  (`Connection`, `Content-Length`, `Transfer-Encoding`, `Keep-Alive`) and
+  `Set-Cookie`, which stays in the worker. A gzip- or deflate-compressed body
+  is decompressed in the worker, since the browser inflates only what came
+  off its own network stack.
 - **URLs.** Requests on the gateway origin, plus a page's requests for
   absolute `http://<address>.onion/…` URLs to *its own* onion, which is what
   its links and assets often say. A request for any other onion goes to the
@@ -112,9 +134,17 @@ cookies, storage, and worker.
 
 ## Limits
 
-- **Static content only.** No `POST`, no cookies, no WebSockets. A site that
-  needs those wants the `WebtorClient` API directly, as the other examples use
-  it.
+- **Plain HTTP only.** The onion's port 80, no TLS, and no WebSockets: a
+  service worker never sees a WebSocket handshake, so a site that needs one
+  wants the `WebtorClient` API directly, as the other examples use it.
+- **Cookies are the worker's, not the page's.** A script's `document.cookie`
+  is the gateway origin's jar, which the onion never sees, and the onion's
+  cookies are never visible to a script. A site that reads its own cookies
+  from JavaScript sees none.
+- **A form submitted while the client is down waits.** The bootstrap page
+  reloads what it was asked for as a `GET`, so only a `GET` navigation gets
+  it; a `POST` holds the tab until the client is up, up to the four minutes
+  the request itself may take.
 - **The worker does not stay up.** A browser stops an idle service worker
   within about half a minute, and the Tor client, its bridge channel and its
   circuits go with it. The next request bootstraps again — from the stored

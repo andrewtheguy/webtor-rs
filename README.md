@@ -89,8 +89,9 @@ caller's question, and no third-party address is compiled into the wasm.
   8388608). The response is buffered whole before it is returned, and
   `maxResponseBytes` is the most that buffer may hold, headers and body
   together, before the request fails instead. Resolves to an `OnionResponse`
-  with `status`, `ok`, `headers`, `bytes()` and `text()`. A 4xx or 5xx is a
-  response, not a rejection.
+  with `status`, `ok`, `headers` (a `Headers`, so `get('content-type')` and
+  `getSetCookie()` work as on a `Response`), `bytes()` and `text()`. A 4xx
+  or 5xx is a response, not a rejection.
 - `connectWebSocket(url, options?)` — RFC 6455 over an onion stream. Options:
   `maxMessageBytes` (default 1048576), `timeoutMs` (default 240000). The
   socket has `send(text)`, `sendBinary(bytes)`, `receive()` and `close()`;

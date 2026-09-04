@@ -1,6 +1,6 @@
 [package]
 name = "webtor-wasm"
-version = "0.0.1-alpha.19"
+version = "0.0.1-alpha.20"
 edition.workspace = true
 license-file = "LICENSE"
 description = "Browser Tor client for http:// and ws:// onion services"

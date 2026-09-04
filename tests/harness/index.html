@@ -233,7 +233,7 @@
         return {
           status: response.status,
           ok: response.ok,
-          headers: response.headers,
+          headers: Object.fromEntries(response.headers),
           byteLength: bytes.length,
           text,
           seconds: Number(((performance.now() - started) / 1000).toFixed(1)),

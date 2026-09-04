@@ -596,14 +596,16 @@ impl OnionResponse {
         self.inner.is_success()
     }
 
-    /// Response headers as a plain object; names are lowercased.
+    /// Response headers as a `Headers`, every occurrence kept: a repeated
+    /// name reads back joined through `get`, and the cookies a response set
+    /// come back one by one from `getSetCookie`.
     #[wasm_bindgen(getter)]
-    pub fn headers(&self) -> js_sys::Object {
-        let object = js_sys::Object::new();
+    pub fn headers(&self) -> Result<web_sys::Headers, JsValue> {
+        let headers = web_sys::Headers::new()?;
         for (name, value) in self.inner.headers() {
-            set(&object, name, &JsValue::from_str(value));
+            headers.append(name, value)?;
         }
-        object
+        Ok(headers)
     }
 
     /// The body as bytes.

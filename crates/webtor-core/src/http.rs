@@ -4,7 +4,6 @@
 
 use crate::error::{Result, TorError};
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use std::collections::HashMap;
 use crate::onion_url::OnionUrl;
 use tracing::debug;
 
@@ -162,17 +161,13 @@ enum BodyFraming {
     UntilClose,
 }
 
-fn body_framing(header_end: usize, headers: &HashMap<String, String>) -> BodyFraming {
-    if headers
-        .get("transfer-encoding")
+fn body_framing(header_end: usize, headers: &[(String, String)]) -> BodyFraming {
+    if header_value(headers, "transfer-encoding")
         .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
     {
         return BodyFraming::Chunked;
     }
-    match headers
-        .get("content-length")
-        .and_then(|value| value.parse::<usize>().ok())
-    {
+    match header_value(headers, "content-length").and_then(|value| value.parse::<usize>().ok()) {
         Some(length) => BodyFraming::Length(header_end + 4 + length),
         None => BodyFraming::UntilClose,
     }
@@ -208,9 +203,18 @@ fn response_is_complete(
     }
 }
 
+/// The first value of the header called `name`, which is lowercase here.
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(header, _)| header == name)
+        .map(|(_, value)| value.as_str())
+}
+
 /// The end of the header block and the headers in it, once `data` holds a
-/// whole header block.
-fn split_headers(data: &[u8]) -> Option<(usize, HashMap<String, String>)> {
+/// whole header block. Every header is kept, in order: a response may repeat
+/// a name, `Set-Cookie` above all, and each occurrence means something.
+fn split_headers(data: &[u8]) -> Option<(usize, Vec<(String, String)>)> {
     let header_end = find_subsequence(data, b"\r\n\r\n")?;
     let header_text = std::str::from_utf8(&data[..header_end]).ok()?;
     let headers = header_text
@@ -240,14 +244,12 @@ fn parse_response(data: &[u8]) -> Result<HttpResponse> {
 
     let mut body = data[header_end + 4..].to_vec();
 
-    if headers
-        .get("transfer-encoding")
+    if header_value(&headers, "transfer-encoding")
         .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
     {
         body = decode_chunked_body(&body)?;
-    } else if let Some(length) = headers
-        .get("content-length")
-        .and_then(|value| value.parse::<usize>().ok())
+    } else if let Some(length) =
+        header_value(&headers, "content-length").and_then(|value| value.parse::<usize>().ok())
     {
         if body.len() < length {
             return Err(TorError::http_request(
@@ -302,7 +304,7 @@ fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>> {
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
     pub status: u16,
-    headers: HashMap<String, String>,
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -311,9 +313,15 @@ impl HttpResponse {
         (200..300).contains(&self.status)
     }
 
-    /// Header names are lowercased on parse, so lookups are case-insensitive.
-    pub fn headers(&self) -> &HashMap<String, String> {
+    /// Every header in the order it arrived, names lowercased. A name may
+    /// repeat: a response sets each cookie with a `Set-Cookie` of its own.
+    pub fn headers(&self) -> &[(String, String)] {
         &self.headers
+    }
+
+    /// The first value of the header called `name`, in any case.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        header_value(&self.headers, &name.to_ascii_lowercase())
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -421,9 +429,23 @@ mod tests {
         let response = parse_response(raw).unwrap();
         assert_eq!(response.status, 302);
         assert_eq!(
-            response.headers().get("location").map(String::as_str),
+            response.header("Location"),
             Some("http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/a")
         );
+    }
+
+    #[test]
+    fn keeps_every_repeated_header() {
+        let raw = b"HTTP/1.1 200 OK\r\nSet-Cookie: a=1; Path=/\r\nContent-Length: 0\r\nSet-Cookie: b=2; HttpOnly\r\n\r\n";
+        let response = parse_response(raw).unwrap();
+        let cookies: Vec<&str> = response
+            .headers()
+            .iter()
+            .filter(|(name, _)| name == "set-cookie")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(cookies, ["a=1; Path=/", "b=2; HttpOnly"]);
+        assert_eq!(response.header("set-cookie"), Some("a=1; Path=/"));
     }
 
     /// Run one exchange over an in-memory stream: the request is written over
