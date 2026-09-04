@@ -3,6 +3,7 @@ members = [
     "crates/subtle-tls",
     "crates/webtor-core",
     "crates/webtor-wasm",
+    "examples/directory-server",
 ]
 # `reference/` holds implementations webtor is tested *against*, not with. They
 # share no code with the crates above and build a whole Tor client of their own,

@@ -41,7 +41,7 @@ const MIN_RELAYS_PER_ROLE: usize = 10;
 const MICRODESCRIPTOR_CHUNK_SIZE: usize = 46;
 const MAX_PARALLEL_CHUNKS: usize = 1;
 const MIN_HSDIR_RELAYS: usize = 100;
-const DIRECTORY_CACHE_VERSION: u32 = 3;
+pub(crate) const DIRECTORY_CACHE_VERSION: u32 = 3;
 /// Bounds on the bridge's directory service. `tor-proto` has none of its
 /// own, and an instance behind the Snowflake fingerprint sometimes takes a
 /// CREATE_FAST or a BEGIN_DIR and never answers; a bounded failure lets the
@@ -56,13 +56,13 @@ const CERTIFICATE_TIMEOUT: Duration = Duration::from_secs(60);
 const MICRODESCRIPTOR_BATCH_TIMEOUT: Duration = Duration::from_secs(40);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-struct DirectoryCache {
-    version: u32,
-    consensus: String,
+pub(crate) struct DirectoryCache {
+    pub(crate) version: u32,
+    pub(crate) consensus: String,
     /// The authority certificates that check `consensus`. A seed carries its
     /// own, because nothing checks it before it is installed.
-    certificates: String,
-    microdescriptors: String,
+    pub(crate) certificates: String,
+    pub(crate) microdescriptors: String,
 }
 
 impl DirectoryCache {
@@ -79,7 +79,7 @@ impl DirectoryCache {
         Ok(cache)
     }
 
-    fn encode(&self) -> Result<String> {
+    pub(crate) fn encode(&self) -> Result<String> {
         serde_json::to_string(self).map_err(|error| {
             TorError::serialization(format!("Failed to serialize directory cache: {}", error))
         })
@@ -156,10 +156,10 @@ pub fn describe_directory(encoded: &str) -> Result<DirectoryDescription> {
 }
 
 #[derive(Debug)]
-struct ProcessedDirectory {
-    relays: Vec<Relay>,
-    middle_count: usize,
-    hsdir_count: usize,
+pub(crate) struct ProcessedDirectory {
+    pub(crate) relays: Vec<Relay>,
+    pub(crate) middle_count: usize,
+    pub(crate) hsdir_count: usize,
     hsdir_params: HsDirRings,
 }
 
@@ -620,7 +620,7 @@ fn validate_directory_documents(
     process_directory_documents(&consensus, microdescriptors_body)
 }
 
-fn process_directory_documents(
+pub(crate) fn process_directory_documents(
     consensus: &MdConsensus,
     microdescriptors_body: &str,
 ) -> Result<ProcessedDirectory> {
@@ -746,7 +746,7 @@ fn relay_weight_value(weight: &RelayWeight) -> u32 {
     }
 }
 
-fn encode_microdescriptor_digest(digest: &[u8; 32]) -> String {
+pub(crate) fn encode_microdescriptor_digest(digest: &[u8; 32]) -> String {
     STANDARD_NO_PAD.encode(digest)
 }
 

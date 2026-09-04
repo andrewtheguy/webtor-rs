@@ -2,7 +2,7 @@
 // `http://<address>.onion.<root>`, and answers every request on it by
 // making the same request of `http://<address>.onion` over Tor. The Tor
 // client lives in the worker, bootstrapped over Snowflake from a directory
-// the page may have served or a previous run stored; no page on the origin
+// the gateway's backend serves (see directory.ts); no page on the origin
 // ever sees it, only the responses. The onion's cookies live here too, since
 // the browser keeps none for a response a worker made up.
 //
@@ -13,8 +13,8 @@
 
 import init, { WebtorClient } from '@andrewtheguy/webtor-wasm';
 import webtorWasmUrl from '@andrewtheguy/webtor-wasm/webtor_wasm_bg.wasm?url';
-import { directorySeedStore } from '../../shared/directory-cache';
 import { cookieJar } from './cookies';
+import { directoryUrl, loadDirectory } from './directory';
 import { gatewayUrl, isOnionHost, parseGatewayHost } from './gateway-host';
 import { bootstrapPage, errorPage } from './gateway-pages';
 import type {
@@ -123,14 +123,21 @@ const gateway = parseGatewayHost(here.hostname);
 /** The gateway's own host with its port, which is what onion URLs map onto. */
 const rootHost = gateway && `${gateway.root}${here.port ? `:${here.port}` : ''}`;
 
-const store = directorySeedStore('webtor-onion-gateway');
+/**
+ * Where a fresh directory comes from: the gateway host's own endpoints, or
+ * a backend elsewhere named by `VITE_DIRECTORY_URL`. Every onion's worker
+ * asks the same URL, and the browser caches the one seed for all of them.
+ */
+const directoryManifestUrl =
+  rootHost && directoryUrl(import.meta.env.VITE_DIRECTORY_URL, here.protocol, rootHost);
 const cookies = cookieJar('webtor-onion-gateway-cookies', gateway?.onion ?? '');
 
 type TorClient = Awaited<ReturnType<typeof WebtorClient.create>>;
 
 // The bootstrap's state, kept in module scope: a browser stops an idle
 // service worker after roughly half a minute, and every restart begins here
-// again, with nothing but what the directory store kept.
+// again, with nothing kept; the directory is fetched afresh, from the
+// browser's HTTP cache when it holds one.
 let bootstrap: Promise<TorClient> | null = null;
 let phase: GatewayPhase = 'starting';
 let failure: string | null = null;
@@ -167,8 +174,7 @@ async function createClient(onion: string): Promise<TorClient> {
   lines = [];
   log('info', `Gateway for ${onion}`);
   await init({ module_or_path: webtorWasmUrl });
-  const seed = await store.load();
-  log('info', `Tor directory: ${seed.source}`);
+  const seed = await loadSeed();
   const client: TorClient = await WebtorClient.create({
     // Only the WebSocket bridge: the WebRTC one needs `RTCPeerConnection`,
     // which a worker does not have.
@@ -176,18 +182,36 @@ async function createClient(onion: string): Promise<TorClient> {
     ...(BRIDGE_URL && BRIDGE_FINGERPRINT
       ? { bridgeUrl: BRIDGE_URL, bridgeFingerprint: BRIDGE_FINGERPRINT }
       : {}),
-    ...(seed.value ? { directorySeed: seed.value } : {}),
-    onDirectoryChange: (cache: string) => {
-      void store.save(cache).then((stored) => {
-        if (stored) log('info', 'Stored a fresh Tor directory for the next start');
-      });
-    },
+    ...(seed ? { directorySeed: seed } : {}),
     // The worker's console is out of sight; the lines go to the page instead.
     onLog: (message: string, level: GatewayLevel) => log(level, message),
   });
   phase = 'ready';
   log('success', 'Tor client bootstrapped');
   return client;
+}
+
+/**
+ * The seed the backend serves, or `null` to let the client download a
+ * directory over Tor — slow, but not wrong, so a backend that is down or not
+ * yet ready costs time rather than the page.
+ */
+async function loadSeed(): Promise<string | null> {
+  if (!directoryManifestUrl) return null;
+  try {
+    const { seed, manifest, seedUrl } = await loadDirectory(directoryManifestUrl);
+    log(
+      'info',
+      `Tor directory: ${manifest.relays} relays from ${seedUrl}, valid until ${manifest.validUntil}`,
+    );
+    return seed;
+  } catch (error) {
+    log(
+      'warn',
+      `No Tor directory from ${directoryManifestUrl} (${describe(error)}); downloading one over Tor`,
+    );
+    return null;
+  }
 }
 
 /** The client, starting a bootstrap if none is under way. */

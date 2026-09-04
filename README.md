@@ -225,6 +225,14 @@ answers every request there from the onion. It shows the client running where
 there is no `window`, and a page's whole load — document, styles, images,
 scripts — arriving over one kept rendezvous circuit.
 
+The worker takes its Tor directory from a backend, over two plain HTTP URLs
+any server can answer (the contract is in the gateway's README), so every
+onion's worker shares one cached copy instead of storing forty megabytes per
+origin. [`examples/directory-server`](examples/directory-server) is a backend
+that answers them: a Rust binary that builds a seed from a directory authority,
+rebuilds it as each hourly consensus is published, and serves it. Its
+`snapshot` subcommand is also what `bun run seed` runs.
+
 ## Releases
 
 The wasm-pack output is published as a `.tgz` asset on a GitHub release:
@@ -246,7 +254,7 @@ The current line is `0.0.1-alpha.*`.
 ## Layout
 
 ```
-crates/            the Rust workspace, one target: wasm32-unknown-unknown
+crates/            the Rust library crates, built for wasm32-unknown-unknown
   webtor-core/     the Tor client: directory, circuits, onion rendezvous, HTTP, WebSocket
   webtor-wasm/     the wasm-bindgen surface packed for distribution
   subtle-tls/      the TLS 1.3 session the bridge channel runs inside (see its README)
@@ -254,7 +262,8 @@ reference/         native peers webtor is tested *against*, each its own workspa
   onion-cli-poc/   an Arti-based onion-service echo peer
 docs/              architecture, network-observation notes, and the roadmap
 tests/             the browser test project
-examples/          standalone browser integrations, over a shared seed store
+examples/          standalone browser integrations
+  directory-server/  a native Rust backend: builds fresh directory seeds and serves the gateway's directory endpoints
 scripts/           the SOCKS-based probe, plus a local WebSocket bridge and a dynamic onion site, each in a container
 ```
 

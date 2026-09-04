@@ -27,6 +27,7 @@ mod onion_url;
 pub mod onion_websocket;
 mod relay;
 mod retry;
+pub mod seed;
 mod smux;
 mod snowflake_broker;
 mod snowflake_webrtc;

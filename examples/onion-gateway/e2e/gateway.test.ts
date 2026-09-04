@@ -13,9 +13,11 @@
 //   SAMPLE_ONION        http://<address>.onion, what `onion.sh env` prints
 //   BRIDGE_URL          a bridge instead of the public one, with
 //   BRIDGE_FINGERPRINT  its identity; both or neither. Without one the worker
-//                       bootstraps across the public Snowflake bridge, which
-//                       takes minutes unless `bun run tor:directory` has put
-//                       a snapshot in public/.
+//                       bootstraps across the public Snowflake bridge.
+//   DIRECTORY_BACKEND   a running directory backend to proxy `/api` to, as a
+//                       port or an origin. Without one the test starts
+//                       `webtor-directory-server` itself, which builds a
+//                       seed from a directory authority in under a minute.
 //   CHROME_PATH         Chrome-family binary (default /usr/bin/google-chrome)
 
 import assert from 'node:assert/strict';
@@ -30,6 +32,7 @@ const CHROME_PATH = process.env.CHROME_PATH ?? '/usr/bin/google-chrome';
 const SAMPLE_ONION = process.env.SAMPLE_ONION;
 const BRIDGE_URL = process.env.BRIDGE_URL;
 const BRIDGE_FINGERPRINT = process.env.BRIDGE_FINGERPRINT;
+const DIRECTORY_BACKEND = process.env.DIRECTORY_BACKEND;
 /** Any name under `.localhost` does; the browser resolves them all to loopback. */
 const GATEWAY_HOST = 'intor.localhost';
 
@@ -60,13 +63,62 @@ async function freePort(): Promise<number> {
   });
 }
 
+/** Relay a child's output into the log, one prefixed line at a time. */
+function relayOutput(child: ChildProcess, prefix: string): void {
+  for (const stream of [child.stdout!, child.stderr!]) {
+    stream.setEncoding('utf8');
+    stream.on('data', (chunk: string) => {
+      for (const line of chunk.split('\n')) if (line.trim()) say(`[${prefix}] ${line.trim()}`);
+    });
+  }
+}
+
+/** Poll `url` until it answers 200, or `child` exits, or `deadlineMs` passes. */
+async function waitForListening(child: ChildProcess, url: string, deadlineMs: number): Promise<void> {
+  const deadline = Date.now() + deadlineMs;
+  for (;;) {
+    if (child.exitCode !== null) throw new Error(`${url} exited with ${child.exitCode}`);
+    try {
+      const response = await fetch(url);
+      if (response.ok) return;
+    } catch {
+      // Not listening yet.
+    }
+    if (Date.now() > deadline) {
+      // Nothing else holds the process once this throws, so it goes here.
+      child.kill();
+      throw new Error(`${url} did not start answering in ${deadlineMs / 1000}s`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+}
+
+/**
+ * The example directory backend on a port of its own, built and run with
+ * cargo, waited for until it serves a seed. The manifest says 503 until the
+ * first build lands, and the worker would fall back to a Tor download if it
+ * asked in that window — a path that also works, but not the one this suite
+ * is here to drive.
+ */
+async function startBackend(port: number): Promise<ChildProcess> {
+  const backend = spawn(
+    'cargo',
+    ['run', '-q', '-p', 'webtor-directory-server', '--', 'serve', '--listen', `127.0.0.1:${port}`],
+    { cwd: EXAMPLE, stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  relayOutput(backend, 'backend');
+  await waitForListening(backend, `http://127.0.0.1:${port}/api/directory`, 5 * 60_000);
+  return backend;
+}
+
 /**
  * Vite's dev server on a port of its own, with the bridge passed through as
- * the `VITE_` variables the worker reads. `--host 127.0.0.1` so the port is
- * loopback only; the browser reaches it by name all the same.
+ * the `VITE_` variables the worker reads and `/api` proxied to `backend`.
+ * `--host 127.0.0.1` so the port is loopback only; the browser reaches it by
+ * name all the same.
  */
-async function startVite(port: number): Promise<ChildProcess> {
-  const env: NodeJS.ProcessEnv = { ...process.env };
+async function startVite(port: number, backend: string): Promise<ChildProcess> {
+  const env: NodeJS.ProcessEnv = { ...process.env, GATEWAY_DEV_BACKEND: backend };
   if (BRIDGE_URL && BRIDGE_FINGERPRINT) {
     env.VITE_BRIDGE_URL = BRIDGE_URL;
     env.VITE_BRIDGE_FINGERPRINT = BRIDGE_FINGERPRINT;
@@ -76,33 +128,15 @@ async function startVite(port: number): Promise<ChildProcess> {
     ['--host', '127.0.0.1', '--port', String(port), '--strictPort', '--clearScreen', 'false'],
     { cwd: EXAMPLE, env, stdio: ['ignore', 'pipe', 'pipe'] },
   );
-  for (const stream of [vite.stdout!, vite.stderr!]) {
-    stream.setEncoding('utf8');
-    stream.on('data', (chunk: string) => {
-      for (const line of chunk.split('\n')) if (line.trim()) say(`[vite] ${line.trim()}`);
-    });
-  }
-  const deadline = Date.now() + 30_000;
-  for (;;) {
-    if (vite.exitCode !== null) throw new Error(`vite exited with ${vite.exitCode}`);
-    try {
-      const response = await fetch(`http://127.0.0.1:${port}/`);
-      if (response.ok) return vite;
-    } catch {
-      // Not listening yet.
-    }
-    if (Date.now() > deadline) {
-      // Nothing else holds the process once this throws, so it goes here.
-      vite.kill();
-      throw new Error('vite did not start listening in 30s');
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
+  relayOutput(vite, 'vite');
+  await waitForListening(vite, `http://127.0.0.1:${port}/`, 30_000);
+  return vite;
 }
 
 describe('the onion gateway against a dynamic onion site', () => {
   let onion: string;
   let origin: string;
+  let backend: ChildProcess | undefined;
   let vite: ChildProcess | undefined;
   let browser: Browser | undefined;
   let page: Page;
@@ -134,8 +168,14 @@ describe('the onion gateway against a dynamic onion site', () => {
       'BRIDGE_URL and BRIDGE_FINGERPRINT are set together or not at all',
     );
 
+    let backendAt = DIRECTORY_BACKEND;
+    if (!backendAt) {
+      const backendPort = await freePort();
+      backend = await startBackend(backendPort);
+      backendAt = String(backendPort);
+    }
     const port = await freePort();
-    vite = await startVite(port);
+    vite = await startVite(port, backendAt);
     origin = `http://${onion}.${GATEWAY_HOST}:${port}`;
     say(`gateway at ${origin}`);
 
@@ -148,6 +188,7 @@ describe('the onion gateway against a dynamic onion site', () => {
   after(async () => {
     await browser?.close();
     vite?.kill();
+    backend?.kill();
   });
 
   it('installs the worker, bootstraps, and shows the onion page', async () => {

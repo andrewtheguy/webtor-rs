@@ -8,6 +8,17 @@ import { defineConfig, type Plugin } from 'vite';
 const SERVICE_WORKER_URL = '/sw.js';
 const SERVICE_WORKER_SOURCE = '/src/sw.ts';
 
+/**
+ * Where the directory backend is listening, so `/api` on the dev server
+ * reaches it from every onion origin. 5180 is `webtor-directory-server`'s
+ * default; a port or a full origin overrides it:
+ *
+ *   GATEWAY_DEV_BACKEND=5181 bun run dev
+ *   GATEWAY_DEV_BACKEND=http://192.168.1.10:5180 bun run dev
+ */
+const backend = process.env.GATEWAY_DEV_BACKEND ?? '5180';
+const backendUrl = /^\d+$/.test(backend) ? `http://127.0.0.1:${backend}` : backend;
+
 function webtorWasmDirectory(): string {
   const require = createRequire(path.join(import.meta.dirname, 'package.json'));
   return fs.realpathSync(
@@ -66,5 +77,11 @@ export default defineConfig({
     },
     // A rebuilt WASM binary and stale JS glue must never share one page load.
     hmr: false,
+    // The directory endpoints come from the backend; the worker asks for
+    // them on the gateway host and the browser keeps one copy for every
+    // onion origin under it.
+    proxy: {
+      '/api': backendUrl,
+    },
   },
 });

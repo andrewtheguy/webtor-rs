@@ -9,7 +9,7 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -b",
-    "tor:directory": "bun ../../tests/tools/fetch-directory.ts public/tor-directory.json",
+    "backend": "cargo run -q -p webtor-directory-server -- serve",
     "test": "bun test src",
     "test:e2e": "bun test --timeout 600000 e2e"
   },
