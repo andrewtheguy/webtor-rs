@@ -26,8 +26,8 @@ use futures::{AsyncReadExt, AsyncWriteExt};
 use webtor_core::{
     DEFAULT_MAX_RESPONSE_BYTES,
     onion_websocket, DataReader, DataWriter, HttpRequest, HttpResponse, LogType, OnionService,
-    OnionServiceOptions, OnionUrl, TorClient, TorClientOptions, WebSocketMessage,
-    WebSocketReader, WebSocketWriter,
+    OnionServiceOptions, OnionUrl, TorClient, TorClientOptions, WebSocketConnection,
+    WebSocketMessage, WebSocketReader, WebSocketWriter,
 };
 
 const DEFAULT_CONNECTION_TIMEOUT_MS: u64 = 300_000;
@@ -50,7 +50,7 @@ const CLIENT_OPTIONS: &[&str] = &[
     "onDirectoryChange",
 ];
 const REQUEST_OPTIONS: &[&str] = &["method", "headers", "body", "timeoutMs", "maxResponseBytes"];
-const WEBSOCKET_OPTIONS: &[&str] = &["maxMessageBytes", "timeoutMs"];
+const WEBSOCKET_OPTIONS: &[&str] = &["headers", "maxMessageBytes", "timeoutMs"];
 const SERVICE_OPTIONS: &[&str] = &["introPoints"];
 
 /// Introduction points a published service establishes, and the most it will
@@ -404,8 +404,11 @@ impl WebtorClient {
 
     /// Open a WebSocket to `ws://<address>.onion[:port][/path]`.
     ///
-    /// Options: `maxMessageBytes` (default 1048576) and `timeoutMs` (default
-    /// 240000, covering the onion stream and the upgrade on it).
+    /// Options: `headers` on the upgrade request (a `Cookie`, an `Origin`, a
+    /// `Sec-WebSocket-Protocol`; the ones the upgrade itself needs are set
+    /// here and refused, as is `Sec-WebSocket-Extensions`, since the client
+    /// speaks plain frames only), `maxMessageBytes` (default 1048576) and `timeoutMs`
+    /// (default 240000, covering the onion stream and the upgrade on it).
     #[wasm_bindgen(js_name = connectWebSocket)]
     pub fn connect_websocket(
         &self,
@@ -417,6 +420,7 @@ impl WebtorClient {
         self.run(async move {
             let bag = options::bag(options, "connectWebSocket")?;
             options::reject_unknown_keys(&bag, "connectWebSocket", WEBSOCKET_OPTIONS)?;
+            let headers = options::string_map(&bag, "headers", "connectWebSocket")?;
             let max_message_bytes =
                 options::count(&bag, "maxMessageBytes", "connectWebSocket")?
                     .unwrap_or(DEFAULT_MAX_MESSAGE_BYTES) as usize;
@@ -435,17 +439,18 @@ impl WebtorClient {
                 "Onion WebSocket",
                 async {
                     let stream = client.open_stream(&parsed).await?;
-                    onion_websocket::connect(stream, &parsed, max_message_bytes).await
+                    onion_websocket::connect(stream, &parsed, &headers, max_message_bytes).await
                 },
             )
             .await
             .map_err(|error| js_error("Onion WebSocket failed", error))?;
             log(&format!("Connected to {url} through Tor."), LogType::Success);
 
-            let (writer, reader) = socket;
+            let WebSocketConnection { writer, reader, headers } = socket;
             Ok(JsValue::from(OnionWebSocket {
                 writer: Rc::new(Mutex::new(writer)),
                 reader: Rc::new(Mutex::new(reader)),
+                headers,
                 max_message_bytes,
                 closed: Rc::new(Cell::new(false)),
             }))
@@ -628,12 +633,26 @@ impl OnionResponse {
 pub struct OnionWebSocket {
     writer: Rc<Mutex<WebSocketWriter>>,
     reader: Rc<Mutex<WebSocketReader>>,
+    headers: Vec<(String, String)>,
     max_message_bytes: usize,
     closed: Rc<Cell<bool>>,
 }
 
 #[wasm_bindgen]
 impl OnionWebSocket {
+    /// The headers the service answered the upgrade with, as a `Headers`:
+    /// `Sec-WebSocket-Protocol` is the subprotocol it chose, and a
+    /// `Set-Cookie` reads back from `getSetCookie`. As on a response, a
+    /// header `Headers` refuses is left out.
+    #[wasm_bindgen(getter)]
+    pub fn headers(&self) -> Result<web_sys::Headers, JsValue> {
+        let headers = web_sys::Headers::new()?;
+        for (name, value) in &self.headers {
+            let _ = headers.append(name, value);
+        }
+        Ok(headers)
+    }
+
     /// Send a text message.
     #[wasm_bindgen(js_name = send)]
     pub fn send(&self, text: String) -> js_sys::Promise {

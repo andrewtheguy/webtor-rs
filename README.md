@@ -93,9 +93,16 @@ caller's question, and no third-party address is compiled into the wasm.
   `getSetCookie()` work as on a `Response`), `bytes()` and `text()`. A 4xx
   or 5xx is a response, not a rejection.
 - `connectWebSocket(url, options?)` — RFC 6455 over an onion stream. Options:
-  `maxMessageBytes` (default 1048576), `timeoutMs` (default 240000). The
-  socket has `send(text)`, `sendBinary(bytes)`, `receive()` and `close()`;
-  `receive()` answers pings itself and resolves to `null` once the peer closes.
+  `headers`, put on the upgrade request after the ones the upgrade itself
+  needs — a `Cookie`, an `Origin`, a `Sec-WebSocket-Protocol`; `Host`,
+  `Upgrade`, `Connection` and the `Sec-WebSocket-Key` and `-Version` are the
+  client's and refused, as is `Sec-WebSocket-Extensions`, since the client
+  speaks plain frames only — `maxMessageBytes` (default 1048576) and `timeoutMs`
+  (default 240000). The socket has `headers`, a `Headers` of what the
+  service answered the upgrade with (`Sec-WebSocket-Protocol` for the
+  subprotocol it chose, `getSetCookie()` for cookies it set), `send(text)`,
+  `sendBinary(bytes)`, `receive()` and `close()`; `receive()` answers pings
+  itself and resolves to `null` once the peer closes.
   An `OnionStream` — what `connectStream` returns and what a published service
   accepts — is the same shape without the framing: `send(text)`,
   `sendBytes(bytes)`, `receive()` and `close()`, where `receive()` resolves to
