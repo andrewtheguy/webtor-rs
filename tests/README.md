@@ -3,7 +3,7 @@
 Drives the built `webtor-wasm` package in headless Chrome. Self-contained:
 `playwright-core` is a devDependency of this repository, the pages are served
 from a loopback port here, and the directory snapshot is built by
-`webtor-directory-server` in `examples/directory-server`.
+`webtor-directory-server` from the `onion-gateway` repository beside this one.
 
 ## Running
 
@@ -52,10 +52,10 @@ response it is, and that every `Set-Cookie` header is delivered in order — the
 `headers` getter is a `Headers`, and `getSetCookie()` is what the harness
 reads. `SAMPLE_ONION` names the site, from `onion.sh env`; the first request
 is retried for up to four minutes, since the container's tor publishes the
-descriptor a while after it bootstraps. The onion gateway example has a
-browser test against the same site — `bun run test:e2e` in
-`examples/onion-gateway` — that drives the service worker through the install,
-the bootstrap page, a form sign-in and a script's own request.
+descriptor a while after it bootstraps. The onion gateway has a browser test
+against the same site — `bun run test:e2e` in the `onion-gateway` repository's
+`gateway` directory — that drives the service worker through the install, the
+bootstrap page, a form sign-in and a script's own request.
 
 **`tools/interop-cli.ts`** is the only one that needs a second implementation:
 `reference/onion-cli-poc`, an Arti-based peer that publishes an ephemeral onion
@@ -86,12 +86,13 @@ is the other way to make the directory download cheap — see below.
 
 ## The directory snapshot
 
-`bun run seed` runs `webtor-directory-server snapshot`, which fetches the
+`bun run seed` runs `webtor-directory-server snapshot` from the `onion-gateway`
+repository beside this one (`../onion-gateway`), which fetches the
 microdesc consensus, the authority certificates that check its signatures, and
 every microdescriptor in it from a directory authority, puts them through the
 checks the client applies to a seed, and writes them in the shape
 `directorySeed` accepts. The same builder runs on a schedule inside that
-binary's `serve` mode, which is how the onion gateway example stays seeded. The
+binary's `serve` mode, which is how the onion gateway stays seeded. The
 certificates travel with the snapshot because the client verifies the consensus
 against the pinned directory authorities before installing a relay from it, and
 a seed arrives with no circuit behind it to vouch for it. Without a snapshot the browser downloads the directory over a single Snowflake

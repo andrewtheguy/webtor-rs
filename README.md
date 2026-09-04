@@ -187,9 +187,10 @@ scripts/local-onion/onion.sh start && eval "$(scripts/local-onion/onion.sh env)"
 bun run test:dynamic
 ```
 
-The onion gateway example has a browser test against the same site, `bun run
-test:e2e` in `examples/onion-gateway`, which drives the service worker from
-the install through a form sign-in.
+The onion gateway, in the [`onion-gateway`](../onion-gateway) repository
+beside this one, has a browser test against the same site, `bun run test:e2e`
+in its `gateway` directory, which drives the service worker from the install
+through a form sign-in.
 
 The repository pins its Bun version in `package.json`. `bun run test` is a
 second or two. `bun run test:live` bootstraps a real Tor client
@@ -217,26 +218,24 @@ signed event received by the subscriber.
 
 ## Browser onion gateway
 
-[`examples/onion-gateway`](examples/onion-gateway) browses static onion sites
-through a service worker, the way the IPFS service-worker gateway browses
-IPFS: `http://<address>.onion.intor.localhost:5173/path` gives each onion an
-origin of its own, and a worker on that origin bootstraps a Tor client and
-answers every request there from the onion. It shows the client running where
-there is no `window`, and a page's whole load — document, styles, images,
-scripts — arriving over one kept rendezvous circuit.
+The [`onion-gateway`](../onion-gateway) repository, expected beside this one,
+browses static onion sites through a service worker, the way the IPFS
+service-worker gateway browses IPFS: `http://<address>.onion.intor.localhost:5173/path`
+gives each onion an origin of its own, and a worker on that origin bootstraps
+a Tor client and answers every request there from the onion. It shows the
+client running where there is no `window`, and a page's whole load —
+document, styles, images, scripts — arriving over one kept rendezvous circuit.
+It installs the WASM package from `crates/webtor-wasm/pkg` here, so `bun run
+build` comes first.
 
 The worker takes its Tor directory from a backend, over two plain HTTP URLs
-any server can answer (the contract is in the gateway's README), so every
-onion's worker shares one cached copy instead of storing forty megabytes per
-origin. [`examples/directory-server`](examples/directory-server) is a backend
-that answers them: a Rust binary that builds a seed from a directory authority,
-rebuilds it as each hourly consensus is published, and serves it. Its
-`snapshot` subcommand is also what `bun run seed` runs.
-[`examples/directory-server-ts`](examples/directory-server-ts) answers the
-same contract from TypeScript with no refresh loop: `bun run tor:directory`
-builds a seed into a directory on disk whenever you choose, and a small Bun
-server answers from whatever is there. The other examples build their
-`public/tor-directory.json` with the same script.
+any server can answer (the contract is in the gateway's README), and that
+repository holds two backends. `directory-server` is a Rust binary that builds
+a seed from a directory authority, rebuilds it as each hourly consensus is
+published, and serves it; it depends on `webtor-core` here by path, and its
+`snapshot` subcommand is what `bun run seed` runs. `directory-server-ts`
+answers the same contract from TypeScript with no refresh loop, and the
+examples here build their `public/tor-directory.json` with its build script.
 
 ## Releases
 
