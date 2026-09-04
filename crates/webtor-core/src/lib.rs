@@ -42,7 +42,7 @@ pub use client::TorClient;
 pub use directory::{describe_directory, DirectoryDescription};
 pub use onion_service::{OnionService, OnionServiceOptions};
 pub use onion_url::{is_onion_host, OnionUrl};
-pub use onion_websocket::{WebSocketMessage, WebSocketReader, WebSocketWriter};
+pub use onion_websocket::{WebSocketConnection, WebSocketMessage, WebSocketReader, WebSocketWriter};
 pub use config::{BridgeType, LogType, TorClientOptions};
 pub use error::{Result, TorError};
 pub use http::{HttpRequest, HttpResponse, DEFAULT_MAX_RESPONSE_BYTES};

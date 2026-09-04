@@ -50,6 +50,7 @@ export interface FetchOptions {
 }
 
 export interface WebSocketOptions {
+  headers?: Record<string, string>;
   maxMessageBytes?: number;
   timeoutMs?: number;
 }
