@@ -196,6 +196,16 @@ through an onion relay. It uses separate subscriber and publisher streams,
 requires the relay's positive publication acknowledgement, and verifies the
 signed event received by the subscriber.
 
+## Browser onion gateway
+
+[`examples/onion-gateway`](examples/onion-gateway) browses static onion sites
+through a service worker, the way the IPFS service-worker gateway browses
+IPFS: `http://<address>.onion.intor.localhost:5173/path` gives each onion an
+origin of its own, and a worker on that origin bootstraps a Tor client and
+answers every request there from the onion. It shows the client running where
+there is no `window`, and a page's whole load — document, styles, images,
+scripts — arriving over one kept rendezvous circuit.
+
 ## Releases
 
 The wasm-pack output is published as a `.tgz` asset on a GitHub release:
