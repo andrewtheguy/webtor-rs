@@ -406,7 +406,8 @@ impl WebtorClient {
     ///
     /// Options: `headers` on the upgrade request (a `Cookie`, an `Origin`, a
     /// `Sec-WebSocket-Protocol`; the ones the upgrade itself needs are set
-    /// here and refused), `maxMessageBytes` (default 1048576) and `timeoutMs`
+    /// here and refused, as is `Sec-WebSocket-Extensions`, since the client
+    /// speaks plain frames only), `maxMessageBytes` (default 1048576) and `timeoutMs`
     /// (default 240000, covering the onion stream and the upgrade on it).
     #[wasm_bindgen(js_name = connectWebSocket)]
     pub fn connect_websocket(

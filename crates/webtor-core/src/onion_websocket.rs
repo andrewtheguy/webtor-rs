@@ -18,13 +18,17 @@ use tor_proto::client::stream::{DataReader, DataStream, DataWriter};
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const MAX_HANDSHAKE_BYTES: usize = 16 * 1024;
 
-/// Headers the upgrade sets itself; a caller may not supply them.
-const RESERVED_HEADERS: [&str; 7] = [
+/// Headers the upgrade sets itself, or must not be set at all, so a caller
+/// may not supply them. `Sec-WebSocket-Extensions` is here because the
+/// reader speaks plain frames only: an extension the service agreed to would
+/// change the framing, or compress the payloads, without it knowing.
+const RESERVED_HEADERS: [&str; 8] = [
     "host",
     "upgrade",
     "connection",
     "sec-websocket-key",
     "sec-websocket-version",
+    "sec-websocket-extensions",
     "content-length",
     "transfer-encoding",
 ];
@@ -75,6 +79,11 @@ fn ws_error(context: &str, detail: impl std::fmt::Display) -> TorError {
     TorError::websocket_connection(format!("{context}: {detail}"))
 }
 
+/// RFC 9110 §5.6.2's `tchar`: the bytes a header name may be made of.
+fn is_tchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
 /// The upgrade request for `url`: RFC 6455 §4.1's line and four headers,
 /// then `headers`, which is where a `Cookie`, an `Origin` or a
 /// `Sec-WebSocket-Protocol` goes. A header that would break the line
@@ -90,9 +99,15 @@ fn upgrade_request(url: &OnionUrl, key: &str, headers: &[(String, String)]) -> R
         url.path_and_query()
     );
     for (name, value) in headers {
-        // A newline in either half would let a caller inject headers, or a
-        // whole second request, into the stream.
-        if name.contains(['\r', '\n', ':']) || value.contains(['\r', '\n']) {
+        // A name that is not a token, or a newline in the value, would let a
+        // caller inject headers, or a whole second request, into the stream.
+        if name.is_empty() || !name.bytes().all(is_tchar) {
+            return Err(ws_error(
+                "WebSocket upgrade refused",
+                format!("header name {name:?} is not a token"),
+            ));
+        }
+        if value.contains(['\r', '\n']) {
             return Err(ws_error(
                 "WebSocket upgrade refused",
                 format!("header {name} contains a line break"),
@@ -405,7 +420,7 @@ mod tests {
     #[test]
     fn upgrade_request_refuses_a_header_the_upgrade_sets() {
         let url = OnionUrl::parse(ONION).unwrap();
-        for name in ["Host", "upgrade", "Sec-WebSocket-Key", "CONNECTION"] {
+        for name in ["Host", "upgrade", "Sec-WebSocket-Key", "CONNECTION", "Sec-WebSocket-Extensions"] {
             let error = upgrade_request(&url, "key", &pairs(&[(name, "x")])).unwrap_err();
             assert!(error.to_string().contains("set by the upgrade"), "{name}: {error}");
         }
@@ -416,7 +431,15 @@ mod tests {
         let url = OnionUrl::parse(ONION).unwrap();
         let error = upgrade_request(&url, "key", &pairs(&[("Cookie", "a\r\nHost: evil")])).unwrap_err();
         assert!(error.to_string().contains("line break"), "{error}");
-        let error = upgrade_request(&url, "key", &pairs(&[("Bad:Name", "x")])).unwrap_err();
-        assert!(error.to_string().contains("line break"), "{error}");
+    }
+
+    #[test]
+    fn upgrade_request_refuses_a_name_that_is_not_a_token() {
+        let url = OnionUrl::parse(ONION).unwrap();
+        for name in ["", "Bad:Name", "Bad Name", "Bad\r\nName", "Bad\"Name", "Bäd", "Bad\u{7f}"] {
+            let error = upgrade_request(&url, "key", &pairs(&[(name, "x")])).unwrap_err();
+            assert!(error.to_string().contains("not a token"), "{name:?}: {error}");
+        }
+        upgrade_request(&url, "key", &pairs(&[("X-Ok_Name.1!#$%&'*+^`|~", "x")])).unwrap();
     }
 }

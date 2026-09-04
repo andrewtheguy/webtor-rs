@@ -96,7 +96,8 @@ caller's question, and no third-party address is compiled into the wasm.
   `headers`, put on the upgrade request after the ones the upgrade itself
   needs — a `Cookie`, an `Origin`, a `Sec-WebSocket-Protocol`; `Host`,
   `Upgrade`, `Connection` and the `Sec-WebSocket-Key` and `-Version` are the
-  client's and refused — `maxMessageBytes` (default 1048576) and `timeoutMs`
+  client's and refused, as is `Sec-WebSocket-Extensions`, since the client
+  speaks plain frames only — `maxMessageBytes` (default 1048576) and `timeoutMs`
   (default 240000). The socket has `headers`, a `Headers` of what the
   service answered the upgrade with (`Sec-WebSocket-Protocol` for the
   subprotocol it chose, `getSetCookie()` for cookies it set), `send(text)`,
