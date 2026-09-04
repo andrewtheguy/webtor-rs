@@ -208,6 +208,20 @@ describe('webtor-wasm over Tor', () => {
     assert.equal(result.ok, false);
   }, CASE_TIMEOUT);
 
+  it('refuses a response past maxResponseBytes', async () => {
+    // The limit is the request's own: a page that would fit any default is
+    // refused when this request asks for less than it, and the error names the
+    // number so a caller can tell the limit from a truncated transfer.
+    await assert.rejects(
+      () =>
+        harness.call('fetch', HTTP_TARGETS[0], {
+          timeoutMs: ATTEMPT_TIMEOUT_MS,
+          maxResponseBytes: 1024,
+        }),
+      /1024-byte limit/,
+    );
+  }, CASE_TIMEOUT);
+
   it('sends caller-supplied headers', async () => {
     // Nostr relays answer `GET /` with NIP-11 JSON when the Accept header asks
     // for it, and with something else when it does not — so a JSON body here

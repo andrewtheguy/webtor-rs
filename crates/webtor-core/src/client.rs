@@ -98,7 +98,7 @@ impl TorClient {
         }
         let wire = build_request(&request, request.url.host())?;
         let mut stream = self.open_stream(&request.url).await?;
-        execute_request(&mut stream, &wire).await
+        execute_request(&mut stream, &wire, request.max_response_bytes).await
     }
 
     /// Open a raw stream to the URL's onion service and port.

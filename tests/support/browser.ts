@@ -44,6 +44,7 @@ export interface CreateOptions {
 export interface FetchOptions {
   body?: Uint8Array | string;
   headers?: Record<string, string>;
+  maxResponseBytes?: number;
   method?: string;
   timeoutMs?: number;
 }

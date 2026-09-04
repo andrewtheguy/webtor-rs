@@ -85,7 +85,10 @@ caller's question, and no third-party address is compiled into the wasm.
 
 - `fetch(url, options?)` — one HTTP/1.1 request to `http://<address>.onion`.
   Options: `method` (default `"GET"`), `headers`, `body` (string or
-  `Uint8Array`), `timeoutMs` (default 240000). Resolves to an `OnionResponse`
+  `Uint8Array`), `timeoutMs` (default 240000), `maxResponseBytes` (default
+  8388608). The response is buffered whole before it is returned, and
+  `maxResponseBytes` is the most that buffer may hold, headers and body
+  together, before the request fails instead. Resolves to an `OnionResponse`
   with `status`, `ok`, `headers`, `bytes()` and `text()`. A 4xx or 5xx is a
   response, not a rejection.
 - `connectWebSocket(url, options?)` — RFC 6455 over an onion stream. Options:
@@ -195,6 +198,16 @@ project that loads the local WASM build and performs a live Nostr round trip
 through an onion relay. It uses separate subscriber and publisher streams,
 requires the relay's positive publication acknowledgement, and verifies the
 signed event received by the subscriber.
+
+## Browser onion gateway
+
+[`examples/onion-gateway`](examples/onion-gateway) browses static onion sites
+through a service worker, the way the IPFS service-worker gateway browses
+IPFS: `http://<address>.onion.intor.localhost:5173/path` gives each onion an
+origin of its own, and a worker on that origin bootstraps a Tor client and
+answers every request there from the onion. It shows the client running where
+there is no `window`, and a page's whole load — document, styles, images,
+scripts — arriving over one kept rendezvous circuit.
 
 ## Releases
 

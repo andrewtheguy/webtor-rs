@@ -8,10 +8,11 @@ use std::collections::HashMap;
 use crate::onion_url::OnionUrl;
 use tracing::debug;
 
-/// A whole response is buffered in memory before the caller sees it, so this
-/// bounds what one request can cost. Callers streaming anything larger have to
-/// range-request it in pieces.
-const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+/// A whole response is buffered in memory before the caller sees it, so a
+/// request carries a bound on what it may cost. This is the bound when the
+/// caller names none; one expecting more, a gateway serving a download, say,
+/// raises it for that request rather than for every request.
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Sent when the caller supplies no `User-Agent` of its own.
 const DEFAULT_USER_AGENT: &str = concat!("webtor/", env!("CARGO_PKG_VERSION"));
@@ -31,6 +32,9 @@ pub struct HttpRequest {
     pub url: OnionUrl,
     pub headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
+    /// The most the response, headers and body together, may occupy before
+    /// the request fails rather than buffer more.
+    pub max_response_bytes: usize,
 }
 
 impl HttpRequest {
@@ -40,6 +44,7 @@ impl HttpRequest {
             url,
             headers: vec![("Accept".to_string(), "*/*".to_string())],
             body: None,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         }
     }
 }
@@ -94,7 +99,11 @@ pub(crate) fn build_request(request: &HttpRequest, host: &str) -> Result<Vec<u8>
     Ok(wire)
 }
 
-pub(crate) async fn execute_request<S>(stream: &mut S, request: &[u8]) -> Result<HttpResponse>
+pub(crate) async fn execute_request<S>(
+    stream: &mut S,
+    request: &[u8],
+    max_response_bytes: usize,
+) -> Result<HttpResponse>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -121,10 +130,14 @@ where
         if count == 0 {
             break;
         }
-        response.extend_from_slice(&buffer[..count]);
-        if response.len() > MAX_RESPONSE_BYTES {
-            return Err(TorError::http_request("HTTP response exceeds 8 MiB"));
+        // Checked before appending, so the buffer never holds more than the
+        // limit, not even for the one read that crosses it.
+        if count > max_response_bytes - response.len() {
+            return Err(TorError::http_request(format!(
+                "HTTP response exceeds the {max_response_bytes}-byte limit on a response"
+            )));
         }
+        response.extend_from_slice(&buffer[..count]);
         if framing.is_none() {
             framing = split_headers(&response).map(|(header_end, headers)| {
                 body_framing(header_end, &headers)
@@ -282,9 +295,6 @@ fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>> {
             return Err(TorError::http_request("Incomplete HTTP chunk"));
         }
         decoded.extend_from_slice(&remaining[..size]);
-        if decoded.len() > MAX_RESPONSE_BYTES {
-            return Err(TorError::http_request("Decoded HTTP response exceeds 8 MiB"));
-        }
         remaining = &remaining[size + 2..];
     }
 }
@@ -348,6 +358,7 @@ mod tests {
             url,
             headers: vec![("user-agent".to_string(), "curl/8".to_string())],
             body: None,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         };
         let wire = String::from_utf8(build_request(&request, "example.onion").unwrap()).unwrap();
         assert!(wire.contains("user-agent: curl/8\r\n"));
@@ -361,6 +372,7 @@ mod tests {
             url: OnionUrl::parse("http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/upload").unwrap(),
             headers: vec![("Content-Type".to_string(), "text/plain".to_string())],
             body: Some(b"hello".to_vec()),
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         };
         let wire = String::from_utf8(build_request(&request, "example.org").unwrap()).unwrap();
         assert!(wire.starts_with("PUT /upload HTTP/1.1\r\n"));
@@ -376,6 +388,7 @@ mod tests {
             url: OnionUrl::parse("http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/").unwrap(),
             headers: vec![("X-Evil".to_string(), "a\r\nX-Injected: 1".to_string())],
             body: None,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         };
         let error = build_request(&request, "example.org").unwrap_err();
         assert!(error.to_string().contains("line break"));
@@ -388,6 +401,7 @@ mod tests {
             url: OnionUrl::parse("http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/").unwrap(),
             headers: vec![("content-length".to_string(), "9".to_string())],
             body: Some(b"hello".to_vec()),
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         };
         let error = build_request(&request, "example.org").unwrap_err();
         assert!(error.to_string().contains("cannot be supplied"));
@@ -409,6 +423,27 @@ mod tests {
         assert_eq!(
             response.headers().get("location").map(String::as_str),
             Some("http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/a")
+        );
+    }
+
+    /// Run one exchange over an in-memory stream: the request is written over
+    /// the zeroed prefix, and what follows it is read back as the response.
+    fn exchange(response: &[u8], max_response_bytes: usize) -> Result<HttpResponse> {
+        let wire = b"GET / HTTP/1.1\r\n\r\n";
+        let mut data = vec![0_u8; wire.len()];
+        data.extend_from_slice(response);
+        let mut stream = futures::io::Cursor::new(data);
+        futures::executor::block_on(execute_request(&mut stream, wire, max_response_bytes))
+    }
+
+    #[test]
+    fn the_response_limit_is_the_requests_own() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        assert_eq!(exchange(response, response.len()).unwrap().bytes(), b"hello");
+        let error = exchange(response, response.len() - 1).unwrap_err();
+        assert!(
+            error.to_string().contains(&format!("{}-byte limit", response.len() - 1)),
+            "{error}"
         );
     }
 
