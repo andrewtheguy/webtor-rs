@@ -107,6 +107,8 @@ cookies, storage, and worker.
   URLs, since the document's origin is the gateway's.
 - **Ports.** The onion's port 80 only; the port in the gateway URL is the
   gateway's.
+- **Size.** A response is buffered whole in the worker before the page sees
+  any of it, up to 256 MiB; anything larger fails with a `502`.
 
 ## Limits
 

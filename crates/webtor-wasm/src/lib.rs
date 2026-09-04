@@ -24,6 +24,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 use futures::{AsyncReadExt, AsyncWriteExt};
 use webtor_core::{
+    DEFAULT_MAX_RESPONSE_BYTES,
     onion_websocket, DataReader, DataWriter, HttpRequest, HttpResponse, LogType, OnionService,
     OnionServiceOptions, OnionUrl, TorClient, TorClientOptions, WebSocketMessage,
     WebSocketReader, WebSocketWriter,
@@ -48,7 +49,7 @@ const CLIENT_OPTIONS: &[&str] = &[
     "onLog",
     "onDirectoryChange",
 ];
-const REQUEST_OPTIONS: &[&str] = &["method", "headers", "body", "timeoutMs"];
+const REQUEST_OPTIONS: &[&str] = &["method", "headers", "body", "timeoutMs", "maxResponseBytes"];
 const WEBSOCKET_OPTIONS: &[&str] = &["maxMessageBytes", "timeoutMs"];
 const SERVICE_OPTIONS: &[&str] = &["introPoints"];
 
@@ -370,7 +371,8 @@ impl WebtorClient {
     /// Issue one HTTP/1.1 request to `http://<address>.onion[:port][/path]`.
     ///
     /// Options: `method` (default `"GET"`), `headers`, `body` (a string or a
-    /// `Uint8Array`) and `timeoutMs` (default 240000).
+    /// `Uint8Array`), `timeoutMs` (default 240000) and `maxResponseBytes`
+    /// (default 8388608), which is the most the buffered response may occupy.
     #[wasm_bindgen(js_name = fetch)]
     pub fn fetch(&self, url: String, options: Option<js_sys::Object>) -> js_sys::Promise {
         let client = self.client.clone();
@@ -382,6 +384,10 @@ impl WebtorClient {
                 url: OnionUrl::parse(&url).map_err(option_error)?,
                 headers: options::string_map(&bag, "headers", "fetch")?,
                 body: options::body(&bag, "body", "fetch")?,
+                max_response_bytes: options::count(&bag, "maxResponseBytes", "fetch")?
+                    .map_or(DEFAULT_MAX_RESPONSE_BYTES, |bytes| {
+                        usize::try_from(bytes).unwrap_or(usize::MAX)
+                    }),
             };
             let timeout = options::count(&bag, "timeoutMs", "fetch")?
                 .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS);

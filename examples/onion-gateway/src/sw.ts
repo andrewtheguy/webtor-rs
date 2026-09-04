@@ -29,6 +29,13 @@ declare const self: ServiceWorkerGlobalScope;
 const REQUEST_TIMEOUT_MS = 240_000;
 
 /**
+ * The most one response may occupy. The client buffers a response whole, and
+ * its own default of 8 MiB is sized for an API call; a static site's
+ * downloads run larger, and this worker has nothing else to hold in memory.
+ */
+const MAX_RESPONSE_BYTES = 256 * 1024 * 1024;
+
+/**
  * Request headers worth carrying to the onion. Conditional headers are not
  * among them: a `304` carries a `Content-Length` and no body, which the
  * client would wait on until the stream ended.
@@ -295,6 +302,7 @@ async function answer(request: Request, target: string): Promise<Response> {
     const upstream: Upstream = await tor.fetch(target, {
       headers,
       timeoutMs: REQUEST_TIMEOUT_MS,
+      maxResponseBytes: MAX_RESPONSE_BYTES,
     });
     return toResponse(upstream, target, request.method === 'HEAD');
   } catch (error) {

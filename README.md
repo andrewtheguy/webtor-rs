@@ -85,7 +85,10 @@ caller's question, and no third-party address is compiled into the wasm.
 
 - `fetch(url, options?)` — one HTTP/1.1 request to `http://<address>.onion`.
   Options: `method` (default `"GET"`), `headers`, `body` (string or
-  `Uint8Array`), `timeoutMs` (default 240000). Resolves to an `OnionResponse`
+  `Uint8Array`), `timeoutMs` (default 240000), `maxResponseBytes` (default
+  8388608). The response is buffered whole before it is returned, and
+  `maxResponseBytes` is the most that buffer may hold, headers and body
+  together, before the request fails instead. Resolves to an `OnionResponse`
   with `status`, `ok`, `headers`, `bytes()` and `text()`. A 4xx or 5xx is a
   response, not a rejection.
 - `connectWebSocket(url, options?)` — RFC 6455 over an onion stream. Options:
