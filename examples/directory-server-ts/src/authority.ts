@@ -121,7 +121,11 @@ export class Authorities {
     return assembleSeed(consensus, summary, certificates, microdescriptors);
   }
 
-  /** The documents at `paths`, concatenated in order, a few requests at a time. */
+  /**
+   * The documents at `paths`, concatenated in order, a few requests at a time.
+   * A batch no authority serves is left out rather than failing the fetch:
+   * whether the shortfall is acceptable is `buildSeed`'s floor to judge.
+   */
   private async fetchAll(paths: string[], log: Log): Promise<string> {
     const bodies: string[] = new Array(paths.length).fill('');
     let next = 0;
@@ -129,7 +133,13 @@ export class Authorities {
     const worker = async () => {
       while (next < paths.length) {
         const index = next++;
-        bodies[index] = await this.get(`${paths[index]}.z`);
+        try {
+          bodies[index] = withTrailingNewline(await this.get(`${paths[index]}.z`));
+        } catch (error: unknown) {
+          log(
+            `Microdescriptor batch ${index + 1}/${paths.length} failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
         done++;
         if (done % 20 === 0 || done === paths.length) {
           log(`Fetched microdescriptor batch ${done}/${paths.length}`);
@@ -139,4 +149,12 @@ export class Authorities {
     await Promise.all(Array.from({ length: Math.min(PARALLEL_REQUESTS, paths.length) }, worker));
     return bodies.join('');
   }
+}
+
+/**
+ * Documents are concatenated, and each is line-based, so a body that does
+ * not end its last line would glue it to the next document's first.
+ */
+function withTrailingNewline(body: string): string {
+  return body === '' || body.endsWith('\n') ? body : `${body}\n`;
 }

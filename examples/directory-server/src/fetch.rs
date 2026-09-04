@@ -129,10 +129,19 @@ impl Authorities {
             .map(|chunk| format!("{}.z", VerifiedConsensus::microdescriptors_path(chunk)))
             .collect();
         let bodies: Vec<String> = stream::iter(paths)
-            .map(|path| async move { self.get(&path).await })
+            .map(|path| async move { self.get(&path).await.map(with_trailing_newline) })
             .buffer_unordered(PARALLEL_REQUESTS)
             .try_collect()
             .await?;
         Ok(bodies.concat())
     }
+}
+
+/// Documents are concatenated, and each is line-based, so a body that does
+/// not end its last line would glue it to the next document's first.
+fn with_trailing_newline(mut body: String) -> String {
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body
 }

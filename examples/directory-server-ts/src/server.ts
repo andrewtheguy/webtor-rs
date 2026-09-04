@@ -46,7 +46,7 @@ export function createHandler(options: ServerOptions): (request: Request) => Pro
       if (request.method !== 'GET' && request.method !== 'HEAD') {
         return json(request, { error: 'method not allowed' }, { status: 405, headers: CORS });
       }
-      if (url.pathname === '/api/health') return json(request, { ok: true });
+      if (url.pathname === '/api/health') return json(request, { ok: true }, { headers: CORS });
       if (url.pathname === DIRECTORY_PATH) return manifest(request);
       if (url.pathname.startsWith(`${DIRECTORY_PATH}/`)) {
         return seed(request, url.pathname.slice(DIRECTORY_PATH.length + 1));
@@ -120,7 +120,14 @@ function maxAgeFor(manifest: Manifest | null, now: Date): number {
 
 /** A file under `root`, or `index.html` for anything that is not one. */
 async function serveStatic(request: Request, root: string, pathname: string): Promise<Response> {
-  const relative = path.posix.normalize(decodeURIComponent(pathname)).replace(/^\/+/, '');
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    // A stray `%` is not a path in this site, or any.
+    return new Response('not found', { status: 404 });
+  }
+  const relative = path.posix.normalize(decoded).replace(/^\/+/, '');
   const resolved = path.resolve(root, relative);
   const inside = resolved === path.resolve(root) || resolved.startsWith(path.resolve(root) + path.sep);
   const isFile = inside && (await fs.stat(resolved).then((s) => s.isFile(), () => false));

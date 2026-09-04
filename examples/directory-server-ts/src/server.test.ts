@@ -185,6 +185,12 @@ describe('the rest of the site', () => {
   it('answers 404 under /api for what is not an endpoint, and 405 for other methods', async () => {
     expect((await get('/api/nothing')).status).toBe(404);
     expect((await get(DIRECTORY_PATH, { method: 'POST' })).status).toBe(405);
-    expect((await get('/api/health')).status).toBe(200);
+    const health = await get('/api/health');
+    expect(health.status).toBe(200);
+    expect(health.headers.get('access-control-allow-origin')).toBe('*');
+  });
+
+  it('answers 404, not an error, to a path that does not decode', async () => {
+    expect((await get('/%E0%A4%A')).status).toBe(404);
   });
 });
