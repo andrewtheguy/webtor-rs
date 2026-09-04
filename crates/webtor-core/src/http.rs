@@ -130,12 +130,14 @@ where
         if count == 0 {
             break;
         }
-        response.extend_from_slice(&buffer[..count]);
-        if response.len() > max_response_bytes {
+        // Checked before appending, so the buffer never holds more than the
+        // limit, not even for the one read that crosses it.
+        if count > max_response_bytes - response.len() {
             return Err(TorError::http_request(format!(
                 "HTTP response exceeds the {max_response_bytes}-byte limit on a response"
             )));
         }
+        response.extend_from_slice(&buffer[..count]);
         if framing.is_none() {
             framing = split_headers(&response).map(|(header_end, headers)| {
                 body_framing(header_end, &headers)

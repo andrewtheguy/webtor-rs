@@ -57,6 +57,13 @@ const BODYLESS_STATUSES = new Set([101, 204, 205, 304]);
 const DECODABLE_ENCODINGS = new Set(['gzip', 'deflate', 'deflate-raw']);
 
 /**
+ * What the onion is told it may compress with: the codings above and nothing
+ * else, so a `br` or `zstd` body the worker could not undo never arrives.
+ * (`deflate-raw` is a `DecompressionStream` format, not an HTTP coding.)
+ */
+const ACCEPT_ENCODING = 'gzip, deflate';
+
+/**
  * A bridge to use instead of the public one, from `.env.local`:
  *
  *   VITE_BRIDGE_URL=ws://localhost:8080/
@@ -295,6 +302,9 @@ async function answer(request: Request, target: string): Promise<Response> {
     const value = request.headers.get(name);
     if (value !== null) headers[name] = value;
   }
+  // The browser's own `Accept-Encoding` is not exposed to a worker, and what
+  // it would ask for includes codings the worker cannot decode.
+  headers['accept-encoding'] = ACCEPT_ENCODING;
 
   try {
     // Always a GET on the wire: the client frames a response by its
