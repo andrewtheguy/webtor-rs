@@ -61,6 +61,28 @@ included, hosts it. As in the other examples, `VITE_BRIDGE_URL` and
 `VITE_BRIDGE_FINGERPRINT` in `.env.local` point the client at a bridge of your
 own, such as `scripts/local-bridge`.
 
+## Test it
+
+`bun run test` checks the cookie jar's rules without a browser. `bun run
+test:e2e` is the gateway itself, in headless Chrome, against the dynamic
+sample site that `scripts/local-onion` publishes as an onion service: the
+install, the bootstrap page, the site's first page, a reload that carries the
+cookie it set, a form sign-in answered with a `303` and a session cookie, a
+script's `fetch` whose `Origin`, `Referer` and `Cookie` arrive in the onion's
+terms, and a sign-out. It starts Vite on a port of its own and reads
+`SAMPLE_ONION` from the environment, plus `BRIDGE_URL` and
+`BRIDGE_FINGERPRINT` for a bridge of your own, which it hands to the worker
+as the `VITE_` variables:
+
+```bash
+bun run build                                    # at the repository root
+scripts/local-onion/onion.sh start && eval "$(scripts/local-onion/onion.sh env)"
+scripts/local-bridge/bridge.sh start && eval "$(scripts/local-bridge/bridge.sh env)"
+cd examples/onion-gateway && bun run test:e2e
+```
+
+`CHROME_PATH` names the browser, as for the suites under `tests/`.
+
 ## How a request travels
 
 1. **Landing.** `http://intor.localhost:5173/` is a page with an address field.

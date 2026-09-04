@@ -159,6 +159,7 @@ bun run build     # wasm-pack the package into crates/webtor-wasm/pkg/
 bun run test      # API suite: URL helpers and option validation, no network
 bun run seed      # fetch a directory snapshot to tests/.directory-seed.json
 bun run test:live # end to end against public onion services
+bun run test:dynamic # end to end against a dynamic onion site of our own, see below
 ```
 
 `bun run test:interop` checks the two halves against a second implementation:
@@ -175,6 +176,20 @@ bun run test:interop
 
 `ONION_CLI` overrides the binary and `ONLY=client` or `ONLY=server` runs one
 direction.
+
+`bun run test:dynamic` needs a site that does what the public onion sites do
+not — takes a `POST`, sets cookies, redirects — and
+[`scripts/local-onion`](scripts/local-onion) runs one in a container behind a
+Tor onion service of its own:
+
+```bash
+scripts/local-onion/onion.sh start && eval "$(scripts/local-onion/onion.sh env)"
+bun run test:dynamic
+```
+
+The onion gateway example has a browser test against the same site, `bun run
+test:e2e` in `examples/onion-gateway`, which drives the service worker from
+the install through a form sign-in.
 
 The repository pins its Bun version in `package.json`. `bun run test` is a
 second or two. `bun run test:live` bootstraps a real Tor client
@@ -240,7 +255,7 @@ reference/         native peers webtor is tested *against*, each its own workspa
 docs/              architecture, network-observation notes, and the roadmap
 tests/             the browser test project
 examples/          standalone browser integrations, over a shared seed store
-scripts/           the SOCKS-based probe and an opt-in local WebSocket bridge
+scripts/           the SOCKS-based probe, a local WebSocket bridge and a dynamic onion site, both in containers
 ```
 
 `reference/` is excluded from the root workspace rather than being a member of

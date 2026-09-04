@@ -1,0 +1,17 @@
+# The sample dynamic site behind a Tor onion service, for testing webtor and
+# the onion gateway against forms, cookies and redirects. Bun runs the site
+# and a plain tor client publishes it; the address is new on every start.
+
+FROM docker.io/oven/bun:1-debian
+
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tor \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY server.ts /opt/sample/server.ts
+COPY torrc /etc/tor/torrc
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

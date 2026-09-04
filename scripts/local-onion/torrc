@@ -1,0 +1,13 @@
+# A Tor client that publishes one onion service, forwarding its port 80 to
+# the sample site in scripts/local-onion/server.ts. A test rig: the address is
+# new on every start and reachable by whoever is told it, which is the point.
+
+User debian-tor
+DataDirectory /var/lib/tor
+Log notice stdout
+
+# Nothing here makes outgoing requests through this tor.
+SocksPort 0
+
+HiddenServiceDir /var/lib/tor/onion
+HiddenServicePort 80 127.0.0.1:8000

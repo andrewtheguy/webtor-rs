@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "typecheck": "tsc -b",
     "tor:directory": "bun ../../tests/tools/fetch-directory.ts public/tor-directory.json",
-    "test": "bun test src"
+    "test": "bun test src",
+    "test:e2e": "bun test --timeout 600000 e2e"
   },
   "dependencies": {
     "@andrewtheguy/webtor-wasm": "file:../../crates/webtor-wasm/pkg",
@@ -23,6 +24,7 @@
     "@types/react": "^19.2.5",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.1.1",
+    "playwright-core": "^1.50.0",
     "typescript": "~5.9.3",
     "vite": "^7.2.4"
   }

@@ -14,6 +14,7 @@ bun run build      # required first: the harness imports crates/webtor-wasm/pkg/
 bun run test       # tests/api.test.ts    — no network, ~1s
 bun run seed       # a directory snapshot, ~40 MiB, valid three hours
 bun run test:live  # tests/live.test.ts   — real onion services, ~1 minute
+bun run test:dynamic  # tests/dynamic.test.ts — a dynamic onion site of our own, ~1 minute
 bun run test:interop  # tools/interop-cli.ts — against onion-cli-poc, ~1 minute
 ```
 
@@ -21,7 +22,7 @@ bun run test:interop  # tools/interop-cli.ts — against onion-cli-poc, ~1 minut
 `/usr/bin/google-chrome`). `playwright-core` ships no browser of its own, which
 is why it needs one already installed.
 
-## The three suites
+## The four suites
 
 **`api.test.ts`** covers what answers without a circuit: `isOnionHost`,
 `parseOnionUrl`, `describeDirectory` against the consensus fixture in
@@ -39,6 +40,22 @@ that a closed client refuses work. The first case to reach a service builds
 its rendezvous — around five seconds — and the ones after it to the same
 service begin streams on that circuit, so the cost of the file is the
 bootstrap plus roughly that per distinct service.
+
+**`dynamic.test.ts`** is the one for what a static site never sends. It runs
+against the sample site in `scripts/local-onion`, a container that publishes a
+small dynamic site as an onion service: a page that sets two cookies at once,
+a form sign-in that answers `303` with a session cookie and refuses a `POST`
+without the right `Origin`, and an `/echo` that returns the request as JSON.
+The cases check that a body goes out with a `POST`, `PUT` or `DELETE`, that
+caller-supplied `Cookie` headers arrive, that a redirect comes back as the
+response it is, and that every `Set-Cookie` header is delivered in order — the
+`headers` getter is a `Headers`, and `getSetCookie()` is what the harness
+reads. `SAMPLE_ONION` names the site, from `onion.sh env`; the first request
+is retried for up to four minutes, since the container's tor publishes the
+descriptor a while after it bootstraps. The onion gateway example has a
+browser test against the same site — `bun run test:e2e` in
+`examples/onion-gateway` — that drives the service worker through the install,
+the bootstrap page, a form sign-in and a script's own request.
 
 **`tools/interop-cli.ts`** is the only one that needs a second implementation:
 `reference/onion-cli-poc`, an Arti-based peer that publishes an ephemeral onion
@@ -59,7 +76,8 @@ is explicit for the same reason:
 cargo build --release --manifest-path reference/onion-cli-poc/Cargo.toml
 ```
 
-Environment: `DIRECTORY_SEED` (default `tests/.directory-seed.json`), `BRIDGE`
+Environment, read by `support/bootstrap.ts` for every suite that bootstraps a
+client: `DIRECTORY_SEED` (default `tests/.directory-seed.json`), `BRIDGE`
 (`websocket` or `webrtc`), `STUN_URLS` (comma-separated, for `webrtc`), and
 `BRIDGE_URL` with `BRIDGE_FINGERPRINT` to use a bridge other than the public
 one. Both or neither: a URL with no identity is a request to trust whatever
