@@ -32,16 +32,34 @@ endpoint() {
     esac
 }
 
+# Whether $1 is a dotted IPv4 loopback literal, 127.x.y.z, and not merely a
+# name that begins with "127.".
+loopback_ipv4() {
+    IFS=. read -r first second third fourth rest <<ADDRESS
+$1
+ADDRESS
+    [ "$first" = 127 ] && [ -z "$rest" ] || return 1
+    for octet in "$second" "$third" "$fourth"; do
+        case "$octet" in
+            ''|*[!0-9]*) return 1 ;;
+        esac
+        [ "$octet" -le 255 ] || return 1
+    done
+}
+
 # Refuse an engine on another machine. `$1` says what would go wrong there:
 # a port published on that host's loopback is unreachable from this one.
 require_local_engine() {
     host=$(endpoint)
     case "$host" in
-        ""|unix://*|npipe://*|tcp://localhost:*|tcp://127.*) ;;
-        *)
-            echo "$ENGINE talks to $host, not to this machine: $1" >&2
-            echo "Point the engine at a local endpoint." >&2
-            exit 1
+        ""|unix://*|npipe://*|tcp://localhost:*|"tcp://[::1]:"*) return 0 ;;
+        tcp://127.*)
+            address=${host#tcp://}
+            address=${address%%:*}
+            loopback_ipv4 "$address" && return 0
             ;;
     esac
+    echo "$ENGINE talks to $host, not to this machine: $1" >&2
+    echo "Point the engine at a local endpoint." >&2
+    exit 1
 }

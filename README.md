@@ -255,7 +255,7 @@ reference/         native peers webtor is tested *against*, each its own workspa
 docs/              architecture, network-observation notes, and the roadmap
 tests/             the browser test project
 examples/          standalone browser integrations, over a shared seed store
-scripts/           the SOCKS-based probe, a local WebSocket bridge and a dynamic onion site, both in containers
+scripts/           the SOCKS-based probe, plus a local WebSocket bridge and a dynamic onion site, each in a container
 ```
 
 `reference/` is excluded from the root workspace rather than being a member of

@@ -91,7 +91,11 @@ async function startVite(port: number): Promise<ChildProcess> {
     } catch {
       // Not listening yet.
     }
-    if (Date.now() > deadline) throw new Error('vite did not start listening in 30s');
+    if (Date.now() > deadline) {
+      // Nothing else holds the process once this throws, so it goes here.
+      vite.kill();
+      throw new Error('vite did not start listening in 30s');
+    }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
 }
