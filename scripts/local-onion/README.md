@@ -10,9 +10,9 @@ publishing one onion service, and behind it the small dynamic site in
 refuses a cross-site `POST`, and echoes any request back as JSON.
 
 Two suites use it. `bun run test:dynamic` at the repository root drives the
-`WebtorClient` API against it directly, and `bun run test:e2e` in
-`examples/onion-gateway` opens it in headless Chrome through the service
-worker gateway.
+`WebtorClient` API against it directly, and `bun run test:e2e` in the
+`onion-gateway` repository's `gateway` directory opens it in headless Chrome
+through the service worker gateway.
 
 ## Run it
 

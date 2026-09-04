@@ -10,7 +10,7 @@
     "test:live": "bun test --timeout 600000 ./tests/live.test.ts",
     "test:dynamic": "bun test --timeout 600000 ./tests/dynamic.test.ts",
     "test:interop": "bun ./tests/tools/interop-cli.ts",
-    "seed": "cargo run -q -p webtor-directory-server -- snapshot tests/.directory-seed.json",
+    "seed": "bun run ./tests/tools/fetch-directory.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
