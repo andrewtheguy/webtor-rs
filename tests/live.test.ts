@@ -4,31 +4,14 @@
 //   bun run build && bun run seed && bun run test:live
 //
 // Environment:
-//   DIRECTORY_SEED  path to a directory snapshot (default
-//                   tests/.directory-seed.json, written by `bun run seed`).
-//                   Without one the bootstrap downloads every HSDir
-//                   microdescriptor over a single bridge circuit, which takes
-//                   minutes and often exceeds the budget.
-//   BRIDGE          "websocket" (default) or "webrtc"
-//   STUN_URLS       comma-separated, for the webrtc bridge
-//   BRIDGE_URL      a bridge to use instead of the public one, with
-//   BRIDGE_FINGERPRINT  its RSA identity. Both or neither. `scripts/local-bridge`
-//                   runs one on localhost and prints the fingerprint, which
-//                   makes the directory download local instead of a download
-//                   across the public bridge.
 //   CHROME_PATH     Chrome-family binary (default /usr/bin/google-chrome)
+//   and the bootstrap variables described in support/bootstrap.ts: a
+//   directory seed, and a bridge to use instead of the public one.
 
 import assert from 'node:assert/strict';
-import { access } from 'node:fs/promises';
-import { constants } from 'node:fs';
-import { relative } from 'node:path';
 import { afterAll as after, beforeAll as before, describe, it } from 'bun:test';
-import {
-  openHarness,
-  type BrowserHarness,
-  type CreateOptions,
-} from './support/browser.ts';
-import { REPO_ROOT } from './support/server.ts';
+import { BRIDGE_FINGERPRINT, BRIDGE_URL, clientOptions, seedUrl } from './support/bootstrap.ts';
+import { openHarness, type BrowserHarness } from './support/browser.ts';
 import {
   ATTEMPT_TIMEOUT_MS,
   HTTP_TARGETS,
@@ -36,15 +19,6 @@ import {
   WS_TARGETS,
   firstReachable,
 } from './support/targets.ts';
-
-const SEED_PATH = process.env.DIRECTORY_SEED ?? `${REPO_ROOT}/tests/.directory-seed.json`;
-const BRIDGE = process.env.BRIDGE ?? 'websocket';
-const STUN_URLS = (process.env.STUN_URLS ?? '')
-  .split(',')
-  .map((url) => url.trim())
-  .filter(Boolean);
-const BRIDGE_URL = process.env.BRIDGE_URL;
-const BRIDGE_FINGERPRINT = process.env.BRIDGE_FINGERPRINT;
 
 /** What the WebSocket cases ask a relay for; short, and always answered. */
 const REQUEST = JSON.stringify(['REQ', 'webtor-test', { kinds: [1], limit: 2 }]);
@@ -65,37 +39,12 @@ describe('webtor-wasm over Tor', () => {
       onLog: (line) => console.log(`  ${elapsed().padStart(7)} ${line}`),
     });
 
-    let seedUrl = null;
-    try {
-      await access(SEED_PATH, constants.R_OK);
-      seedUrl = `/${relative(REPO_ROOT, SEED_PATH)}`;
-    } catch {
-      console.log(
-        `  no directory seed at ${SEED_PATH}; bootstrapping from the network. ` +
-          'Run `bun run seed` to make this fast.',
-      );
-    }
-
-    const options: CreateOptions = { bridge: BRIDGE, logPrefix: '[tor]' };
-    if (BRIDGE === 'webrtc') {
-      assert.ok(STUN_URLS.length, 'BRIDGE=webrtc needs STUN_URLS');
-      options.stunUrls = STUN_URLS;
-    }
-    // Half a bridge is not a usable bridge, and the half that is missing
-    // decides whether the run is slow or insecure, so refuse both ways round
-    // rather than falling back to the public one.
-    assert.equal(
-      Boolean(BRIDGE_URL),
-      Boolean(BRIDGE_FINGERPRINT),
-      'BRIDGE_URL and BRIDGE_FINGERPRINT are set together or not at all',
-    );
+    const options = clientOptions('[tor]');
     if (BRIDGE_URL && BRIDGE_FINGERPRINT) {
-      options.bridgeUrl = BRIDGE_URL;
-      options.bridgeFingerprint = BRIDGE_FINGERPRINT;
       console.log(`  using bridge ${BRIDGE_URL} (${BRIDGE_FINGERPRINT})`);
     }
-    seededFrom = seedUrl;
-    const { seconds } = await harness.call('create', options, seedUrl);
+    seededFrom = await seedUrl();
+    const { seconds } = await harness.call('create', options, seededFrom);
     console.log(`  client ready in ${seconds}s`);
 
     // What the binding's `verifyOnion` option used to do before `create`
@@ -374,13 +323,7 @@ describe('webtor-wasm over Tor', () => {
   // gateway too. Two GETs to one service, because the second is meant to
   // begin on the circuit the first built rather than rendezvous again.
   it('runs in a dedicated worker and reuses the circuit to a service', async () => {
-    const options: CreateOptions = { bridge: BRIDGE };
-    if (BRIDGE === 'webrtc') options.stunUrls = STUN_URLS;
-    if (BRIDGE_URL && BRIDGE_FINGERPRINT) {
-      options.bridgeUrl = BRIDGE_URL;
-      options.bridgeFingerprint = BRIDGE_FINGERPRINT;
-    }
-    const created = await harness.call('workerCreate', options, seededFrom);
+    const created = await harness.call('workerCreate', clientOptions(), seededFrom);
     console.log(`  worker client ready in ${created.seconds}s`);
 
     try {

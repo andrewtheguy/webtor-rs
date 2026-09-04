@@ -233,7 +233,10 @@
         return {
           status: response.status,
           ok: response.ok,
-          headers: response.headers,
+          headers: Object.fromEntries(response.headers),
+          // Kept apart: a site sets more than one cookie on one response, and
+          // the map above keeps only the last of a repeated name.
+          setCookies: response.headers.getSetCookie(),
           byteLength: bytes.length,
           text,
           seconds: Number(((performance.now() - started) / 1000).toFixed(1)),

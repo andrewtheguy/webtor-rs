@@ -1,9 +1,10 @@
 // The gateway: a service worker that owns one origin,
 // `http://<address>.onion.<root>`, and answers every request on it by
-// fetching the same path from `http://<address>.onion` over Tor. The Tor
+// making the same request of `http://<address>.onion` over Tor. The Tor
 // client lives in the worker, bootstrapped over Snowflake from a directory
 // the page may have served or a previous run stored; no page on the origin
-// ever sees it, only the responses.
+// ever sees it, only the responses. The onion's cookies live here too, since
+// the browser keeps none for a response a worker made up.
 //
 // Two things a service worker forbids shape this file. `import()` is not
 // allowed here, so the WASM package is imported statically and instantiated
@@ -13,6 +14,7 @@
 import init, { WebtorClient } from '@andrewtheguy/webtor-wasm';
 import webtorWasmUrl from '@andrewtheguy/webtor-wasm/webtor_wasm_bg.wasm?url';
 import { directorySeedStore } from '../../shared/directory-cache';
+import { cookieJar } from './cookies';
 import { gatewayUrl, isOnionHost, parseGatewayHost } from './gateway-host';
 import { bootstrapPage, errorPage } from './gateway-pages';
 import type {
@@ -36,17 +38,54 @@ const REQUEST_TIMEOUT_MS = 240_000;
 const MAX_RESPONSE_BYTES = 256 * 1024 * 1024;
 
 /**
- * Request headers worth carrying to the onion. Conditional headers are not
- * among them: a `304` carries a `Content-Length` and no body, which the
- * client would wait on until the stream ended.
+ * The most a request body may weigh. It is buffered whole here and once more
+ * in the client, so this is a bound on memory, not on what a site may accept.
  */
-const FORWARDED_REQUEST_HEADERS = ['accept', 'accept-language', 'range'];
+const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 
-/** Response headers about the onion connection, not about the content. */
-const CONNECTION_HEADERS = new Set([
+/**
+ * Request headers that are not carried to the onion as the page sent them.
+ * Everything else is: a page's `Content-Type`, `Authorization` or
+ * `X-Requested-With` is what makes its request mean what it means.
+ */
+const DROPPED_REQUEST_HEADERS = new Set([
+  // Set here, from the request itself, in the onion's terms.
+  'accept-encoding',
+  'cookie',
+  'origin',
+  'referer',
+  // Set by the client from the framing it puts on the wire.
+  'host',
+  'content-length',
+  'connection',
+  'transfer-encoding',
+  // Conditional: a `304` carries a `Content-Length` and no body, which the
+  // client would wait on until the stream ended.
+  'if-match',
+  'if-modified-since',
+  'if-none-match',
+  'if-range',
+  'if-unmodified-since',
+  // About a connection this worker is not the end of.
+  'expect',
+  'keep-alive',
+  'proxy-authorization',
+  'proxy-connection',
+  'te',
+  'trailer',
+  'upgrade',
+]);
+
+/**
+ * Response headers not passed to the page: the ones about the onion
+ * connection rather than the content, and `Set-Cookie`, which goes into the
+ * jar here — the browser would drop it from a worker's response anyway.
+ */
+const WITHHELD_RESPONSE_HEADERS = new Set([
   'connection',
   'content-length',
   'keep-alive',
+  'set-cookie',
   'transfer-encoding',
 ]);
 
@@ -85,6 +124,7 @@ const gateway = parseGatewayHost(here.hostname);
 const rootHost = gateway && `${gateway.root}${here.port ? `:${here.port}` : ''}`;
 
 const store = directorySeedStore('webtor-onion-gateway');
+const cookies = cookieJar('webtor-onion-gateway-cookies', gateway?.onion ?? '');
 
 type TorClient = Awaited<ReturnType<typeof WebtorClient.create>>;
 
@@ -205,7 +245,7 @@ function rewriteLocation(location: string, target: string): string {
 
 interface Upstream {
   status: number;
-  headers: Record<string, string>;
+  headers: Headers;
   bytes(): Uint8Array;
 }
 
@@ -225,9 +265,9 @@ function toResponse(upstream: Upstream, target: string, headOnly: boolean): Resp
     });
   }
   const headers = new Headers();
-  for (const [name, value] of Object.entries(upstream.headers)) {
-    if (!CONNECTION_HEADERS.has(name)) headers.set(name, value);
-  }
+  upstream.headers.forEach((value, name) => {
+    if (!WITHHELD_RESPONSE_HEADERS.has(name)) headers.set(name, value);
+  });
   const location = headers.get('location');
   if (location !== null) headers.set('location', rewriteLocation(location, target));
 
@@ -250,35 +290,74 @@ function textResponse(status: number, text: string): Response {
   });
 }
 
-function htmlResponse(status: number, html: string, headers: HeadersInit = {}): Response {
+function htmlResponse(status: number, html: string): Response {
   return new Response(html, {
     status,
     headers: {
       'content-type': 'text/html; charset=utf-8',
       'cache-control': 'no-store',
-      ...headers,
     },
   });
+}
+
+/**
+ * The `Referer` the onion should see, or `null` for none: the page's own
+ * URL, in onion terms, when it was on this gateway. The browser has already
+ * applied the page's referrer policy by the time a worker sees the request.
+ */
+function refererFor(request: Request): string | null {
+  if (request.referrer === '' || request.referrer === 'about:client') return null;
+  try {
+    return onionUrl(new URL(request.referrer));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The request body, whole, or `null` once it has run past
+ * `MAX_REQUEST_BYTES`. It is read a chunk at a time and the stream cancelled
+ * as soon as the limit is crossed, so a body far past it costs the worker no
+ * more memory than the limit itself.
+ */
+async function readBody(request: Request): Promise<Uint8Array | null> {
+  if (request.body === null) return new Uint8Array(0);
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_REQUEST_BYTES) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
 }
 
 async function answer(request: Request, target: string): Promise<Response> {
   const onion = gateway!.onion;
   const navigation = request.mode === 'navigate';
   const requested = new URL(request.url);
+  const method = request.method.toUpperCase();
+  const carriesBody = method !== 'GET' && method !== 'HEAD';
 
-  if (request.method !== 'GET' && request.method !== 'HEAD') {
-    const detail = `This gateway serves static content: it forwards GET and HEAD, not ${request.method}.`;
-    return navigation
-      ? htmlResponse(405, errorPage(onion, 'Method not allowed', detail), { allow: 'GET, HEAD' })
-      : textResponse(405, detail);
-  }
-
-  // A navigation gets a page to watch the bootstrap from, rather than a tab
-  // that spins for a minute or more; a subresource waits, since the page
-  // that asked for it is already showing.
+  // A GET navigation gets a page to watch the bootstrap from, rather than a
+  // tab that spins for a minute or more. Anything else waits: a subresource
+  // because the page that asked for it is already showing, a form submission
+  // because the bootstrap page would replay it as a GET without its body.
   if (phase !== 'ready' || bootstrap === null) {
     const pending = client(onion);
-    if (navigation) {
+    if (navigation && !carriesBody) {
       pending.catch(() => undefined);
       return htmlResponse(
         200,
@@ -297,27 +376,49 @@ async function answer(request: Request, target: string): Promise<Response> {
       : textResponse(502, detail);
   }
 
-  const headers: Record<string, string> = {};
-  for (const name of FORWARDED_REQUEST_HEADERS) {
-    const value = request.headers.get(name);
-    if (value !== null) headers[name] = value;
+  let body: Uint8Array | undefined;
+  if (carriesBody) {
+    const read = await readBody(request);
+    if (read === null) {
+      const detail = `The request body is over ${MAX_REQUEST_BYTES} bytes, the most this gateway forwards.`;
+      return navigation
+        ? htmlResponse(413, errorPage(onion, 'Request too large', detail))
+        : textResponse(413, detail);
+    }
+    body = read;
   }
+
+  const headers: Record<string, string> = {};
+  request.headers.forEach((value, name) => {
+    if (!DROPPED_REQUEST_HEADERS.has(name)) headers[name] = value;
+  });
   // The browser's own `Accept-Encoding` is not exposed to a worker, and what
   // it would ask for includes codings the worker cannot decode.
   headers['accept-encoding'] = ACCEPT_ENCODING;
+  // The browser adds `Origin`, `Referer` and `Cookie` after a worker has
+  // answered, and in the gateway's terms; the onion wants them in its own,
+  // above all for a CSRF check that compares them with its `Host`.
+  const referer = refererFor(request);
+  if (referer !== null) headers.referer = referer;
+  if (carriesBody) headers.origin = `http://${onion}`;
+  const cookie = await cookies.headerFor(requested.pathname);
+  if (cookie !== null) headers.cookie = cookie;
 
   try {
-    // Always a GET on the wire: the client frames a response by its
+    // A HEAD goes out as a GET: the client frames a response by its
     // `Content-Length`, and a HEAD's body never comes.
     const upstream: Upstream = await tor.fetch(target, {
+      method: method === 'HEAD' ? 'GET' : method,
       headers,
+      ...(body ? { body } : {}),
       timeoutMs: REQUEST_TIMEOUT_MS,
       maxResponseBytes: MAX_RESPONSE_BYTES,
     });
-    return toResponse(upstream, target, request.method === 'HEAD');
+    await cookies.set(upstream.headers.getSetCookie(), requested.pathname);
+    return toResponse(upstream, target, method === 'HEAD');
   } catch (error) {
     const detail = describe(error);
-    log('error', `${request.method} ${requested.pathname}: ${detail}`);
+    log('error', `${method} ${requested.pathname}: ${detail}`);
     return navigation
       ? htmlResponse(502, errorPage(onion, 'The onion did not answer', detail))
       : textResponse(502, detail);

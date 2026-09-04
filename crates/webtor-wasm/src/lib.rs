@@ -596,14 +596,18 @@ impl OnionResponse {
         self.inner.is_success()
     }
 
-    /// Response headers as a plain object; names are lowercased.
+    /// Response headers as a `Headers`, every occurrence kept: a repeated
+    /// name reads back joined through `get`, and the cookies a response set
+    /// come back one by one from `getSetCookie`. A header `Headers` refuses,
+    /// for a name or value it considers malformed, is left out rather than
+    /// making the whole response unreadable over one line a server got wrong.
     #[wasm_bindgen(getter)]
-    pub fn headers(&self) -> js_sys::Object {
-        let object = js_sys::Object::new();
+    pub fn headers(&self) -> Result<web_sys::Headers, JsValue> {
+        let headers = web_sys::Headers::new()?;
         for (name, value) in self.inner.headers() {
-            set(&object, name, &JsValue::from_str(value));
+            let _ = headers.append(name, value);
         }
-        object
+        Ok(headers)
     }
 
     /// The body as bytes.

@@ -6,8 +6,9 @@
   "packageManager": "bun@1.4.0",
   "scripts": {
     "build": "wasm-pack build crates/webtor-wasm --release --target web --scope andrewtheguy",
-    "test": "bun test --timeout 60000 ./tests/api.test.ts",
+    "test": "bun test --timeout 60000 ./tests/api.test.ts ./scripts/local-onion/server.test.ts",
     "test:live": "bun test --timeout 600000 ./tests/live.test.ts",
+    "test:dynamic": "bun test --timeout 600000 ./tests/dynamic.test.ts",
     "test:interop": "bun ./tests/tools/interop-cli.ts",
     "seed": "bun run ./tests/tools/fetch-directory.ts",
     "typecheck": "tsc --noEmit"

@@ -62,6 +62,8 @@ export interface HarnessFetchResult {
   status: number;
   ok: boolean;
   headers: Record<string, string>;
+  /** Every `Set-Cookie` header, in order. */
+  setCookies: string[];
   byteLength: number;
   text: string | null;
   seconds: number;
