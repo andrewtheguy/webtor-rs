@@ -10,6 +10,7 @@
     "preview": "vite preview",
     "typecheck": "tsc -b",
     "backend": "cargo run -q -p webtor-directory-server -- serve",
+    "backend:ts": "cd ../directory-server-ts && bun run serve",
     "test": "bun test src",
     "test:e2e": "bun test --timeout 600000 e2e"
   },

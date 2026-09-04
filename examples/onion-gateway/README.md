@@ -53,11 +53,13 @@ It builds a seed from a directory authority in under a minute, rebuilds it as
 each hourly consensus is published, and serves it on `127.0.0.1:5180`; the
 dev server proxies `/api` there, so the worker on every onion origin finds it
 at `http://intor.localhost:5173/api/directory`. `GATEWAY_DEV_BACKEND` names
-another port or origin. Seeded, a client bootstraps in a few seconds and the
-first page arrives after one rendezvous, about ten seconds in; later requests
-to the same onion begin on the circuit the first one built and take about a
-second each. Without a backend the worker says so and downloads the directory
-over Tor instead.
+another port or origin. `bun run backend:ts` is the TypeScript backend in
+`examples/directory-server-ts` on the same port instead: it refreshes nothing
+itself, so run its `bun run tor:directory` first and again within three hours.
+Seeded, a client bootstraps in a few seconds and the first page arrives after
+one rendezvous, about ten seconds in; later requests to the same onion begin
+on the circuit the first one built and take about a second each. Without a
+backend the worker says so and downloads the directory over Tor instead.
 
 `bun run build` produces a static `dist/` with the worker at `/sw.js`. The
 backend serves it too — `webtor-directory-server serve --web-root dist` is
@@ -155,8 +157,11 @@ GET /api/directory/<name>.json
 
 `examples/directory-server` is one backend: a Rust binary that fetches the
 documents from a directory authority over plain HTTP, checks them with the
-same code the client uses on a seed, and serves them as above. The gateway
-does not depend on it being the one.
+same code the client uses on a seed, and serves them as above, refreshing on
+its own. `examples/directory-server-ts` is another, in TypeScript on Bun, with
+no refresh loop: `bun run tor:directory` writes a seed and its manifest to a
+directory on disk, and `bun run serve` answers from whatever is there. The
+gateway does not depend on either being the one.
 
 ## What the gateway does and does not forward
 

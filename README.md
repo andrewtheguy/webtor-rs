@@ -232,6 +232,11 @@ origin. [`examples/directory-server`](examples/directory-server) is a backend
 that answers them: a Rust binary that builds a seed from a directory authority,
 rebuilds it as each hourly consensus is published, and serves it. Its
 `snapshot` subcommand is also what `bun run seed` runs.
+[`examples/directory-server-ts`](examples/directory-server-ts) answers the
+same contract from TypeScript with no refresh loop: `bun run tor:directory`
+builds a seed into a directory on disk whenever you choose, and a small Bun
+server answers from whatever is there. The other examples build their
+`public/tor-directory.json` with the same script.
 
 ## Releases
 
@@ -263,7 +268,8 @@ reference/         native peers webtor is tested *against*, each its own workspa
 docs/              architecture, network-observation notes, and the roadmap
 tests/             the browser test project
 examples/          standalone browser integrations
-  directory-server/  a native Rust backend: builds fresh directory seeds and serves the gateway's directory endpoints
+  directory-server/     a native Rust backend: builds fresh directory seeds and serves the gateway's directory endpoints
+  directory-server-ts/  the same endpoints from Bun, with the seed built by hand through `bun run tor:directory`
 scripts/           the SOCKS-based probe, plus a local WebSocket bridge and a dynamic onion site, each in a container
 ```
 
