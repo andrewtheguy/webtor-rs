@@ -8,4 +8,4 @@ no cargo fmt
 
 use biome for lint for javascript projects, and use async await instead of promises unless promises is meant for a specific reason
 
-always bump only webtor-wasm by patch version for breaking changes, but only one bump per branch
+when a branch changes anything under crates/, bump the webtor-wasm patch version once on that branch, and leave the other crates' versions alone
