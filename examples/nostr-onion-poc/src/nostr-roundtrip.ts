@@ -336,7 +336,9 @@ export async function runNostrRoundTrip(
   });
   const client = (await module.WebtorClient.create({
     bridge: options.bridge,
-    ...(options.bridge === 'webrtc' ? { stunUrls: STUN_URLS } : {}),
+    ...(options.bridge === 'webrtc'
+      ? { stunUrls: STUN_URLS, rtcPeerConnection: RTCPeerConnection }
+      : {}),
     directorySeed: directory.value,
     connectionTimeoutMs: 300_000,
     // Every directory this client downloads, kept for the next run. A seed

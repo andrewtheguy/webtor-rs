@@ -26,8 +26,8 @@ use futures::{AsyncReadExt, AsyncWriteExt};
 use webtor_core::{
     DEFAULT_MAX_RESPONSE_BYTES,
     onion_websocket, DataReader, DataWriter, HttpRequest, HttpResponse, LogType, OnionService,
-    OnionServiceOptions, OnionUrl, TorClient, TorClientOptions, WebSocketConnection,
-    WebSocketMessage, WebSocketReader, WebSocketWriter,
+    OnionServiceOptions, OnionUrl, PeerConnectionClass, TorClient, TorClientOptions,
+    WebSocketConnection, WebSocketMessage, WebSocketReader, WebSocketWriter,
 };
 
 const DEFAULT_CONNECTION_TIMEOUT_MS: u64 = 300_000;
@@ -42,6 +42,7 @@ const CLIENT_OPTIONS: &[&str] = &[
     "stunUrls",
     "bridgeUrl",
     "bridgeFingerprint",
+    "rtcPeerConnection",
     "directorySeed",
     "connectionTimeoutMs",
     "log",
@@ -97,6 +98,7 @@ fn read_client_config(raw: Option<js_sys::Object>) -> Result<ClientConfig, JsVal
     let stun_urls = options::string_array(&bag, "stunUrls", what)?.unwrap_or_default();
     let bridge_url = options::string(&bag, "bridgeUrl", what)?;
     let bridge_fingerprint = options::string(&bag, "bridgeFingerprint", what)?;
+    let rtc_peer_connection = options::function(&bag, "rtcPeerConnection", what)?;
     let options = match bridge.as_str() {
         // The direct bridge WebSocket needs no broker, no volunteer proxy and
         // no STUN server, which is why it is the default: one fixed endpoint
@@ -105,6 +107,11 @@ fn read_client_config(raw: Option<js_sys::Object>) -> Result<ClientConfig, JsVal
             if !stun_urls.is_empty() {
                 return Err(option_error(
                     "WebtorClient.create option \"stunUrls\" applies to the webrtc bridge only",
+                ));
+            }
+            if rtc_peer_connection.is_some() {
+                return Err(option_error(
+                    "WebtorClient.create option \"rtcPeerConnection\" applies to the webrtc bridge only",
                 ));
             }
             // A bridge is authenticated by its RSA identity alone, so a URL
@@ -139,7 +146,15 @@ fn read_client_config(raw: Option<js_sys::Object>) -> Result<ClientConfig, JsVal
                     "WebtorClient.create bridge \"webrtc\" requires at least one STUN URL in \"stunUrls\"",
                 ));
             }
-            TorClientOptions::snowflake_webrtc(stun_urls)
+            // Always the caller's, never the global: a window has one, a worker
+            // or a non-browser host does not, and which implementation runs is
+            // the caller's decision either way.
+            let Some(peer_connection) = rtc_peer_connection else {
+                return Err(option_error(
+                    "WebtorClient.create bridge \"webrtc\" requires \"rtcPeerConnection\", the RTCPeerConnection constructor to build its peer connection with",
+                ));
+            };
+            TorClientOptions::snowflake_webrtc(stun_urls, PeerConnectionClass::new(peer_connection))
         }
         other => {
             return Err(option_error(format!(
@@ -317,6 +332,9 @@ impl WebtorClient {
     /// Options, all optional:
     /// - `bridge`: `"websocket"` (default) or `"webrtc"`.
     /// - `stunUrls`: STUN servers for the `"webrtc"` bridge, required there.
+    /// - `rtcPeerConnection`: the `RTCPeerConnection` constructor the
+    ///   `"webrtc"` bridge uses, required there: a window's own, or any other
+    ///   implementation of the interface.
     /// - `bridgeUrl` and `bridgeFingerprint`: a bridge to use instead of the
     ///   public one, for the `"websocket"` bridge. Both or neither;
     ///   `scripts/local-bridge` runs one on localhost.

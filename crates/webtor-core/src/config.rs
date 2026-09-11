@@ -1,5 +1,6 @@
 //! Configuration for the browser Tor client.
 
+use crate::webrtc_stream::PeerConnectionClass;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,6 +42,7 @@ pub enum BridgeType {
         broker_url: String,
         stun_urls: Vec<String>,
         fingerprint: String,
+        peer_connection: PeerConnectionClass,
     },
     /// Direct browser WebSocket to the bridge, chosen explicitly by the caller.
     SnowflakeWebSocket { url: String, fingerprint: String },
@@ -79,12 +81,15 @@ pub enum LogType {
 }
 
 impl TorClientOptions {
-    pub fn snowflake_webrtc(stun_urls: Vec<String>) -> Self {
+    /// Construct the volunteer-proxy transport, building its peer connection
+    /// with `peer_connection`.
+    pub fn snowflake_webrtc(stun_urls: Vec<String>, peer_connection: PeerConnectionClass) -> Self {
         Self {
             bridge: BridgeType::SnowflakeWebRtc {
                 broker_url: SNOWFLAKE_BROKER_URL.to_string(),
                 stun_urls,
                 fingerprint: PUBLIC_SNOWFLAKE_FINGERPRINT.to_string(),
+                peer_connection,
             },
             connection_timeout: 300_000,
             on_log: None,

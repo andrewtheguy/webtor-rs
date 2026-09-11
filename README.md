@@ -7,8 +7,9 @@ application proxy: the page builds Tor circuits itself and speaks HTTP or RFC
 other way around — the page publishes its own `.onion` address and answers what
 clients send it. The client runs wherever the page puts it: a window, a
 dedicated or shared worker, or a service worker, with the default `"websocket"`
-bridge; the `"webrtc"` bridge needs `RTCPeerConnection`, which only a window
-has.
+bridge. The `"webrtc"` bridge builds its peer connection with the
+`RTCPeerConnection` the caller passes as `rtcPeerConnection`: a window's own,
+or, anywhere else, any implementation of the interface.
 
 The Rust workspace builds `@andrewtheguy/webtor-wasm`, the package a web app
 installs.
@@ -60,8 +61,9 @@ Bootstraps a client. Every option is optional.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `bridge` | `"websocket"` | `"websocket"` opens a direct WebSocket to the Snowflake bridge: one fixed endpoint, no broker, no volunteer proxy, no STUN. `"webrtc"` goes through a volunteer proxy brokered over HTTPS — harder to block, and it needs `stunUrls`. |
+| `bridge` | `"websocket"` | `"websocket"` opens a direct WebSocket to the Snowflake bridge: one fixed endpoint, no broker, no volunteer proxy, no STUN. `"webrtc"` goes through a volunteer proxy brokered over HTTPS — harder to block, and it needs `stunUrls` and `rtcPeerConnection`. |
 | `stunUrls` | — | STUN servers for the `"webrtc"` bridge; required there and refused otherwise. |
+| `rtcPeerConnection` | — | The `RTCPeerConnection` constructor the `"webrtc"` bridge builds its peer connection with; required there and refused otherwise. webtor never reads the global, so a window passes its own `RTCPeerConnection`; anything implementing the W3C interface serves, such as `node-datachannel/polyfill` under Node or Bun. |
 | `bridgeUrl` | — | WebSocket URL for a bridge to use instead of the public one. Valid only with the `"websocket"` bridge and must be supplied with `bridgeFingerprint`. |
 | `bridgeFingerprint` | — | The custom bridge's 40-hex-character RSA identity fingerprint. Valid only with the `"websocket"` bridge and must be supplied with `bridgeUrl`. |
 | `directorySeed` | — | A previous `directoryCache()`. Without one the client downloads the directory over a single bridge circuit, which is the slowest and least reliable part of a bootstrap. |

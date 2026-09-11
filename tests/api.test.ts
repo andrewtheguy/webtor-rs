@@ -186,6 +186,46 @@ describe('webtor-wasm API', () => {
       );
     });
 
+    it('builds the webrtc peer connection with a constructor the caller supplies', async () => {
+      // This constructor throws, so the bootstrap fails without touching the
+      // network; what matters is that it is the one called.
+      const used = await harness.call('createWithPeerConnection', {
+        bridge: 'webrtc',
+        stunUrls: ['stun:stun.example.com'],
+        connectionTimeoutMs: 10_000,
+      });
+      assert.ok(used.error, 'create succeeded with a constructor that throws');
+      assert.ok(used.configurations.length > 0, `constructor never called: ${used.error}`);
+      assert.deepEqual(used.configurations[0], ['stun:stun.example.com']);
+
+      const refused = await harness.call('createWithPeerConnection', {});
+      assert.match(refused.error ?? '', /"rtcPeerConnection" applies to the webrtc bridge only/);
+      assert.deepEqual(refused.configurations, []);
+
+      await assert.rejects(
+        () =>
+          harness.call('createRejects', {
+            bridge: 'webrtc',
+            stunUrls: ['stun:stun.example.com'],
+            rtcPeerConnection: 7,
+          }),
+        /must be a function/,
+      );
+    });
+
+    it('requires the RTCPeerConnection even where the scope has one', async () => {
+      // A window has a global RTCPeerConnection, and webtor still does not
+      // reach for it: the implementation is always the caller's.
+      await assert.rejects(
+        () =>
+          harness.call('createRejects', {
+            bridge: 'webrtc',
+            stunUrls: ['stun:stun.example.com'],
+          }),
+        /requires "rtcPeerConnection"/,
+      );
+    });
+
     it('takes a bridge URL and its identity together, or neither', async () => {
       await assert.rejects(
         () => harness.call('createRejects', { bridgeUrl: 'ws://localhost:8080/' }),

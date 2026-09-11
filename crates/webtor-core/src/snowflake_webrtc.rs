@@ -4,7 +4,7 @@ use crate::error::{Result, TorError};
 use crate::kcp_stream::{KcpConfig, KcpStream};
 use crate::smux::SmuxStream;
 use crate::turbo::TurboStream;
-use crate::webrtc_stream::WebRtcStream;
+use crate::webrtc_stream::{PeerConnectionClass, WebRtcStream};
 use futures::{AsyncRead, AsyncWrite};
 use std::borrow::Cow;
 use std::io;
@@ -21,6 +21,7 @@ pub(crate) struct SnowflakeWebRtcConfig {
     pub(crate) broker_url: String,
     pub(crate) fingerprint: String,
     pub(crate) stun_urls: Vec<String>,
+    pub(crate) peer_connection: PeerConnectionClass,
 }
 
 type SnowflakeWebRtcStack = SmuxStream<KcpStream<TurboStream<WebRtcStream>>>;
@@ -44,6 +45,7 @@ impl SnowflakeWebRtcStream {
                 &config.broker_url,
                 &config.fingerprint,
                 &config.stun_urls,
+                &config.peer_connection,
             )
             .await
             {

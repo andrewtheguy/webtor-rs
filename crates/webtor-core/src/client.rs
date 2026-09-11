@@ -213,12 +213,14 @@ impl TorClient {
                 broker_url,
                 stun_urls,
                 fingerprint,
+                peer_connection,
             } => {
                 self.log("Connecting to Snowflake via WebRTC", LogType::Info);
                 let stream = SnowflakeWebRtcStream::connect(SnowflakeWebRtcConfig {
                     broker_url: broker_url.clone(),
                     fingerprint: fingerprint.clone(),
                     stun_urls: stun_urls.clone(),
+                    peer_connection: peer_connection.clone(),
                 })
                 .await?;
                 self.create_channel(stream, rsa_identity).await?
