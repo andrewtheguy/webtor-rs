@@ -34,6 +34,31 @@ paths to it:
 | `websocket` (default) | A direct WebSocket to one fixed Snowflake bridge endpoint. It uses no broker, volunteer proxy, or STUN and has fewer moving parts, but blocking that endpoint blocks the client. |
 | `webrtc` | A volunteer proxy selected through the Snowflake broker over HTTPS. It requires caller-supplied STUN URLs and the `RTCPeerConnection` constructor to use, as `rtcPeerConnection` — a window's own, or any implementation of the interface — and is harder to block, at the cost of another dependency and a slower start. |
 
+The webrtc bridge polls the broker up to ten times per bootstrap, each poll at
+least ten seconds after the one before it began, as the official client does:
+the broker often has no proxy for a poll or two, and a matched proxy is often
+unreachable. A browser cannot probe its own NAT, so the client tells the broker
+its NAT is "unrestricted", which spares the proxies anyone can reach for the
+clients that need them, until a proxy matched that way cannot be reached; for
+the rest of the client's life it says "unknown", and the broker offers only
+proxies behind an open NAT.
+
+A proxy does not own the session. Both bridges carry Tor over Snowflake's
+Turbo tunnel, whose sessions the bridge keys by a client ID each connection
+opens with, and holds for a minute while no connection has them. When a
+connection closes, fails, or delivers nothing for twenty seconds (the bridge
+sends a keepalive every ten), the client opens another with the same ID,
+through a new proxy or a new WebSocket, and the session carries on under the
+same Tor channel: KCP resends what was lost in between, and circuits and
+streams do not notice. A replacement that fails to dial is dialed again,
+backing off from one second to eight, for as long as the bridge still holds
+the session, and a dial still going when that minute is up is given up. Three connections in a row that deliver nothing end the session,
+since by then the bridge has most likely let it go.
+
+A channel that closes anyway is opened again, with a new session, when it is
+next needed: before a caller's request starts, and when a published service
+next repairs its introduction points. The directory the client has is kept.
+
 For development, `bridgeUrl` and `bridgeFingerprint` replace the public
 WebSocket bridge. They are accepted only together and only in `websocket` mode:
 a URL without the bridge's RSA identity would ask the client to trust whatever
@@ -109,6 +134,13 @@ rendezvous. A kept circuit that fails a new `BEGIN` for any reason other than
 an `END` from the service is replaced by a fresh rendezvous once, and a kept
 descriptor none of whose introduction points answer is fetched again before
 the connect fails.
+
+Tor itself puts no limit on how long a relay may take to answer an extension,
+and one that never answers would hold the circuit open indefinitely, so every
+circuit this client builds, for either role, is given twenty seconds to come
+up. Each of steps 2 through 4 is then given thirty seconds for its build and
+its one exchange before the client moves on to another HSDir, rendezvous
+point, or introduction point.
 
 The raw API stops at the resulting byte stream. `fetch` layers one HTTP/1.1
 exchange on it, while `connectWebSocket` performs the RFC 6455 upgrade and owns

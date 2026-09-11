@@ -3,12 +3,49 @@
 use crate::error::{Result, TorError};
 use crate::global_scope::fetch_with_request;
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use tracing::{debug, info};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Request, RequestInit, RequestMode, Response};
 
 const CLIENT_VERSION: &str = "1.0";
+const NAT_UNRESTRICTED: &str = "unrestricted";
+const NAT_UNKNOWN: &str = "unknown";
+
+/// What a client tells the broker about its NAT, for as long as it lives.
+///
+/// The broker matches a client that says "unrestricted" with the proxies
+/// hardest to reach first, those behind a strict NAT, and one that says
+/// anything else only with proxies behind an open one. A browser has no raw
+/// UDP to probe its own NAT with, so this client's is always unknown. Like the
+/// official client's `NATPolicy` it claims "unrestricted" anyway, which spares
+/// the open proxies for clients that need them, until a proxy it was matched
+/// with that way cannot be reached. It says "unknown" from then on: behind a
+/// restricted NAT, every later strict proxy would fail the same way.
+#[derive(Debug, Default)]
+pub(crate) struct NatPolicy {
+    unrestricted_failed: Cell<bool>,
+}
+
+impl NatPolicy {
+    pub(crate) fn nat_type(&self) -> &'static str {
+        if self.unrestricted_failed.get() {
+            NAT_UNKNOWN
+        } else {
+            NAT_UNRESTRICTED
+        }
+    }
+
+    /// A proxy matched for `sent` answered, and its data channel never opened.
+    /// A broker with no proxy to offer says nothing about the NAT, so only
+    /// this moves the policy.
+    pub(crate) fn unreachable(&self, sent: &str) {
+        if sent == NAT_UNRESTRICTED && !self.unrestricted_failed.replace(true) {
+            info!("A proxy matched for an unrestricted NAT was unreachable; asking for open proxies from now on");
+        }
+    }
+}
 
 fn broker_error_is_retryable(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
@@ -26,12 +63,10 @@ struct ClientPollRequest {
 }
 
 impl ClientPollRequest {
-    fn new(offer: String, fingerprint: String) -> Self {
+    fn new(offer: String, nat: &'static str, fingerprint: String) -> Self {
         Self {
             offer,
-            // This matches the official client's behavior when its NAT type is
-            // unknown and permits matching with restricted volunteer proxies.
-            nat: "unrestricted",
+            nat,
             fingerprint,
         }
     }
@@ -64,13 +99,14 @@ impl<'a> BrokerClient<'a> {
         }
     }
 
-    /// Exchange a fresh SDP offer for an answer from a volunteer proxy.
-    pub async fn negotiate(&self, sdp_offer: String) -> Result<String> {
-        let request = ClientPollRequest::new(sdp_offer, self.fingerprint.to_string());
+    /// Exchange a fresh SDP offer for an answer from a volunteer proxy,
+    /// telling the broker the client's NAT is `nat`.
+    pub async fn negotiate(&self, sdp_offer: String, nat: &'static str) -> Result<String> {
+        let request = ClientPollRequest::new(sdp_offer, nat, self.fingerprint.to_string());
         let body = request.encode()?;
         let url = format!("{}/client", self.broker_url.trim_end_matches('/'));
 
-        info!("Contacting Snowflake broker");
+        info!("Contacting Snowflake broker as a client behind a {nat} NAT");
         debug!("Broker URL: {url}");
         let response_bytes = fetch(&url, &body).await?;
         let response: ClientPollResponse = serde_json::from_slice(&response_bytes)
@@ -135,4 +171,36 @@ async fn fetch(url: &str, body: &[u8]) -> Result<Vec<u8>> {
     .await
     .map_err(|error| TorError::network(format!("Failed to read broker response: {error:?}")))?;
     Ok(js_sys::Uint8Array::new(&buffer).to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claims_unrestricted_until_a_proxy_matched_that_way_is_unreachable() {
+        let policy = NatPolicy::default();
+        assert_eq!(policy.nat_type(), NAT_UNRESTRICTED);
+
+        policy.unreachable(NAT_UNKNOWN);
+        assert_eq!(policy.nat_type(), NAT_UNRESTRICTED);
+
+        policy.unreachable(NAT_UNRESTRICTED);
+        assert_eq!(policy.nat_type(), NAT_UNKNOWN);
+
+        policy.unreachable(NAT_UNKNOWN);
+        assert_eq!(policy.nat_type(), NAT_UNKNOWN);
+    }
+
+    #[test]
+    fn a_poll_carries_the_nat_type_it_was_given() {
+        let body = ClientPollRequest::new("offer".to_string(), NAT_UNKNOWN, "AAAA".to_string())
+            .encode()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            r#"1.0
+{"offer":"offer","nat":"unknown","fingerprint":"AAAA"}"#
+        );
+    }
 }

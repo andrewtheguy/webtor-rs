@@ -6,7 +6,7 @@
   "packageManager": "bun@1.4.0",
   "scripts": {
     "build": "wasm-pack build crates/webtor-wasm --release --target web --scope andrewtheguy",
-    "test": "bun test --timeout 60000 ./tests/api.test.ts ./tests/webrtc-polyfill.test.ts ./scripts/local-onion/server.test.ts",
+    "test": "bun test --timeout 60000 ./tests/api.test.ts ./tests/webrtc-polyfill.test.ts ./tests/websocket-bridge.test.ts ./scripts/local-onion/server.test.ts",
     "test:live": "bun test --timeout 600000 ./tests/live.test.ts",
     "test:live:polyfill": "bun test --timeout 600000 ./tests/webrtc-polyfill-live.test.ts",
     "test:dynamic": "bun test --timeout 600000 ./tests/dynamic.test.ts",

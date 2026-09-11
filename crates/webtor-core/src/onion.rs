@@ -75,9 +75,15 @@ const ONE_DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
 const MAX_HSDIR_ATTEMPTS: usize = 4;
 const MAX_INTRO_ATTEMPTS: usize = 3;
-const DESCRIPTOR_TIMEOUT: Duration = Duration::from_secs(90);
-const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(90);
-const INTRODUCE_TIMEOUT: Duration = Duration::from_secs(90);
+// Each of these covers one circuit build, which gives up on its own after
+// twenty seconds, and one exchange over the circuit. A relay that takes
+// longer than that is given up for another, rather than holding the attempt
+// open until whatever the caller is doing runs out of time.
+const DESCRIPTOR_TIMEOUT: Duration = Duration::from_secs(30);
+const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(30);
+const INTRODUCE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Waiting for the service: it builds a circuit of its own to the rendezvous
+/// point after its introduction point hands it the request.
 const RENDEZVOUS_COMPLETION_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// What the consensus says about where descriptors live in one time period.
@@ -517,7 +523,7 @@ fn stream_refused_by_service(error: &tor_proto::Error) -> bool {
 }
 
 pub(crate) struct OnionConnector {
-    circuit_manager: Arc<CircuitManager>,
+    circuit_manager: Rc<CircuitManager>,
     directory_manager: Rc<DirectoryManager>,
     relay_manager: Arc<RwLock<RelayManager>>,
     /// Per-service state, each behind a lock of its own: concurrent connects
@@ -529,7 +535,7 @@ pub(crate) struct OnionConnector {
 
 impl OnionConnector {
     pub(crate) fn new(
-        circuit_manager: Arc<CircuitManager>,
+        circuit_manager: Rc<CircuitManager>,
         directory_manager: Rc<DirectoryManager>,
         relay_manager: Arc<RwLock<RelayManager>>,
         on_log: Option<LogCallback>,

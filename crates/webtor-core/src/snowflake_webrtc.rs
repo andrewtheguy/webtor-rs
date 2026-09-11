@@ -3,18 +3,28 @@
 use crate::error::{Result, TorError};
 use crate::kcp_stream::{KcpConfig, KcpStream};
 use crate::smux::SmuxStream;
-use crate::turbo::TurboStream;
+use crate::snowflake_broker::NatPolicy;
+use crate::time::Instant;
+use crate::turbotunnel::{Dial, TurboSession};
 use crate::webrtc_stream::{PeerConnectionClass, WebRtcStream};
-use futures::{AsyncRead, AsyncWrite};
+use futures::{AsyncRead, AsyncWrite, FutureExt};
 use std::borrow::Cow;
 use std::io;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use subtle_tls::TlsStream;
 use tracing::{info, warn};
 
-const MAX_WEBRTC_ATTEMPTS: u32 = 3;
+/// Proxies one connection asks the broker for before giving up. The broker
+/// often has none to offer for a poll or two, and a matched proxy is often
+/// unreachable, so a handful is not enough to ride out either.
+const MAX_WEBRTC_ATTEMPTS: u32 = 10;
+/// The least time from the start of one attempt to the start of the next, as
+/// the official client's `ReconnectTimeout`: a broker that had no proxy is not
+/// asked again at once, and an attempt that took longer is followed at once.
+const ATTEMPT_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub(crate) struct SnowflakeWebRtcConfig {
@@ -24,7 +34,7 @@ pub(crate) struct SnowflakeWebRtcConfig {
     pub(crate) peer_connection: PeerConnectionClass,
 }
 
-type SnowflakeWebRtcStack = SmuxStream<KcpStream<TurboStream<WebRtcStream>>>;
+type SnowflakeWebRtcStack = SmuxStream<KcpStream<TurboSession<WebRtcStream>>>;
 
 pub(crate) struct SnowflakeWebRtcStream {
     inner: TlsStream<SnowflakeWebRtcStack>,
@@ -37,46 +47,15 @@ pub(crate) struct SnowflakeWebRtcStream {
 unsafe impl Send for SnowflakeWebRtcStream {}
 
 impl SnowflakeWebRtcStream {
-    pub(crate) async fn connect(config: SnowflakeWebRtcConfig) -> Result<Self> {
-        let mut connected = None;
-        let mut last_error = None;
-
-        for attempt in 1..=MAX_WEBRTC_ATTEMPTS {
-            info!("Connecting to a Snowflake volunteer proxy (attempt {attempt}/{MAX_WEBRTC_ATTEMPTS})");
-            match WebRtcStream::connect(
-                &config.broker_url,
-                &config.fingerprint,
-                &config.stun_urls,
-                &config.peer_connection,
-            )
-            .await
-            {
-                Ok(stream) => {
-                    connected = Some(stream);
-                    break;
-                }
-                Err(error) => {
-                    warn!("Snowflake WebRTC attempt {attempt} failed: {error}");
-                    if !error.is_retryable() {
-                        return Err(error);
-                    }
-                    last_error = Some(error);
-                    if attempt < MAX_WEBRTC_ATTEMPTS {
-                        crate::retry::sleep(Duration::from_secs(2)).await;
-                    }
-                }
-            }
-        }
-
-        let webrtc = connected.ok_or_else(|| {
-            last_error.unwrap_or_else(|| {
-                TorError::network("Snowflake WebRTC failed after three attempts")
-            })
-        })?;
-
-        let mut turbo = TurboStream::new(webrtc);
-        turbo.initialize().await?;
-        let kcp = KcpStream::new(turbo, KcpConfig::default());
+    pub(crate) async fn connect(config: SnowflakeWebRtcConfig, nat: Rc<NatPolicy>) -> Result<Self> {
+        let config = Rc::new(config);
+        let dial: Dial<WebRtcStream> = Rc::new(move || {
+            let config = config.clone();
+            let nat = nat.clone();
+            async move { dial_proxy(&config, &nat).await }.boxed_local()
+        });
+        let session = TurboSession::open(dial).await?;
+        let kcp = KcpStream::new(session, KcpConfig::default());
         let mut smux = SmuxStream::with_stream_id(kcp, 3);
         smux.initialize().await?;
 
@@ -89,6 +68,43 @@ impl SnowflakeWebRtcStream {
 
         Ok(Self { inner })
     }
+}
+
+/// A data channel through the first volunteer proxy that can be reached, for
+/// the session's first connection and for every one after it.
+async fn dial_proxy(config: &SnowflakeWebRtcConfig, nat: &NatPolicy) -> Result<WebRtcStream> {
+    let mut last_error = None;
+    for attempt in 1..=MAX_WEBRTC_ATTEMPTS {
+        let started = Instant::now();
+        info!("Connecting to a Snowflake volunteer proxy (attempt {attempt}/{MAX_WEBRTC_ATTEMPTS})");
+        match WebRtcStream::connect(
+            &config.broker_url,
+            &config.fingerprint,
+            &config.stun_urls,
+            &config.peer_connection,
+            nat,
+        )
+        .await
+        {
+            Ok(stream) => return Ok(stream),
+            Err(error) => {
+                warn!("Snowflake WebRTC attempt {attempt} failed: {error}");
+                if !error.is_retryable() {
+                    return Err(error);
+                }
+                last_error = Some(error);
+                let wait = ATTEMPT_INTERVAL.saturating_sub(started.elapsed());
+                if attempt < MAX_WEBRTC_ATTEMPTS && !wait.is_zero() {
+                    crate::retry::sleep(wait).await;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        TorError::network(format!(
+            "Snowflake WebRTC failed after {MAX_WEBRTC_ATTEMPTS} attempts"
+        ))
+    }))
 }
 
 impl tor_rtcompat::StreamOps for SnowflakeWebRtcStream {}

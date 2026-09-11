@@ -11,7 +11,7 @@ here, and the directory snapshot is built by a tool in this directory.
 bun install        # install dependencies from bun.lock
 bun run typecheck  # check all TypeScript without emitting JavaScript
 bun run build      # required first: the harness imports crates/webtor-wasm/pkg/
-bun run test       # tests/api.test.ts and webrtc-polyfill.test.ts — no network, ~1s
+bun run test       # api, webrtc-polyfill and websocket-bridge — no network, ~2 minutes
 bun run seed       # a directory snapshot, ~40 MiB, valid three hours
 bun run test:live  # tests/live.test.ts   — real onion services, ~1 minute
 bun run test:live:polyfill  # webrtc-polyfill-live.test.ts — the webrtc bridge under Bun, ~1 minute
@@ -23,7 +23,7 @@ bun run test:interop  # tools/interop-cli.ts — against onion-cli-poc, ~1 minut
 `/usr/bin/google-chrome`). `playwright-core` ships no browser of its own, which
 is why it needs one already installed.
 
-## The six suites
+## The seven suites
 
 **`api.test.ts`** covers what answers without a circuit: `isOnionHost`,
 `parseOnionUrl`, `describeDirectory` against the consensus fixture in
@@ -39,27 +39,54 @@ server, the Snowflake broker (by standing in for `fetch`), and the volunteer
 proxy, as a second node-datachannel peer that answers webtor's offer. A case
 checks the broker poll, the offer's server-reflexive candidate, the data
 channel's label and the Turbo token webtor opens it with, and then what webtor
-makes of the proxy's reply: a binary frame reaches KCP, and a text message is
-refused. No bridge sits behind the proxy, so every bootstrap fails, and each
-case also waits for webtor to close its side of the channel.
+makes of the proxy's reply: a binary frame reaches KCP. A proxy that answers
+with text, or opens and then says nothing for twenty seconds, is one webtor
+stops using, and cases check that it dials another with the same Turbo client
+ID and gives the session up after three that deliver nothing. Another has the
+broker answer with no proxy and then with one that is gone before webtor
+reaches it, and checks that webtor waits ten seconds between polls and tells
+the broker its NAT is "unknown" once a proxy matched for "unrestricted" was
+unreachable. Those waits are most of the suite's time. A proxy on loopback
+can still fail to open in time, and webtor then asks the broker for another,
+so the cases count the channels webtor used rather than the broker's polls,
+and a failure prints what webtor logged. No bridge sits behind
+the proxies, so every bootstrap fails, and each case also waits for webtor to
+close every data channel it opened.
 
 **`webrtc-polyfill-live.test.ts`** is the same setup with the real network
 behind it: webtor gathers against public STUN servers (Google's and
 Cloudflare's, or `STUN_URLS`), and the proxy relays the data channel to the
 public bridge's WebSocket, as a Snowflake proxy does. It bootstraps from the
-directory seed and fetches the Tor Project's onion site. The proxy is still
-this file's rather than a volunteer the broker matches, since a test cannot
-choose one and one may not turn up; `BRIDGE=webrtc` with `live.test.ts` is
-what goes through a real one. The STUN servers are checked last, by the
+directory seed and fetches the Tor Project's onion site. Then it cuts that
+proxy off, as a volunteer closing a tab would, and fetches the site again on
+the kept circuit: the session has to have moved to a second proxy with the
+same client ID, with no new bridge channel. The proxy is still this file's
+rather than a volunteer the broker matches, since a test cannot choose one and
+one may not turn up; `BRIDGE=webrtc` with `live.test.ts` is what goes through
+a real one. The STUN servers are checked last, by the
 offer's server-reflexive candidate: the proxy is on loopback, so the channel
 opens on host candidates even where UDP to the outside is blocked.
+
+**`websocket-bridge.test.ts`** points the websocket bridge, under Bun, at a
+WebSocket server of its own on loopback that takes webtor's first connection
+and drops it, then refuses the next two with a 503, as a bridge instance that
+is briefly down does. It checks that webtor dials again after one second and
+then two, rather than giving up the session, that every connection it gets
+through opens with the same Turbo client ID, and that refusals do not count
+toward the three connections that deliver nothing. Another case has the
+bridge never answer the replacement's upgrade, and checks that the session
+ends a minute after its connection was lost, when the bridge would have let it
+go, rather than waiting on the dial for ever; that minute is most of the
+file's time.
 
 **`live.test.ts`** bootstraps one client and reuses it for every case:
 directory cache export, an HTTP GET, a server-chosen 4xx, caller-supplied
 headers, the schemes the client refuses, a WebSocket exchange, the
 `maxMessageBytes` limit, a second client bootstrapped inside a dedicated
-worker — where there is no `window`, as in a service worker — that GETs one
-site twice to show the second stream begins on the kept circuit, and finally
+worker — where there is no `window`, as in a service worker, and no
+`RTCPeerConnection`, so it takes the websocket bridge whatever `BRIDGE` says —
+that GETs one site twice to show the second stream begins on the kept
+circuit, and finally
 that a closed client refuses work. The first case to reach a service builds
 its rendezvous — around five seconds — and the ones after it to the same
 service begin streams on that circuit, so the cost of the file is the

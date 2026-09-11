@@ -1,7 +1,7 @@
 //! WebRTC DataChannel stream used by the Snowflake client transport.
 
 use crate::error::{Result, TorError};
-use crate::snowflake_broker::BrokerClient;
+use crate::snowflake_broker::{BrokerClient, NatPolicy};
 use futures::channel::mpsc;
 use futures::{AsyncRead, AsyncWrite, FutureExt, StreamExt};
 use js_sys::{Array, Object, Reflect};
@@ -97,6 +97,7 @@ impl WebRtcStream {
         fingerprint: &str,
         stun_urls: &[String],
         peer_connection: &PeerConnectionClass,
+        nat: &NatPolicy,
     ) -> Result<Self> {
         if stun_urls.is_empty() {
             return Err(TorError::configuration(
@@ -161,11 +162,15 @@ impl WebRtcStream {
         };
 
         let offer = create_offer(&stream.peer_connection).await?;
+        let sent_nat = nat.nat_type();
         let answer = BrokerClient::new(broker_url, fingerprint)
-            .negotiate(offer)
+            .negotiate(offer, sent_nat)
             .await?;
         set_answer(&stream.peer_connection, &answer).await?;
-        wait_for_channel_open(&stream.data_channel).await?;
+        if let Err(error) = wait_for_channel_open(&stream.data_channel).await {
+            nat.unreachable(sent_nat);
+            return Err(error);
+        }
         stream
             .data_channel
             .set_onerror(Some(stream._on_error.as_ref().unchecked_ref()));

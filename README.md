@@ -166,7 +166,7 @@ node-datachannel for the webrtc bridge.
 ```bash
 bun install       # install dependencies from bun.lock
 bun run build     # wasm-pack the package into crates/webtor-wasm/pkg/
-bun run test      # API suite and the webrtc bridge under Bun, no network
+bun run test      # API suite and both bridges under Bun, no network
 bun run seed      # fetch a directory snapshot to tests/.directory-seed.json
 bun run test:live # end to end against public onion services
 bun run test:live:polyfill # the webrtc bridge under Bun, end to end
@@ -203,8 +203,8 @@ repository, has a browser test against the same site, `bun run test:e2e`
 in its `gateway` directory, which drives the service worker from the install
 through a form sign-in.
 
-The repository pins its Bun version in `package.json`. `bun run test` is a
-second or two. `bun run test:live` bootstraps a real Tor client
+The repository pins its Bun version in `package.json`. `bun run test` takes
+about two minutes, most of it waiting out timeouts. `bun run test:live` bootstraps a real Tor client
 and builds a fresh set of circuits per case, so it runs in minutes; a snapshot
 from `bun run seed` is what keeps the bootstrap to under a minute, and a
 snapshot expires when its consensus does, three hours after it is made. See

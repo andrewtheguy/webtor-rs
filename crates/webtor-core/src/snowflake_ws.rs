@@ -3,16 +3,17 @@
 use crate::error::{Result, TorError};
 use crate::kcp_stream::{KcpConfig, KcpStream};
 use crate::smux::SmuxStream;
-use crate::turbo::TurboStream;
+use crate::turbotunnel::{Dial, TurboSession};
 use crate::websocket::WebSocketStream;
-use futures::{AsyncRead, AsyncWrite};
+use futures::{AsyncRead, AsyncWrite, FutureExt};
 use std::borrow::Cow;
 use std::io;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll};
 use subtle_tls::TlsStream;
 
-type SnowflakeWsStack = SmuxStream<KcpStream<TurboStream<WebSocketStream>>>;
+type SnowflakeWsStack = SmuxStream<KcpStream<TurboSession<WebSocketStream>>>;
 
 pub(crate) struct SnowflakeWsStream {
     inner: TlsStream<SnowflakeWsStack>,
@@ -25,10 +26,13 @@ unsafe impl Send for SnowflakeWsStream {}
 
 impl SnowflakeWsStream {
     pub(crate) async fn connect(url: &str) -> Result<Self> {
-        let websocket = WebSocketStream::connect(url).await?;
-        let mut turbo = TurboStream::new(websocket);
-        turbo.initialize().await?;
-        let kcp = KcpStream::new(turbo, KcpConfig::default());
+        let url: Rc<str> = url.into();
+        let dial: Dial<WebSocketStream> = Rc::new(move || {
+            let url = url.clone();
+            async move { WebSocketStream::connect(&url).await }.boxed_local()
+        });
+        let session = TurboSession::open(dial).await?;
+        let kcp = KcpStream::new(session, KcpConfig::default());
         let mut smux = SmuxStream::with_stream_id(kcp, 3);
         smux.initialize().await?;
         // Tor authenticates the bridge through its CERTS cells, so the TLS

@@ -69,3 +69,18 @@ export function clientOptions(logPrefix?: string): CreateOptions {
   }
   return options;
 }
+
+/**
+ * `WebtorClient.create` options for a client in a dedicated worker. A worker
+ * has no `RTCPeerConnection` to hand the webrtc bridge, so its client takes
+ * the websocket bridge whatever `BRIDGE` says, which is the bridge a worker
+ * or a service worker has to use anyway.
+ */
+export function workerClientOptions(logPrefix?: string): CreateOptions {
+  const options = clientOptions(logPrefix);
+  if (options.bridge === 'webrtc') {
+    options.bridge = 'websocket';
+    delete options.stunUrls;
+  }
+  return options;
+}

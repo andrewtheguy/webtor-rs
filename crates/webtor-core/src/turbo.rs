@@ -164,10 +164,9 @@ pub struct TurboStream<S> {
 }
 
 impl<S> TurboStream<S> {
-    pub fn new(inner: S) -> Self {
-        Self::with_client_id(inner, rand::random())
-    }
-
+    /// A connection for the Turbo session `client_id` names. The bridge keys
+    /// the session by it, so every connection of one session opens with the
+    /// same ID.
     pub fn with_client_id(inner: S, client_id: [u8; 8]) -> Self {
         Self {
             inner,
