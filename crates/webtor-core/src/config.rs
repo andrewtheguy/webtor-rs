@@ -1,13 +1,14 @@
 //! Configuration for the browser Tor client.
 
+use crate::webrtc_stream::PeerConnectionClass;
 use std::fmt;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::Duration;
 
 #[derive(Clone)]
-pub(crate) struct LogCallback(pub Arc<LogHandler>);
+pub(crate) struct LogCallback(pub Rc<LogHandler>);
 
-type LogHandler = dyn Fn(&str, LogType) + Send + Sync;
+type LogHandler = dyn Fn(&str, LogType);
 
 impl fmt::Debug for LogCallback {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -18,9 +19,9 @@ impl fmt::Debug for LogCallback {
 /// Told about a directory the client downloaded, as the encoded seed a later
 /// bootstrap would take.
 #[derive(Clone)]
-pub(crate) struct DirectoryCallback(pub Arc<DirectoryHandler>);
+pub(crate) struct DirectoryCallback(pub Rc<DirectoryHandler>);
 
-type DirectoryHandler = dyn Fn(&str) + Send + Sync;
+type DirectoryHandler = dyn Fn(&str);
 
 impl fmt::Debug for DirectoryCallback {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -41,6 +42,7 @@ pub enum BridgeType {
         broker_url: String,
         stun_urls: Vec<String>,
         fingerprint: String,
+        peer_connection: PeerConnectionClass,
     },
     /// Direct browser WebSocket to the bridge, chosen explicitly by the caller.
     SnowflakeWebSocket { url: String, fingerprint: String },
@@ -79,12 +81,15 @@ pub enum LogType {
 }
 
 impl TorClientOptions {
-    pub fn snowflake_webrtc(stun_urls: Vec<String>) -> Self {
+    /// Construct the volunteer-proxy transport, building its peer connection
+    /// with `peer_connection`.
+    pub fn snowflake_webrtc(stun_urls: Vec<String>, peer_connection: PeerConnectionClass) -> Self {
         Self {
             bridge: BridgeType::SnowflakeWebRtc {
                 broker_url: SNOWFLAKE_BROKER_URL.to_string(),
                 stun_urls,
                 fingerprint: PUBLIC_SNOWFLAKE_FINGERPRINT.to_string(),
+                peer_connection,
             },
             connection_timeout: 300_000,
             on_log: None,
@@ -125,9 +130,9 @@ impl TorClientOptions {
 
     pub fn with_on_log<F>(mut self, on_log: F) -> Self
     where
-        F: Fn(&str, LogType) + Send + Sync + 'static,
+        F: Fn(&str, LogType) + 'static,
     {
-        self.on_log = Some(LogCallback(Arc::new(on_log)));
+        self.on_log = Some(LogCallback(Rc::new(on_log)));
         self
     }
 
@@ -146,9 +151,9 @@ impl TorClientOptions {
     /// directory changed when none did.
     pub fn with_on_directory_change<F>(mut self, on_directory_change: F) -> Self
     where
-        F: Fn(&str) + Send + Sync + 'static,
+        F: Fn(&str) + 'static,
     {
-        self.on_directory_change = Some(DirectoryCallback(Arc::new(on_directory_change)));
+        self.on_directory_change = Some(DirectoryCallback(Rc::new(on_directory_change)));
         self
     }
 

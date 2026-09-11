@@ -52,7 +52,9 @@ export async function createClient(bridge: Bridge, log: Log) {
 
   const client = await WebtorClient.create({
     bridge,
-    ...(bridge === 'webrtc' ? { stunUrls: STUN_URLS } : {}),
+    ...(bridge === 'webrtc'
+      ? { stunUrls: STUN_URLS, rtcPeerConnection: RTCPeerConnection }
+      : {}),
     ...(BRIDGE_URL && BRIDGE_FINGERPRINT
       ? { bridgeUrl: BRIDGE_URL, bridgeFingerprint: BRIDGE_FINGERPRINT }
       : {}),

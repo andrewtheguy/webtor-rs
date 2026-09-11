@@ -79,6 +79,10 @@ export interface HarnessCalls {
     result: string;
   };
   createLogging: { args: [options: CreateOptions]; result: string[] };
+  createWithPeerConnection: {
+    args: [options: CreateOptions];
+    result: { configurations: string[][]; error: string | null };
+  };
   describeDirectory: {
     args: [seed: string, instants?: number[]];
     result: {

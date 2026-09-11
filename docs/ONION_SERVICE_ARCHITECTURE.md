@@ -32,7 +32,7 @@ paths to it:
 | Bridge | Network path |
 | --- | --- |
 | `websocket` (default) | A direct WebSocket to one fixed Snowflake bridge endpoint. It uses no broker, volunteer proxy, or STUN and has fewer moving parts, but blocking that endpoint blocks the client. |
-| `webrtc` | A volunteer proxy selected through the Snowflake broker over HTTPS. It requires caller-supplied STUN URLs and is harder to block, at the cost of another dependency and a slower start. |
+| `webrtc` | A volunteer proxy selected through the Snowflake broker over HTTPS. It requires caller-supplied STUN URLs and the `RTCPeerConnection` constructor to use, as `rtcPeerConnection` — a window's own, or any implementation of the interface — and is harder to block, at the cost of another dependency and a slower start. |
 
 For development, `bridgeUrl` and `bridgeFingerprint` replace the public
 WebSocket bridge. They are accepted only together and only in `websocket` mode:

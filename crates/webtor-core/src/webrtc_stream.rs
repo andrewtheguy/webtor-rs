@@ -1,4 +1,4 @@
-//! Browser WebRTC DataChannel stream used by the Snowflake client transport.
+//! WebRTC DataChannel stream used by the Snowflake client transport.
 
 use crate::error::{Result, TorError};
 use crate::snowflake_broker::BrokerClient;
@@ -22,6 +22,65 @@ const DATA_CHANNEL_LABEL: &str = "webrtc";
 const ICE_GATHERING_TIMEOUT_MS: u32 = 10_000;
 const DATA_CHANNEL_TIMEOUT_MS: u32 = 10_000;
 
+/// The `RTCPeerConnection` constructor the webrtc bridge builds its peer
+/// connection with, always the caller's.
+///
+/// A window has one as a global and nothing else does: a worker has none, and
+/// neither does a JavaScript host that is not a browser. Taking the
+/// constructor as a value, and never reading the global, is what lets such a
+/// host bring an implementation of its own without installing it for every
+/// other piece of code in the process. Only the constructor is taken; every
+/// method is then called on the object by name, so anything that implements
+/// the W3C interface serves.
+#[derive(Clone)]
+pub struct PeerConnectionClass(js_sys::Function);
+
+impl PeerConnectionClass {
+    pub fn new(constructor: js_sys::Function) -> Self {
+        Self(constructor)
+    }
+
+    fn construct(&self, configuration: &RtcConfiguration) -> Result<RtcPeerConnection> {
+        Reflect::construct(&self.0, &Array::of1(configuration))
+            .map(JsCast::unchecked_into)
+            .map_err(|error| {
+                TorError::network(format!("Failed to create RTCPeerConnection: {error:?}"))
+            })
+    }
+}
+
+impl std::fmt::Debug for PeerConnectionClass {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "PeerConnectionClass")
+    }
+}
+
+/// The same constructor, by identity.
+impl PartialEq for PeerConnectionClass {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for PeerConnectionClass {}
+
+// A JS constructor belongs to the thread that made it, which threaded WASM
+// makes observable; nothing may claim it is `Send` or `Sync`.
+const _: fn() = || {
+    trait AmbiguousIfSend<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+    trait AmbiguousIfSync<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+    <PeerConnectionClass as AmbiguousIfSend<_>>::check();
+    <PeerConnectionClass as AmbiguousIfSync<_>>::check();
+};
+
 pub struct WebRtcStream {
     peer_connection: RtcPeerConnection,
     data_channel: RtcDataChannel,
@@ -37,6 +96,7 @@ impl WebRtcStream {
         broker_url: &str,
         fingerprint: &str,
         stun_urls: &[String],
+        peer_connection: &PeerConnectionClass,
     ) -> Result<Self> {
         if stun_urls.is_empty() {
             return Err(TorError::configuration(
@@ -46,10 +106,7 @@ impl WebRtcStream {
 
         info!("Creating Snowflake WebRTC connection");
         let configuration = create_rtc_configuration(stun_urls)?;
-        let peer_connection = RtcPeerConnection::new_with_configuration(&configuration)
-            .map_err(|error| {
-                TorError::network(format!("Failed to create RTCPeerConnection: {error:?}"))
-            })?;
+        let peer_connection = peer_connection.construct(&configuration)?;
         let data_channel = peer_connection.create_data_channel_with_data_channel_dict(
             DATA_CHANNEL_LABEL,
             &RtcDataChannelInit::new(),

@@ -1,9 +1,9 @@
 # tests
 
-Drives the built `webtor-wasm` package in headless Chrome. Self-contained:
-`playwright-core` is a devDependency of this repository, the pages are served
-from a loopback port here, and the directory snapshot is built by a tool in
-this directory.
+Drives the built `webtor-wasm` package in headless Chrome, and under Bun with
+no browser at all. Self-contained: `playwright-core` and `node-datachannel` are
+devDependencies of this repository, the pages are served from a loopback port
+here, and the directory snapshot is built by a tool in this directory.
 
 ## Running
 
@@ -11,9 +11,10 @@ this directory.
 bun install        # install dependencies from bun.lock
 bun run typecheck  # check all TypeScript without emitting JavaScript
 bun run build      # required first: the harness imports crates/webtor-wasm/pkg/
-bun run test       # tests/api.test.ts    — no network, ~1s
+bun run test       # tests/api.test.ts and webrtc-polyfill.test.ts — no network, ~1s
 bun run seed       # a directory snapshot, ~40 MiB, valid three hours
 bun run test:live  # tests/live.test.ts   — real onion services, ~1 minute
+bun run test:live:polyfill  # webrtc-polyfill-live.test.ts — the webrtc bridge under Bun, ~1 minute
 bun run test:dynamic  # tests/dynamic.test.ts — a dynamic onion site of our own, ~1 minute
 bun run test:interop  # tools/interop-cli.ts — against onion-cli-poc, ~1 minute
 ```
@@ -22,13 +23,36 @@ bun run test:interop  # tools/interop-cli.ts — against onion-cli-poc, ~1 minut
 `/usr/bin/google-chrome`). `playwright-core` ships no browser of its own, which
 is why it needs one already installed.
 
-## The four suites
+## The six suites
 
 **`api.test.ts`** covers what answers without a circuit: `isOnionHost`,
 `parseOnionUrl`, `describeDirectory` against the consensus fixture in
 `crates/webtor-core/testdata/`, and the option validation `WebtorClient.create` runs before
 it touches the network — unknown keys, wrong types, a bridge that needs STUN.
 It needs no Tor and no directory, so it is the one to run while editing.
+
+**`webrtc-polyfill.test.ts`** runs the webrtc bridge where there is no browser:
+the package loaded under Bun, with `node-datachannel/polyfill`'s
+`RTCPeerConnection` as `rtcPeerConnection`, which is what the README tells a
+Node or Bun host to pass. The file plays every other part on loopback: a STUN
+server, the Snowflake broker (by standing in for `fetch`), and the volunteer
+proxy, as a second node-datachannel peer that answers webtor's offer. A case
+checks the broker poll, the offer's server-reflexive candidate, the data
+channel's label and the Turbo token webtor opens it with, and then what webtor
+makes of the proxy's reply: a binary frame reaches KCP, and a text message is
+refused. No bridge sits behind the proxy, so every bootstrap fails, and each
+case also waits for webtor to close its side of the channel.
+
+**`webrtc-polyfill-live.test.ts`** is the same setup with the real network
+behind it: webtor gathers against public STUN servers (Google's and
+Cloudflare's, or `STUN_URLS`), and the proxy relays the data channel to the
+public bridge's WebSocket, as a Snowflake proxy does. It bootstraps from the
+directory seed and fetches the Tor Project's onion site. The proxy is still
+this file's rather than a volunteer the broker matches, since a test cannot
+choose one and one may not turn up; `BRIDGE=webrtc` with `live.test.ts` is
+what goes through a real one. The STUN servers are checked last, by the
+offer's server-reflexive candidate: the proxy is on loopback, so the channel
+opens on host candidates even where UDP to the outside is blocked.
 
 **`live.test.ts`** bootstraps one client and reuses it for every case:
 directory cache export, an HTTP GET, a server-chosen 4xx, caller-supplied

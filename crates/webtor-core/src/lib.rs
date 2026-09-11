@@ -47,4 +47,5 @@ pub use config::{BridgeType, LogType, TorClientOptions};
 pub use error::{Result, TorError};
 pub use http::{HttpRequest, HttpResponse, DEFAULT_MAX_RESPONSE_BYTES};
 pub use retry::with_timeout;
+pub use webrtc_stream::PeerConnectionClass;
 pub use tor_proto::client::stream::{DataReader, DataStream, DataWriter};

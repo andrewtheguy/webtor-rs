@@ -143,6 +143,33 @@
         return lines;
       }),
     /**
+     * Create with an `RTCPeerConnection` constructor made here, and return the
+     * STUN URLs of every configuration it was called with alongside how
+     * `create` failed. The constructor throws, so the webrtc bridge fails
+     * without touching the network.
+     */
+    createWithPeerConnection: (options) =>
+      rethrowing(async () => {
+        const configurations = [];
+        class RefusingPeerConnection {
+          constructor(configuration) {
+            configurations.push(configuration.iceServers.map((server) => server.urls));
+            throw new Error('refused by the harness');
+          }
+        }
+        let error = null;
+        try {
+          const created = await WebtorClient.create({
+            ...options,
+            rtcPeerConnection: RefusingPeerConnection,
+          });
+          await created.close();
+        } catch (failure) {
+          error = failure instanceof Error ? failure.message : String(failure);
+        }
+        return { configurations, error };
+      }),
+    /**
      * Read a seed's own account of itself. `instants` are epoch milliseconds
      * to place in time periods, which is how the boundary a caller cares
      * about is asserted from the Node side.
@@ -168,6 +195,9 @@
       rethrowing(async () => {
         const started = performance.now();
         const settings = { ...options };
+        // A function cannot travel through CDP, so the webrtc bridge's
+        // constructor is the page's own, added here.
+        if (settings.bridge === 'webrtc') settings.rtcPeerConnection = RTCPeerConnection;
         if (seedUrl) {
           const response = await fetch(seedUrl);
           if (!response.ok) {

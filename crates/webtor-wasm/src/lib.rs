@@ -18,7 +18,6 @@ use options::error as option_error;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
@@ -26,8 +25,8 @@ use futures::{AsyncReadExt, AsyncWriteExt};
 use webtor_core::{
     DEFAULT_MAX_RESPONSE_BYTES,
     onion_websocket, DataReader, DataWriter, HttpRequest, HttpResponse, LogType, OnionService,
-    OnionServiceOptions, OnionUrl, TorClient, TorClientOptions, WebSocketConnection,
-    WebSocketMessage, WebSocketReader, WebSocketWriter,
+    OnionServiceOptions, OnionUrl, PeerConnectionClass, TorClient, TorClientOptions,
+    WebSocketConnection, WebSocketMessage, WebSocketReader, WebSocketWriter,
 };
 
 const DEFAULT_CONNECTION_TIMEOUT_MS: u64 = 300_000;
@@ -42,6 +41,7 @@ const CLIENT_OPTIONS: &[&str] = &[
     "stunUrls",
     "bridgeUrl",
     "bridgeFingerprint",
+    "rtcPeerConnection",
     "directorySeed",
     "connectionTimeoutMs",
     "log",
@@ -97,6 +97,7 @@ fn read_client_config(raw: Option<js_sys::Object>) -> Result<ClientConfig, JsVal
     let stun_urls = options::string_array(&bag, "stunUrls", what)?.unwrap_or_default();
     let bridge_url = options::string(&bag, "bridgeUrl", what)?;
     let bridge_fingerprint = options::string(&bag, "bridgeFingerprint", what)?;
+    let rtc_peer_connection = options::function(&bag, "rtcPeerConnection", what)?;
     let options = match bridge.as_str() {
         // The direct bridge WebSocket needs no broker, no volunteer proxy and
         // no STUN server, which is why it is the default: one fixed endpoint
@@ -105,6 +106,11 @@ fn read_client_config(raw: Option<js_sys::Object>) -> Result<ClientConfig, JsVal
             if !stun_urls.is_empty() {
                 return Err(option_error(
                     "WebtorClient.create option \"stunUrls\" applies to the webrtc bridge only",
+                ));
+            }
+            if rtc_peer_connection.is_some() {
+                return Err(option_error(
+                    "WebtorClient.create option \"rtcPeerConnection\" applies to the webrtc bridge only",
                 ));
             }
             // A bridge is authenticated by its RSA identity alone, so a URL
@@ -139,7 +145,15 @@ fn read_client_config(raw: Option<js_sys::Object>) -> Result<ClientConfig, JsVal
                     "WebtorClient.create bridge \"webrtc\" requires at least one STUN URL in \"stunUrls\"",
                 ));
             }
-            TorClientOptions::snowflake_webrtc(stun_urls)
+            // Always the caller's, never the global: a window has one, a worker
+            // or a non-browser host does not, and which implementation runs is
+            // the caller's decision either way.
+            let Some(peer_connection) = rtc_peer_connection else {
+                return Err(option_error(
+                    "WebtorClient.create bridge \"webrtc\" requires \"rtcPeerConnection\", the RTCPeerConnection constructor to build its peer connection with",
+                ));
+            };
+            TorClientOptions::snowflake_webrtc(stun_urls, PeerConnectionClass::new(peer_connection))
         }
         other => {
             return Err(option_error(format!(
@@ -298,7 +312,7 @@ fn set(object: &js_sys::Object, key: &str, value: &JsValue) {
 
 #[wasm_bindgen]
 pub struct WebtorClient {
-    client: Arc<TorClient>,
+    client: Rc<TorClient>,
     log: Logger,
     /// Set by `close`. Work issued afterwards fails at once instead of
     /// bootstrapping a Tor client all over again for a stream nobody wants.
@@ -317,6 +331,9 @@ impl WebtorClient {
     /// Options, all optional:
     /// - `bridge`: `"websocket"` (default) or `"webrtc"`.
     /// - `stunUrls`: STUN servers for the `"webrtc"` bridge, required there.
+    /// - `rtcPeerConnection`: the `RTCPeerConnection` constructor the
+    ///   `"webrtc"` bridge uses, required there: a window's own, or any other
+    ///   implementation of the interface.
     /// - `bridgeUrl` and `bridgeFingerprint`: a bridge to use instead of the
     ///   public one, for the `"websocket"` bridge. Both or neither;
     ///   `scripts/local-bridge` runs one on localhost.
@@ -359,7 +376,7 @@ impl WebtorClient {
                 .await
                 .map_err(|error| js_error("Failed to establish Tor connection", error))?;
             Ok(JsValue::from(Self {
-                client: Arc::new(client),
+                client: Rc::new(client),
                 log,
                 closed: Rc::new(Cell::new(false)),
                 pending: Rc::new(RefCell::new(HashMap::new())),
@@ -515,7 +532,7 @@ impl WebtorClient {
                 LogType::Success,
             );
             Ok(JsValue::from(WebtorOnionService {
-                service: Arc::new(service),
+                service: Rc::new(service),
             }))
         })
     }
@@ -771,7 +788,7 @@ impl OnionWebSocket {
 /// A v3 onion service this page is running.
 #[wasm_bindgen]
 pub struct WebtorOnionService {
-    service: Arc<OnionService>,
+    service: Rc<OnionService>,
 }
 
 #[wasm_bindgen]

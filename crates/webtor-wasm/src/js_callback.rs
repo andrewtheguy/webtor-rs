@@ -1,10 +1,4 @@
-//! A JS function held where the Tor client wants `Send + Sync`.
-//!
-//! The client's callbacks are declared `Send + Sync` because its core is
-//! written against a threaded runtime as well as this one. Browser WASM is
-//! single-threaded and a `js_sys::Function` never leaves its thread, so the
-//! bound is satisfiable here but not derivable — which needs an `unsafe impl`,
-//! and this is the one place that carries it.
+//! A caller's JS function, called with strings for whatever it is told about.
 
 use wasm_bindgen::prelude::*;
 
@@ -26,7 +20,3 @@ impl JsCallback {
         let _ = self.0.apply(&JsValue::NULL, &list);
     }
 }
-
-// Nothing here crosses a thread; see the module comment.
-unsafe impl Send for JsCallback {}
-unsafe impl Sync for JsCallback {}

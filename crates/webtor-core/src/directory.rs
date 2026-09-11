@@ -753,6 +753,7 @@ fn encode_microdescriptor_digest(digest: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
 
     #[test]
     fn directory_cache_round_trips() {
@@ -863,7 +864,7 @@ mod tests {
         let manager = DirectoryManager::new(
             Arc::new(RwLock::new(RelayManager::new(Vec::new()))),
             None,
-            Some(DirectoryCallback(Arc::new(move |encoded: &str| {
+            Some(DirectoryCallback(Rc::new(move |encoded: &str| {
                 recorder.lock().unwrap().push(encoded.to_string());
             }))),
         );

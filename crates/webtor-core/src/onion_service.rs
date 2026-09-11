@@ -40,6 +40,7 @@ use futures::channel::{mpsc, oneshot};
 use futures::future::{AbortHandle, Abortable};
 use futures::{SinkExt, StreamExt};
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -204,7 +205,7 @@ pub struct OnionService {
     /// taking `incoming`'s lock, which an `accept` that is waiting for a
     /// client holds for as long as it waits.
     streams: mpsc::Sender<DataStream>,
-    state: Arc<ServiceState>,
+    state: Rc<ServiceState>,
 }
 
 /// The parts of a running service that its background tasks share.
@@ -214,7 +215,7 @@ struct ServiceState {
     /// again, so this key lives as long as the service does rather than being
     /// dropped once the first descriptor is signed.
     identity: HsIdKeypair,
-    directory_manager: Arc<DirectoryManager>,
+    directory_manager: Rc<DirectoryManager>,
     relay_manager: Arc<RwLock<RelayManager>>,
     /// What every descriptor advertises, and the circuits the introductions
     /// arrive on. Kept up to strength by [`reconcile_intro_points`].
@@ -405,7 +406,7 @@ impl ServiceState {
 /// rotate with the onion service time period, so a service that uploads once
 /// stops being reachable a few hours later while still looking healthy from
 /// the inside. C tor and Arti both republish on a timer for this reason.
-async fn republish_forever(state: Arc<ServiceState>) {
+async fn republish_forever(state: Rc<ServiceState>) {
     loop {
         let delay = republish_delay(&state).await;
         crate::retry::sleep(delay).await;
@@ -466,7 +467,7 @@ fn capped_republish_delay(
 
 /// One republication: a current directory, introduction points that are still
 /// answering, then a descriptor on every ring the directory names.
-async fn republish(state: &Arc<ServiceState>) -> Result<()> {
+async fn republish(state: &Rc<ServiceState>) -> Result<()> {
     let _publishing = state.publishing.lock().await;
 
     // The rings come from the consensus, so republishing against the one this
@@ -523,7 +524,7 @@ async fn republish(state: &Arc<ServiceState>) -> Result<()> {
 /// the service exists: it is already running, and a period that fails here
 /// leaves `unpublished_change` set for the maintainer to come back to.
 /// Failing all of them is still worth saying.
-async fn publish_everywhere(state: &Arc<ServiceState>) -> Result<()> {
+async fn publish_everywhere(state: &Rc<ServiceState>) -> Result<()> {
     // Whatever is left of the previous round's uploads has either finished or
     // run out its timeout many times over by now.
     abort_all(&state.upload_aborts);
@@ -573,7 +574,7 @@ async fn publish_everywhere(state: &Arc<ServiceState>) -> Result<()> {
 /// is retried on a growing delay, since what stopped a relay from taking an
 /// ESTABLISH_INTRO or an HSDir from storing a descriptor a moment ago is
 /// usually still true.
-async fn maintain_intro_points(state: Arc<ServiceState>, mut nudges: mpsc::Receiver<()>) {
+async fn maintain_intro_points(state: Rc<ServiceState>, mut nudges: mpsc::Receiver<()>) {
     use futures::future::{select, Either};
 
     let (min_delay, max_delay) = INTRO_RETRY_DELAY;
@@ -664,7 +665,7 @@ impl OnionService {
     /// the point at which a client can reach the address.
     pub(crate) async fn launch(
         circuit_manager: Arc<CircuitManager>,
-        directory_manager: Arc<DirectoryManager>,
+        directory_manager: Rc<DirectoryManager>,
         relay_manager: Arc<RwLock<RelayManager>>,
         options: OnionServiceOptions,
         on_log: Option<LogCallback>,
@@ -688,7 +689,7 @@ impl OnionService {
         // find nothing left to do.
         let (maintenance_tx, maintenance_rx) = mpsc::channel(1);
 
-        let state = Arc::new(ServiceState {
+        let state = Rc::new(ServiceState {
             circuit_manager,
             identity,
             directory_manager,
@@ -883,7 +884,7 @@ impl Drop for OnionService {
 /// the old descriptor, which then tries one of the two other points that
 /// descriptor names — the same thing that client does when a relay simply
 /// fails.
-async fn reconcile_intro_points(state: &Arc<ServiceState>) -> Result<()> {
+async fn reconcile_intro_points(state: &Rc<ServiceState>) -> Result<()> {
     let known: HashSet<String> = state
         .relay_manager
         .read()
@@ -992,7 +993,7 @@ fn intro_point_is_usable(ended: bool, fingerprint: &str, known: &HashSet<String>
 /// with a fresh session key, a handler that forwards every INTRODUCE2, and a
 /// watcher that reports the circuit's end.
 async fn establish_intro_point(
-    state: &Arc<ServiceState>,
+    state: &Rc<ServiceState>,
     relay: &Relay,
 ) -> Result<EstablishedIntroPoint> {
     let mut rng = rand::rng();
@@ -1156,7 +1157,7 @@ fn build_descriptor<R: rand::Rng + rand::CryptoRng>(
 /// client falls back on when the relay it asked has dropped its copy — but
 /// nothing needs to wait for them, and one unreachable HSDir would otherwise
 /// hold publishing up for the whole of `UPLOAD_TIMEOUT`.
-async fn publish_descriptor(state: &Arc<ServiceState>, publication: &Publication) -> Result<()> {
+async fn publish_descriptor(state: &Rc<ServiceState>, publication: &Publication) -> Result<()> {
     let Publication {
         period,
         blind_id,
@@ -1251,7 +1252,7 @@ async fn publish_descriptor(state: &Arc<ServiceState>, publication: &Publication
 /// Take each INTRODUCE2 as it arrives and serve it on its own task, so a slow
 /// rendezvous never holds up the next client.
 async fn answer_introductions(
-    state: Arc<ServiceState>,
+    state: Rc<ServiceState>,
     mut introductions: mpsc::Receiver<(Arc<IntroPointKeys>, Introduce2)>,
     streams: mpsc::Sender<DataStream>,
 ) {
@@ -1272,7 +1273,7 @@ async fn answer_introductions(
 /// Finish one client's handshake: answer at its rendezvous point and pass on
 /// every stream it opens.
 async fn serve_introduction(
-    state: &Arc<ServiceState>,
+    state: &Rc<ServiceState>,
     keys: &IntroPointKeys,
     message: Introduce2,
     mut streams: mpsc::Sender<DataStream>,
