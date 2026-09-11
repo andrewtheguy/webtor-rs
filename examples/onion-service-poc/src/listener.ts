@@ -2,6 +2,7 @@
 // messages on it. A message is the body of `POST /message`; anything else
 // gets a small page saying what this address is.
 
+import type { WebtorOnionService } from '@andrewtheguy/webtor-wasm';
 import { createClient, logger, type Bridge, type LogEntry } from './tor-client';
 
 export interface ReceivedMessage {
@@ -116,7 +117,7 @@ export async function startListener(options: ListenOptions): Promise<Listener> {
   const log = logger(options.onLog);
   const client = await createClient(options.bridge, log);
 
-  let service;
+  let service: WebtorOnionService;
   try {
     log('info', 'Establishing introduction points and publishing a descriptor…');
     service = await client.publishOnionService({

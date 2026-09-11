@@ -61,10 +61,8 @@ export async function createClient(bridge: Bridge, log: Log) {
     // with: a published service refreshes the directory for as long as it is
     // up, and downloading one over a single bridge circuit is the slowest part
     // of a cold start.
-    onDirectoryChange: (cache: string) => {
-      void store.save(cache).then((stored) => {
-        if (stored) log('info', 'Stored a fresh Tor directory for the next start');
-      });
+    onDirectoryChange: async (cache: string) => {
+      if (await store.save(cache)) log('info', 'Stored a fresh Tor directory for the next start');
     },
     logPrefix: '[onion-service-poc]',
   });

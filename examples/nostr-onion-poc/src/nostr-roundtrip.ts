@@ -113,30 +113,26 @@ function isNostrEvent(value: unknown): value is NostrEvent {
   );
 }
 
-function withDeadline<T>(
+async function withDeadline<T>(
   operation: Promise<T>,
   timeoutMs: number,
   description: string,
 ): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timeout = globalThis.setTimeout(
+  let timeout: ReturnType<typeof globalThis.setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timeout = globalThis.setTimeout(
       () =>
         reject(
           new Error(`${description} timed out after ${timeoutMs / 1000}s`),
         ),
       timeoutMs,
     );
-    void operation.then(
-      (value) => {
-        globalThis.clearTimeout(timeout);
-        resolve(value);
-      },
-      (error: unknown) => {
-        globalThis.clearTimeout(timeout);
-        reject(error);
-      },
-    );
   });
+  try {
+    return await Promise.race([operation, deadline]);
+  } finally {
+    globalThis.clearTimeout(timeout);
+  }
 }
 
 async function receiveMatching<T>(
@@ -346,13 +342,11 @@ export async function runNostrRoundTrip(
     // Every directory this client downloads, kept for the next run. A seed
     // that came from here is never handed back, so this fires only when there
     // is something new to store.
-    onDirectoryChange: (cache: string) => {
-      void store.save(cache).then((stored) => {
-        if (!stored) return;
-        onLog({
-          level: 'info',
-          message: 'Saved the validated directory in IndexedDB',
-        });
+    onDirectoryChange: async (cache: string) => {
+      if (!(await store.save(cache))) return;
+      onLog({
+        level: 'info',
+        message: 'Saved the validated directory in IndexedDB',
       });
     },
     logPrefix: '[nostr-onion-poc]',

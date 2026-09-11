@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import {
   ONION_RELAYS,
   type ProofLog,
@@ -7,6 +7,9 @@ import {
 } from './nostr-roundtrip';
 
 type RunState = 'idle' | 'running' | 'passed' | 'failed';
+
+/** A trace line, numbered in the order it was logged. */
+type TraceEntry = ProofLog & { id: number };
 
 function shortRelay(relay: string): string {
   const host = new URL(relay).hostname;
@@ -26,7 +29,8 @@ export default function App() {
     'auto',
   );
   const [state, setState] = useState<RunState>('idle');
-  const [logs, setLogs] = useState<ProofLog[]>([]);
+  const [logs, setLogs] = useState<TraceEntry[]>([]);
+  const logged = useRef(0);
   const [result, setResult] = useState<RoundTripResult | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
 
@@ -41,7 +45,10 @@ export default function App() {
         bridge,
         relay,
         message: message.trim(),
-        onLog: (entry) => setLogs((current) => [...current, entry]),
+        onLog: (entry) => {
+          const id = ++logged.current;
+          setLogs((current) => [...current, { ...entry, id }]);
+        },
       });
       setResult(proof);
       setState('passed');
@@ -166,10 +173,7 @@ export default function App() {
           ) : (
             <ol>
               {logs.map((entry, index) => (
-                <li
-                  className={`log-${entry.level}`}
-                  key={`${index}-${entry.message}`}
-                >
+                <li className={`log-${entry.level}`} key={entry.id}>
                   <span>{String(index + 1).padStart(2, '0')}</span>
                   <div>
                     <strong>{entry.message}</strong>

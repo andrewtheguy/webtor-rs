@@ -21,7 +21,7 @@ const HTML = 'text/html; charset=utf-8';
 const JSON_TYPE = 'application/json; charset=utf-8';
 const TEXT = 'text/plain; charset=utf-8';
 
-function escape(text: string): string {
+function escapeHtml(text: string): string {
   return text
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
@@ -86,7 +86,7 @@ function home(request: Request): Response {
   const cookies = parseCookies(request.headers.get('cookie'));
   const name = cookies[SESSION_COOKIE];
   const visits = (Number.parseInt(cookies[VISITS_COOKIE] ?? '0', 10) || 0) + 1;
-  const who = name ? `Signed in as ${escape(name)}` : 'Not signed in';
+  const who = name ? `Signed in as ${escapeHtml(name)}` : 'Not signed in';
   const body = `<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><title>Sample onion</title></head>

@@ -11,9 +11,11 @@
     "test:dynamic": "bun test --timeout 600000 ./tests/dynamic.test.ts",
     "test:interop": "bun ./tests/tools/interop-cli.ts",
     "seed": "bun run ./tests/tools/fetch-directory.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "lint": "biome lint"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.5.13",
     "@types/bun": "^1.3.9",
     "playwright-core": "^1.50.0",
     "typescript": "~5.9.3",
