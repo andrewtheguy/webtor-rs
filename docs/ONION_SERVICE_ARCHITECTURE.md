@@ -50,8 +50,10 @@ connection closes, fails, or delivers nothing for twenty seconds (the bridge
 sends a keepalive every ten), the client opens another with the same ID,
 through a new proxy or a new WebSocket, and the session carries on under the
 same Tor channel: KCP resends what was lost in between, and circuits and
-streams do not notice. Three connections in a row that deliver nothing end
-the session, since by then the bridge has most likely let it go.
+streams do not notice. A replacement that fails to dial is dialed again,
+backing off from one second to eight, for as long as the bridge still holds
+the session. Three connections in a row that deliver nothing end the session,
+since by then the bridge has most likely let it go.
 
 A channel that closes anyway is opened again, with a new session, when it is
 next needed: before a caller's request starts, and when a published service

@@ -121,16 +121,24 @@ impl CircuitManager {
         }
     }
 
-    /// Open a new bridge channel for a bootstrap, in place of any there was.
+    /// Open a new bridge channel for a bootstrap, in place of any there was,
+    /// which is terminated: one a bootstrap gave up on, or one that timed out
+    /// and left its channel here.
     pub(crate) async fn open_channel(&self) -> Result<Arc<Channel>> {
         let channel = self.bridge.open().await?;
-        *self.channel.write().await = Some(channel.clone());
+        if let Some(replaced) = self.channel.write().await.replace(channel.clone()) {
+            replaced.terminate();
+        }
         Ok(channel)
     }
 
-    /// Forget the channel. Nothing reopens one until the next bootstrap.
+    /// Close the channel and forget it. Nothing reopens one until the next
+    /// bootstrap. Kept circuits hold the channel too, so it is terminated
+    /// rather than dropped, which would leave it running under them.
     pub(crate) async fn close_channel(&self) {
-        *self.channel.write().await = None;
+        if let Some(channel) = self.channel.write().await.take() {
+            channel.terminate();
+        }
     }
 
     /// Build a fresh three-hop tunnel Snowflake → middle → `target`, choosing

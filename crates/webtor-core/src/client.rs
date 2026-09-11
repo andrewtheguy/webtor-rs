@@ -194,7 +194,6 @@ impl TorClient {
                     &format!("Tor directory download failed ({error}); reconnecting to the bridge"),
                     LogType::Error,
                 );
-                channel.terminate();
                 channel = self.circuit_manager.open_channel().await?;
                 self.directory_manager
                     .fetch_and_process_consensus(channel)

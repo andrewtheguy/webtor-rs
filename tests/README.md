@@ -11,7 +11,7 @@ here, and the directory snapshot is built by a tool in this directory.
 bun install        # install dependencies from bun.lock
 bun run typecheck  # check all TypeScript without emitting JavaScript
 bun run build      # required first: the harness imports crates/webtor-wasm/pkg/
-bun run test       # tests/api.test.ts and webrtc-polyfill.test.ts — no network, ~1 minute
+bun run test       # api, webrtc-polyfill and websocket-bridge — no network, ~1 minute
 bun run seed       # a directory snapshot, ~40 MiB, valid three hours
 bun run test:live  # tests/live.test.ts   — real onion services, ~1 minute
 bun run test:live:polyfill  # webrtc-polyfill-live.test.ts — the webrtc bridge under Bun, ~1 minute
@@ -23,7 +23,7 @@ bun run test:interop  # tools/interop-cli.ts — against onion-cli-poc, ~1 minut
 `/usr/bin/google-chrome`). `playwright-core` ships no browser of its own, which
 is why it needs one already installed.
 
-## The six suites
+## The seven suites
 
 **`api.test.ts`** covers what answers without a circuit: `isOnionHost`,
 `parseOnionUrl`, `describeDirectory` against the consensus fixture in
@@ -63,6 +63,14 @@ one may not turn up; `BRIDGE=webrtc` with `live.test.ts` is what goes through
 a real one. The STUN servers are checked last, by the
 offer's server-reflexive candidate: the proxy is on loopback, so the channel
 opens on host candidates even where UDP to the outside is blocked.
+
+**`websocket-bridge.test.ts`** points the websocket bridge, under Bun, at a
+WebSocket server of its own on loopback that takes webtor's first connection
+and drops it, then refuses the next two with a 503, as a bridge instance that
+is briefly down does. It checks that webtor dials again after one second and
+then two, rather than giving up the session, that every connection it gets
+through opens with the same Turbo client ID, and that refusals do not count
+toward the three connections that deliver nothing.
 
 **`live.test.ts`** bootstraps one client and reuses it for every case:
 directory cache export, an HTTP GET, a server-chosen 4xx, caller-supplied

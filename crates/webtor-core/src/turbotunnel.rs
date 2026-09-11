@@ -8,7 +8,7 @@
 //! official client does: KCP above retransmits what was lost in between, and
 //! nothing above KCP notices.
 
-use crate::error::Result;
+use crate::error::{Result, TorError};
 use crate::time::Instant;
 use crate::turbo::TurboStream;
 use futures::future::LocalBoxFuture;
@@ -31,6 +31,16 @@ const SILENCE_TIMEOUT: Duration = Duration::from_secs(20);
 /// the session is taken to be gone at the bridge, rather than each proxy
 /// being unlucky, and the stream fails so that a fresh session can be opened.
 const MAX_SILENT_CONNECTIONS: u32 = 3;
+/// How long after a connection is lost a replacement may still be dialed.
+/// The Snowflake server forgets a client ID it has not used for a minute
+/// (`clientMapTimeout`), and a connection that opens with a forgotten one
+/// starts a session nothing above is waiting on.
+const SESSION_RETENTION: Duration = Duration::from_secs(60);
+/// The wait after a replacement fails to dial, doubling from the first to
+/// the last, so that a bridge that is briefly unreachable is asked again soon
+/// without being hammered.
+const FIRST_REDIAL_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_REDIAL_BACKOFF: Duration = Duration::from_secs(8);
 
 /// Opens one connection to the bridge: a proxy's data channel, or a WebSocket.
 pub(crate) type Dial<S> = Rc<dyn Fn() -> LocalBoxFuture<'static, Result<S>>>;
@@ -63,6 +73,39 @@ async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
     let mut turbo = TurboStream::with_client_id(stream, client_id);
     turbo.initialize().await?;
     Ok(turbo)
+}
+
+/// Dial a replacement for a lost connection, and dial again after a failure
+/// for as long as the bridge may still hold the session.
+async fn reconnect<S: AsyncRead + AsyncWrite + Unpin>(
+    dial: Dial<S>,
+    client_id: [u8; 8],
+) -> Result<TurboStream<S>> {
+    let lost = Instant::now();
+    let mut attempt = 0;
+    loop {
+        let error = match connect(dial.clone(), client_id).await {
+            Ok(turbo) => return Ok(turbo),
+            Err(error) => error,
+        };
+        let Some(backoff) = redial_backoff(&error, attempt, lost.elapsed()) else {
+            return Err(error);
+        };
+        warn!("Could not dial another Snowflake connection ({error}); trying again in {backoff:?}");
+        crate::retry::sleep(backoff).await;
+        attempt += 1;
+    }
+}
+
+/// The wait before dialing again once replacement `attempt` has failed with
+/// `error`, `since_lost` after the connection went; `None` when the failure
+/// is not one a retry would fix, or the next dial would start after the
+/// bridge has let the session go.
+fn redial_backoff(error: &TorError, attempt: u32, since_lost: Duration) -> Option<Duration> {
+    let backoff = FIRST_REDIAL_BACKOFF
+        .saturating_mul(2u32.saturating_pow(attempt))
+        .min(MAX_REDIAL_BACKOFF);
+    (error.is_retryable() && since_lost + backoff < SESSION_RETENTION).then_some(backoff)
 }
 
 fn up<S>(turbo: TurboStream<S>) -> Connection<S> {
@@ -112,7 +155,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + 'static> TurboSession<S> {
             return;
         }
         warn!("Snowflake connection lost ({reason}); dialing another for the same session");
-        self.connection = Connection::Dialing(connect(self.dial.clone(), self.client_id).boxed_local());
+        self.connection =
+            Connection::Dialing(reconnect(self.dial.clone(), self.client_id).boxed_local());
     }
 
     /// Drive a dial in progress: ready once a connection is up, or the
@@ -130,7 +174,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + 'static> TurboSession<S> {
                         self.connection = up(turbo);
                     }
                     Err(error) => {
-                        warn!("Could not dial another Snowflake connection: {error}");
+                        warn!("Could not dial another Snowflake connection ({error}); giving the session up");
                         self.connection =
                             Connection::Failed(format!("Snowflake session lost: {error}"));
                     }
@@ -233,5 +277,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin + 'static> AsyncWrite for TurboSession<S>
             Connection::Up { turbo, .. } => Pin::new(turbo).poll_close(cx),
             Connection::Dialing(_) | Connection::Failed(_) => Poll::Ready(Ok(())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_redial_backs_off_while_the_bridge_holds_the_session() {
+        let unreachable = TorError::network("the bridge did not answer");
+        let backoffs: Vec<_> = (0..5)
+            .map(|attempt| redial_backoff(&unreachable, attempt, Duration::ZERO))
+            .collect();
+        let seconds = |s| Some(Duration::from_secs(s));
+        assert_eq!(backoffs, [seconds(1), seconds(2), seconds(4), seconds(8), seconds(8)]);
+
+        assert_eq!(redial_backoff(&unreachable, 3, Duration::from_secs(51)), seconds(8));
+        assert_eq!(redial_backoff(&unreachable, 3, Duration::from_secs(52)), None);
+        assert_eq!(
+            redial_backoff(&TorError::Internal("no dial".to_string()), 0, Duration::ZERO),
+            None
+        );
     }
 }
