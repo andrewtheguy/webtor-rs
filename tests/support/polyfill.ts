@@ -50,7 +50,16 @@ export interface Poll {
   offer: string;
   nat: string;
   fingerprint: string;
+  /** When it arrived, in `performance.now()` milliseconds. */
+  at: number;
 }
+
+/**
+ * How the stand-in broker answers one poll: with a proxy, with the broker's
+ * own error for having none, or with a proxy that is gone before webtor can
+ * reach it, whose data channel therefore never opens.
+ */
+export type BrokerReply = 'proxy' | 'no proxies' | 'unreachable';
 
 async function gathered(peer: RTCPeerConnection): Promise<void> {
   if (peer.iceGatheringState === 'complete') return;
@@ -62,15 +71,19 @@ async function gathered(peer: RTCPeerConnection): Promise<void> {
 }
 
 /**
- * Stand in for `fetch` as the Snowflake broker. Every client poll is answered
+ * Stand in for `fetch` as the Snowflake broker. A client poll is answered
  * with a new node-datachannel peer on loopback, which hands the data channel
  * webtor opens to `proxy`, as the broker would have matched a volunteer proxy
- * and passed it the offer. Anything else fetched is refused, since webtor has
- * nothing else to fetch.
+ * and passed it the offer. `replies` changes how the first polls are
+ * answered, one entry per poll. Anything else fetched is refused, since
+ * webtor has nothing else to fetch.
  *
  * `restore` puts the real `fetch` back and closes every peer.
  */
-export function standInForBroker(proxy: (channel: RTCDataChannel) => void): {
+export function standInForBroker(
+  proxy: (channel: RTCDataChannel) => void,
+  replies: BrokerReply[] = [],
+): {
   polls: Poll[];
   restore(): void;
 } {
@@ -83,8 +96,16 @@ export function standInForBroker(proxy: (channel: RTCDataChannel) => void): {
     if (request.url !== BROKER_URL) throw new Error(`unexpected fetch of ${request.url}`);
     const body = await request.text();
     const newline = body.indexOf('\n');
-    const poll: Poll = { version: body.slice(0, newline), ...JSON.parse(body.slice(newline + 1)) };
+    const poll: Poll = {
+      version: body.slice(0, newline),
+      ...JSON.parse(body.slice(newline + 1)),
+      at: performance.now(),
+    };
+    const reply = replies[polls.length] ?? 'proxy';
     polls.push(poll);
+    if (reply === 'no proxies') {
+      return Response.json({ error: 'no snowflake proxies currently available' });
+    }
 
     const peer = new RTCPeerConnection({ iceServers: [] });
     peers.push(peer);
@@ -95,7 +116,9 @@ export function standInForBroker(proxy: (channel: RTCDataChannel) => void): {
     await peer.setRemoteDescription(JSON.parse(poll.offer));
     await peer.setLocalDescription(await peer.createAnswer());
     await gathered(peer);
-    return Response.json({ answer: JSON.stringify(peer.localDescription) });
+    const answer = JSON.stringify(peer.localDescription);
+    if (reply === 'unreachable') peer.close();
+    return Response.json({ answer });
   }) as typeof fetch;
 
   return {

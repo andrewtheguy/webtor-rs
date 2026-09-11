@@ -203,8 +203,8 @@ repository, has a browser test against the same site, `bun run test:e2e`
 in its `gateway` directory, which drives the service worker from the install
 through a form sign-in.
 
-The repository pins its Bun version in `package.json`. `bun run test` is a
-second or two. `bun run test:live` bootstraps a real Tor client
+The repository pins its Bun version in `package.json`. `bun run test` takes
+half a minute. `bun run test:live` bootstraps a real Tor client
 and builds a fresh set of circuits per case, so it runs in minutes; a snapshot
 from `bun run seed` is what keeps the bootstrap to under a minute, and a
 snapshot expires when its consensus does, three hours after it is made. See

@@ -34,6 +34,15 @@ paths to it:
 | `websocket` (default) | A direct WebSocket to one fixed Snowflake bridge endpoint. It uses no broker, volunteer proxy, or STUN and has fewer moving parts, but blocking that endpoint blocks the client. |
 | `webrtc` | A volunteer proxy selected through the Snowflake broker over HTTPS. It requires caller-supplied STUN URLs and the `RTCPeerConnection` constructor to use, as `rtcPeerConnection` — a window's own, or any implementation of the interface — and is harder to block, at the cost of another dependency and a slower start. |
 
+The webrtc bridge polls the broker up to ten times per bootstrap, each poll at
+least ten seconds after the one before it began, as the official client does:
+the broker often has no proxy for a poll or two, and a matched proxy is often
+unreachable. A browser cannot probe its own NAT, so the client tells the broker
+its NAT is "unrestricted", which spares the proxies anyone can reach for the
+clients that need them, until a proxy matched that way cannot be reached; for
+the rest of the client's life it says "unknown", and the broker offers only
+proxies behind an open NAT.
+
 For development, `bridgeUrl` and `bridgeFingerprint` replace the public
 WebSocket bridge. They are accepted only together and only in `websocket` mode:
 a URL without the bridge's RSA identity would ask the client to trust whatever

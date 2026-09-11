@@ -14,6 +14,7 @@ use crate::onion::OnionConnector;
 use crate::onion_service::{OnionService, OnionServiceOptions};
 use crate::relay::RelayManager;
 use crate::retry::with_timeout;
+use crate::snowflake_broker::NatPolicy;
 use crate::snowflake_webrtc::{SnowflakeWebRtcConfig, SnowflakeWebRtcStream};
 use crate::snowflake_ws::SnowflakeWsStream;
 use crate::time::system_time_now;
@@ -48,6 +49,10 @@ pub struct TorClient {
     /// reliable step of a bootstrap, so a caller-supplied directory is tried
     /// first and the download only runs when there is none or it is rejected.
     directory_seed: RwLock<Option<String>>,
+    /// What the webrtc bridge tells the broker about this client's NAT. Kept
+    /// for the client's life, since a NAT found to need an open proxy on one
+    /// bootstrap still needs one on the next.
+    nat_policy: NatPolicy,
 }
 
 impl TorClient {
@@ -80,6 +85,7 @@ impl TorClient {
             bootstrap_lock: Mutex::new(()),
             channel,
             directory_seed: RwLock::new(None),
+            nat_policy: NatPolicy::default(),
         })
     }
 
@@ -217,12 +223,15 @@ impl TorClient {
                 peer_connection,
             } => {
                 self.log("Connecting to Snowflake via WebRTC", LogType::Info);
-                let stream = SnowflakeWebRtcStream::connect(SnowflakeWebRtcConfig {
-                    broker_url: broker_url.clone(),
-                    fingerprint: fingerprint.clone(),
-                    stun_urls: stun_urls.clone(),
-                    peer_connection: peer_connection.clone(),
-                })
+                let stream = SnowflakeWebRtcStream::connect(
+                    SnowflakeWebRtcConfig {
+                        broker_url: broker_url.clone(),
+                        fingerprint: fingerprint.clone(),
+                        stun_urls: stun_urls.clone(),
+                        peer_connection: peer_connection.clone(),
+                    },
+                    &self.nat_policy,
+                )
                 .await?;
                 self.create_channel(stream, rsa_identity).await?
             }
