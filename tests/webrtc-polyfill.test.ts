@@ -7,7 +7,8 @@
 // peer on loopback as a volunteer proxy would, and runs the STUN server the
 // offer's candidates are gathered against. No bridge sits behind that proxy,
 // so every bootstrap here fails; what it fails on is what shows the proxy's
-// bytes reached webtor.
+// bytes reached webtor. `webrtc-polyfill-live.test.ts` puts the real bridge
+// behind the proxy.
 //
 //   bun run test
 //
@@ -15,37 +16,19 @@
 
 import assert from 'node:assert/strict';
 import { createSocket } from 'node:dgram';
-import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import { afterAll as after, beforeAll as before, describe, it } from 'bun:test';
-import { RTCPeerConnection } from 'node-datachannel/polyfill';
-import { REPO_ROOT } from './support/server.ts';
+import {
+  type Poll,
+  RTCPeerConnection,
+  type Webtor,
+  loadWebtor,
+  standInForBroker,
+} from './support/polyfill.ts';
 
-const PACKAGE = join(REPO_ROOT, 'crates', 'webtor-wasm', 'pkg');
-const BROKER_URL = 'https://snowflake-broker.torproject.net/client';
 /** The public bridge's identity, the only one the webrtc bridge asks for. */
 const PUBLIC_FINGERPRINT = '2B280B23E1107BB62ABFC40DDCC8824814F80A72';
 /** What a Turbo connection opens with, before its 8-byte client id. */
 const TURBO_TOKEN = '1293605d278175f5';
-
-/** The part of the package this file uses, typed without needing a build. */
-interface Webtor {
-  default(init: { module_or_path: BufferSource }): Promise<unknown>;
-  WebtorClient: { create(options: object): Promise<{ close(): Promise<void> }> };
-}
-
-/**
- * Load the package the way a Bun or Node host does: the glue would fetch the
- * binary next to itself, which under Bun is a `file:` URL, so the bytes are
- * read here and handed over.
- */
-async function loadWebtor(): Promise<Webtor> {
-  const webtor: Webtor = await import(join(PACKAGE, 'webtor_wasm.js'));
-  await webtor.default({
-    module_or_path: await readFile(join(PACKAGE, 'webtor_wasm_bg.wasm')),
-  });
-  return webtor;
-}
 
 /**
  * A STUN server on loopback that answers every binding request with the
@@ -84,9 +67,7 @@ async function startStun(): Promise<{ url: string; close(): void }> {
 interface Rendezvous {
   /** Why `WebtorClient.create` rejected. */
   error: string;
-  /** The poll's version line and its JSON, as the broker received them. */
-  version: string;
-  poll: { offer: string; nat: string; fingerprint: string };
+  poll: Poll;
   /** The label of the data channel webtor opened. */
   label: string;
   /** The first message on it, as hex, or what it was if not binary. */
@@ -105,15 +86,6 @@ async function within<T>(promise: Promise<T>, ms: number, what: string): Promise
   }
 }
 
-async function gathered(peer: RTCPeerConnection): Promise<void> {
-  if (peer.iceGatheringState === 'complete') return;
-  await new Promise<void>((resolve) => {
-    peer.onicegatheringstatechange = () => {
-      if (peer.iceGatheringState === 'complete') resolve();
-    };
-  });
-}
-
 /**
  * Bootstrap a client over the webrtc bridge with this file as its broker and
  * its volunteer proxy. The proxy answers the first message webtor sends it
@@ -125,44 +97,27 @@ async function gathered(peer: RTCPeerConnection): Promise<void> {
 async function bootstrapThrough(
   webtor: Webtor,
   stunUrl: string,
-  reply: string | Uint8Array,
+  reply: string | Uint8Array<ArrayBuffer>,
 ): Promise<Rendezvous> {
   const seen: Partial<Rendezvous> = {};
-  let proxy: RTCPeerConnection | undefined;
   let channelClosed: () => void = () => {};
   const closed = new Promise<void>((resolve) => {
     channelClosed = resolve;
   });
 
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const request = new Request(input, init);
-    if (request.url !== BROKER_URL) throw new Error(`unexpected fetch of ${request.url}`);
-    const body = await request.text();
-    const newline = body.indexOf('\n');
-    seen.version = body.slice(0, newline);
-    seen.poll = JSON.parse(body.slice(newline + 1));
-
-    const answering = new RTCPeerConnection({ iceServers: [] });
-    proxy = answering;
-    answering.ondatachannel = ({ channel }) => {
-      seen.label = channel.label;
-      channel.binaryType = 'arraybuffer';
-      channel.onmessage = ({ data }) => {
-        if (seen.first !== undefined) return;
-        seen.first =
-          data instanceof ArrayBuffer
-            ? Buffer.from(data).toString('hex')
-            : `a ${typeof data}: ${String(data)}`;
-        channel.send(reply);
-      };
-      channel.onclose = () => channelClosed();
+  const broker = standInForBroker((channel) => {
+    seen.label = channel.label;
+    channel.onmessage = ({ data }) => {
+      if (seen.first !== undefined) return;
+      seen.first =
+        data instanceof ArrayBuffer
+          ? Buffer.from(data).toString('hex')
+          : `a ${typeof data}: ${String(data)}`;
+      if (typeof reply === 'string') channel.send(reply);
+      else channel.send(reply);
     };
-    await answering.setRemoteDescription(JSON.parse(seen.poll?.offer ?? ''));
-    await answering.setLocalDescription(await answering.createAnswer());
-    await gathered(answering);
-    return Response.json({ answer: JSON.stringify(answering.localDescription) });
-  }) as typeof fetch;
+    channel.onclose = () => channelClosed();
+  });
 
   try {
     const client = await webtor.WebtorClient.create({
@@ -176,18 +131,17 @@ async function bootstrapThrough(
     seen.error = '';
   } catch (error) {
     seen.error = String(error);
-  } finally {
-    globalThis.fetch = realFetch;
   }
 
   try {
-    if (proxy) await within(closed, 5_000, 'webtor did not close its data channel');
+    if (broker.polls.length) await within(closed, 5_000, 'webtor did not close its data channel');
   } finally {
-    proxy?.close();
+    broker.restore();
   }
   assert.ok(seen.error, 'bootstrap succeeded with no bridge behind the proxy');
-  assert.ok(seen.poll, `webtor never reached the broker: ${seen.error}`);
+  assert.equal(broker.polls.length, 1, `expected one broker poll: ${seen.error}`);
   assert.ok(seen.first !== undefined, `nothing arrived at the proxy: ${seen.error}`);
+  seen.poll = broker.polls[0];
   return seen as Rendezvous;
 }
 
@@ -209,7 +163,7 @@ describe('webrtc bridge with node-datachannel under Bun', () => {
     // KCP refusing it is what shows it came through Turbo as binary.
     const seen = await bootstrapThrough(webtor, stun.url, new Uint8Array([0x84, 1, 2, 3, 4]));
 
-    assert.equal(seen.version, '1.0');
+    assert.equal(seen.poll.version, '1.0');
     assert.equal(seen.poll.fingerprint, PUBLIC_FINGERPRINT);
     assert.equal(seen.poll.nat, 'unrestricted');
     const offer = JSON.parse(seen.poll.offer);

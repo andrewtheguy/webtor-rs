@@ -8,6 +8,7 @@
     "build": "wasm-pack build crates/webtor-wasm --release --target web --scope andrewtheguy",
     "test": "bun test --timeout 60000 ./tests/api.test.ts ./tests/webrtc-polyfill.test.ts ./scripts/local-onion/server.test.ts",
     "test:live": "bun test --timeout 600000 ./tests/live.test.ts",
+    "test:live:polyfill": "bun test --timeout 600000 ./tests/webrtc-polyfill-live.test.ts",
     "test:dynamic": "bun test --timeout 600000 ./tests/dynamic.test.ts",
     "test:interop": "bun ./tests/tools/interop-cli.ts",
     "seed": "bun run ./tests/tools/fetch-directory.ts",

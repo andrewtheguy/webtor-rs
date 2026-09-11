@@ -169,6 +169,7 @@ bun run build     # wasm-pack the package into crates/webtor-wasm/pkg/
 bun run test      # API suite and the webrtc bridge under Bun, no network
 bun run seed      # fetch a directory snapshot to tests/.directory-seed.json
 bun run test:live # end to end against public onion services
+bun run test:live:polyfill # the webrtc bridge under Bun, end to end
 bun run test:dynamic # end to end against a dynamic onion site of our own, see below
 ```
 
