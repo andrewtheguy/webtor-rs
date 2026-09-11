@@ -8,8 +8,10 @@
 //! of the caller's own, or nothing at all.
 
 use crate::js_callback::JsCallback;
+use std::cell::RefCell;
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex, Once};
+use std::rc::Rc;
+use std::sync::Once;
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Level, Metadata, Subscriber};
@@ -18,7 +20,7 @@ use webtor_core::LogType;
 
 /// A log sink shared by the Tor client and this binding, so progress from
 /// both sides of the boundary lands in one place.
-pub(crate) type Logger = Arc<dyn Fn(&str, LogType) + Send + Sync>;
+pub(crate) type Logger = Rc<dyn Fn(&str, LogType)>;
 
 /// What a JS `onLog` callback is told a line is.
 fn level_name(log_type: LogType) -> &'static str {
@@ -32,7 +34,7 @@ fn level_name(log_type: LogType) -> &'static str {
 
 /// The default sink: the browser console, every line under one prefix.
 pub(crate) fn console_logger(prefix: String) -> Logger {
-    Arc::new(move |message: &str, log_type: LogType| {
+    Rc::new(move |message: &str, log_type: LogType| {
         let rendered = JsValue::from_str(&format!("{prefix} {message}"));
         match log_type {
             LogType::Error => web_sys::console::error_1(&rendered),
@@ -46,26 +48,29 @@ pub(crate) fn console_logger(prefix: String) -> Logger {
 /// the rest of its logging goes rather than only in the console.
 pub(crate) fn js_logger(callback: js_sys::Function) -> Logger {
     let sink = JsCallback::new(callback);
-    // `sink.call` and not `sink.0`: precise capture would take the bare
-    // function into the closure and leave it without the Send and Sync that
-    // `JsCallback` is what carries.
-    Arc::new(move |message: &str, log_type: LogType| {
+    Rc::new(move |message: &str, log_type: LogType| {
         sink.call(&[message, level_name(log_type)])
     })
 }
 
 /// Drop every line, for a caller that asked for no logging at all.
 pub(crate) fn silent() -> Logger {
-    Arc::new(|_: &str, _| {})
+    Rc::new(|_: &str, _| {})
 }
 
-/// Where `tracing` events go.
-///
-/// A `tracing` event carries no client identity — the Arti crates emit these
-/// from code that knows nothing about which client's circuit it is running —
-/// so on a page holding more than one client there is nothing to route by,
-/// and the most recently created *logging* client owns this.
-static SINK: Mutex<Option<Logger>> = Mutex::new(None);
+thread_local! {
+    /// Where `tracing` events go.
+    ///
+    /// A `tracing` event carries no client identity — the Arti crates emit
+    /// these from code that knows nothing about which client's circuit it is
+    /// running — so on a page holding more than one client there is nothing
+    /// to route by, and the most recently created *logging* client owns this.
+    ///
+    /// Per thread, because a JS function can only be called on the thread
+    /// that made it: an event emitted anywhere else finds no sink and is
+    /// dropped.
+    static SINK: RefCell<Option<Logger>> = const { RefCell::new(None) };
+}
 
 /// Send `tracing` warnings and errors to `logger`, installing the subscriber
 /// the first time a client asks for one.
@@ -75,9 +80,7 @@ static SINK: Mutex<Option<Logger>> = Mutex::new(None);
 /// its own lines go, not silencing a client that is still reporting.
 pub(crate) fn install(logger: Option<Logger>) {
     let Some(logger) = logger else { return };
-    if let Ok(mut sink) = SINK.lock() {
-        *sink = Some(logger);
-    }
+    SINK.with(|sink| *sink.borrow_mut() = Some(logger));
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
         let _ = tracing::subscriber::set_global_default(TracingSink);
@@ -112,9 +115,11 @@ impl Subscriber for TracingSink {
     fn record_follows_from(&self, _: &Id, _: &Id) {}
 
     fn event(&self, event: &Event<'_>) {
-        // Cloned out of the lock before it is called: a caller's sink can
-        // re-enter WASM, and a line logged from there would deadlock here.
-        let Some(logger) = SINK.lock().ok().and_then(|sink| sink.clone()) else {
+        // Cloned out of the cell before it is called: a caller's sink can
+        // re-enter WASM, and a client created from there would find the cell
+        // still borrowed. `try_with` because a subscriber must not panic, even
+        // for an event emitted while the thread's locals are torn down.
+        let Some(logger) = SINK.try_with(|sink| sink.borrow().clone()).ok().flatten() else {
             return;
         };
         let mut visitor = MessageVisitor(String::new());

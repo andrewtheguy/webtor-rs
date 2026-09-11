@@ -18,7 +18,6 @@ use options::error as option_error;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
@@ -533,7 +532,7 @@ impl WebtorClient {
                 LogType::Success,
             );
             Ok(JsValue::from(WebtorOnionService {
-                service: Arc::new(service),
+                service: Rc::new(service),
             }))
         })
     }
@@ -789,7 +788,7 @@ impl OnionWebSocket {
 /// A v3 onion service this page is running.
 #[wasm_bindgen]
 pub struct WebtorOnionService {
-    service: Arc<OnionService>,
+    service: Rc<OnionService>,
 }
 
 #[wasm_bindgen]

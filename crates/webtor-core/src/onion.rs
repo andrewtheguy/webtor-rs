@@ -33,6 +33,7 @@ use rand::seq::SliceRandom;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::str::FromStr;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use async_lock::{Mutex, RwLock};
@@ -517,7 +518,7 @@ fn stream_refused_by_service(error: &tor_proto::Error) -> bool {
 
 pub(crate) struct OnionConnector {
     circuit_manager: Arc<CircuitManager>,
-    directory_manager: Arc<DirectoryManager>,
+    directory_manager: Rc<DirectoryManager>,
     relay_manager: Arc<RwLock<RelayManager>>,
     /// Per-service state, each behind a lock of its own: concurrent connects
     /// to one service wait for the same rendezvous instead of each building
@@ -529,7 +530,7 @@ pub(crate) struct OnionConnector {
 impl OnionConnector {
     pub(crate) fn new(
         circuit_manager: Arc<CircuitManager>,
-        directory_manager: Arc<DirectoryManager>,
+        directory_manager: Rc<DirectoryManager>,
         relay_manager: Arc<RwLock<RelayManager>>,
         on_log: Option<LogCallback>,
     ) -> Self {

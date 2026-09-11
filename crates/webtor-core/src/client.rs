@@ -20,6 +20,7 @@ use crate::time::system_time_now;
 use crate::wasm_runtime::WasmRuntime;
 use safelog::MaybeSensitive;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::rc::Rc;
 use std::sync::Arc;
 use async_lock::{Mutex, RwLock};
 use tor_linkspec::OwnedChanTargetBuilder;
@@ -33,7 +34,7 @@ use tracing::{error, info, warn};
 
 pub struct TorClient {
     options: TorClientOptions,
-    directory_manager: Arc<DirectoryManager>,
+    directory_manager: Rc<DirectoryManager>,
     /// Circuit and relay state, shared with the onion client and with any
     /// service this client publishes.
     circuit_manager: Arc<CircuitManager>,
@@ -53,7 +54,7 @@ impl TorClient {
     pub async fn new(options: TorClientOptions) -> Result<Self> {
         let channel = Arc::new(RwLock::new(None));
         let relay_manager = Arc::new(RwLock::new(RelayManager::new(Vec::new())));
-        let directory_manager = Arc::new(DirectoryManager::new(
+        let directory_manager = Rc::new(DirectoryManager::new(
             relay_manager.clone(),
             options.on_log.clone(),
             options.on_directory_change.clone(),

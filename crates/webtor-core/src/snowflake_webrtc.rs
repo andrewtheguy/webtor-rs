@@ -31,7 +31,9 @@ pub(crate) struct SnowflakeWebRtcStream {
 }
 
 // Browser WASM is single-threaded, while Arti requires its transport stream to
-// satisfy Send at the generic boundary.
+// satisfy Send at the generic boundary. Threaded WASM is not single-threaded,
+// so it gets no such claim and fails to compile instead.
+#[cfg(not(target_feature = "atomics"))]
 unsafe impl Send for SnowflakeWebRtcStream {}
 
 impl SnowflakeWebRtcStream {

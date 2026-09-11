@@ -19,6 +19,8 @@ pub(crate) struct SnowflakeWsStream {
 }
 
 // Browser WASM is single-threaded; Arti requires channel streams to be Send.
+// Threaded WASM is not, so it gets no such claim and fails to compile instead.
+#[cfg(not(target_feature = "atomics"))]
 unsafe impl Send for SnowflakeWsStream {}
 
 impl SnowflakeWsStream {
