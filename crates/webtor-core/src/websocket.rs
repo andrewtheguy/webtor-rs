@@ -86,6 +86,18 @@ impl WebSocketStream {
         });
         socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
 
+        // Own the callbacks before waiting, so that a connect given up while
+        // the socket opens closes it and unhooks them through Drop, rather
+        // than leaving the socket to call closures that are gone.
+        let stream = Self {
+            socket,
+            receiver,
+            read_buffer: Vec::new(),
+            _on_message: on_message,
+            _on_error: on_error,
+            _on_close: on_close,
+        };
+
         match open_receiver.await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return Err(TorError::network(error)),
@@ -95,16 +107,9 @@ impl WebSocketStream {
                 ))
             }
         }
-        socket.set_onopen(None);
+        stream.socket.set_onopen(None);
 
-        Ok(Self {
-            socket,
-            receiver,
-            read_buffer: Vec::new(),
-            _on_message: on_message,
-            _on_error: on_error,
-            _on_close: on_close,
-        })
+        Ok(stream)
     }
 }
 

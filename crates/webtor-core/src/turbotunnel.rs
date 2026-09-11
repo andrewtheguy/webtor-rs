@@ -9,6 +9,7 @@
 //! nothing above KCP notices.
 
 use crate::error::{Result, TorError};
+use crate::retry::with_timeout;
 use crate::time::Instant;
 use crate::turbo::TurboStream;
 use futures::future::LocalBoxFuture;
@@ -76,7 +77,10 @@ async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Dial a replacement for a lost connection, and dial again after a failure
-/// for as long as the bridge may still hold the session.
+/// for as long as the bridge may still hold the session. A dial still going
+/// when that time is up is given up, since what it would connect to is gone:
+/// the session then fails, its Tor channel closes, and the channel is opened
+/// again with a new session.
 async fn reconnect<S: AsyncRead + AsyncWrite + Unpin>(
     dial: Dial<S>,
     client_id: [u8; 8],
@@ -84,7 +88,13 @@ async fn reconnect<S: AsyncRead + AsyncWrite + Unpin>(
     let lost = Instant::now();
     let mut attempt = 0;
     loop {
-        let error = match connect(dial.clone(), client_id).await {
+        let remaining = SESSION_RETENTION.saturating_sub(lost.elapsed());
+        let dialed = with_timeout(
+            Duration::from_millis(remaining.as_millis() as u64),
+            "Dialing another Snowflake connection while the bridge held the session",
+            connect(dial.clone(), client_id),
+        );
+        let error = match dialed.await {
             Ok(turbo) => return Ok(turbo),
             Err(error) => error,
         };

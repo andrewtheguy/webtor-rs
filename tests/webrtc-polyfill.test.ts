@@ -77,11 +77,22 @@ interface ProxyChannel {
 interface Rendezvous {
   /** Why `WebtorClient.create` rejected. */
   error: string;
+  /**
+   * Every poll, including any whose proxy webtor could not reach: a data
+   * channel on loopback can still fail to open in time, and webtor asks for
+   * another, as it would of the real broker.
+   */
   polls: Poll[];
+  /** The data channels webtor sent something on, in the order it did. */
   channels: ProxyChannel[];
+  /** What webtor logged, for a failure to show. */
+  log: string[];
 }
 
-/** How the `index`th proxy answers webtor's first message; `null` is silence. */
+/**
+ * How the proxy whose channel webtor sent something on `index`th answers
+ * webtor's first message; `null` is silence.
+ */
 type ProxyReply = (index: number) => string | Uint8Array<ArrayBuffer> | null;
 
 async function within<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
@@ -120,24 +131,27 @@ async function bootstrapThrough(
 ): Promise<Rendezvous> {
   const channels: ProxyChannel[] = [];
   const closes: Promise<void>[] = [];
+  const log: string[] = [];
 
   const broker = standInForBroker((channel) => {
-    const index = closes.length;
     closes.push(
       new Promise<void>((resolve) => {
         channel.onclose = () => resolve();
       }),
     );
+    let heard = false;
     channel.onmessage = ({ data }) => {
-      if (channels[index]) return;
-      channels[index] = {
+      if (heard) return;
+      heard = true;
+      const index = channels.length;
+      channels.push({
         label: channel.label,
         first:
           data instanceof ArrayBuffer
             ? Buffer.from(data).toString('hex')
             : `a ${typeof data}: ${String(data)}`,
         at: performance.now(),
-      };
+      });
       const answer = reply(index);
       if (typeof answer === 'string') channel.send(answer);
       else if (answer) channel.send(answer);
@@ -151,7 +165,7 @@ async function bootstrapThrough(
       stunUrls: [stunUrl],
       rtcPeerConnection: RTCPeerConnection,
       connectionTimeoutMs: 60_000,
-      log: false,
+      onLog: (line: string) => log.push(line),
     });
     await client.close();
   } catch (failure) {
@@ -165,7 +179,12 @@ async function bootstrapThrough(
   }
   assert.ok(error, 'bootstrap succeeded with no bridge behind the proxy');
   assert.ok(channels.length, `nothing arrived at a proxy: ${error}`);
-  return { error, polls: broker.polls, channels };
+  return { error, polls: broker.polls, channels, log };
+}
+
+/** What webtor logged, as an assertion message. */
+function logged(seen: Rendezvous): string {
+  return `webtor logged:\n  ${seen.log.join('\n  ')}`;
 }
 
 describe('webrtc bridge with node-datachannel under Bun', () => {
@@ -186,7 +205,6 @@ describe('webrtc bridge with node-datachannel under Bun', () => {
     // KCP refusing it is what shows it came through Turbo as binary.
     const seen = await bootstrapThrough(webtor, stun.url, () => new Uint8Array([0x84, 1, 2, 3, 4]));
 
-    assert.equal(seen.polls.length, 1);
     const [poll] = seen.polls;
     assert.equal(poll.version, '1.0');
     assert.equal(poll.fingerprint, PUBLIC_FINGERPRINT);
@@ -206,8 +224,7 @@ describe('webrtc bridge with node-datachannel under Bun', () => {
     // bridge to know it; three that deliver nothing end it.
     const seen = await bootstrapThrough(webtor, stun.url, () => 'not binary');
 
-    assert.equal(seen.polls.length, 3);
-    assert.equal(seen.channels.length, 3);
+    assert.equal(seen.channels.length, 3, logged(seen));
     const ids = new Set(seen.channels.map(clientId));
     assert.equal(ids.size, 1, `the session changed its client ID: ${[...ids].join(', ')}`);
     assert.match(seen.error, /3 connections in a row delivered nothing/);
@@ -220,8 +237,10 @@ describe('webrtc bridge with node-datachannel under Bun', () => {
       index === 0 ? null : 'not binary',
     );
 
-    assert.equal(seen.polls.length, 3);
-    const quiet = (seen.polls[1].at - seen.channels[0].at) / 1000;
+    assert.equal(seen.channels.length, 3, logged(seen));
+    const next = seen.polls.find((poll) => poll.at > seen.channels[0].at);
+    assert.ok(next, logged(seen));
+    const quiet = (next.at - seen.channels[0].at) / 1000;
     assert.ok(quiet >= 19.5, `gave up on the silent proxy after ${quiet.toFixed(1)} s`);
     assert.equal(new Set(seen.channels.map(clientId)).size, 1);
   });
@@ -238,10 +257,14 @@ describe('webrtc bridge with node-datachannel under Bun', () => {
 
     // A broker with no proxy says nothing about the NAT; an unreachable proxy
     // matched for an unrestricted one does, for the rest of the client's life.
-    assert.deepEqual(
-      seen.polls.map((poll) => poll.nat),
-      ['unrestricted', 'unrestricted', 'unknown', 'unknown', 'unknown'],
+    const nats = seen.polls.map((poll) => poll.nat);
+    assert.deepEqual(nats.slice(0, 2), ['unrestricted', 'unrestricted']);
+    assert.ok(nats.length >= 5, logged(seen));
+    assert.ok(
+      nats.slice(2).every((nat) => nat === 'unknown'),
+      `said ${nats.join(', ')} to the broker`,
     );
+    assert.equal(seen.channels.length, 3, logged(seen));
     const gap = (unreachable.at - empty.at) / 1000;
     assert.ok(gap >= 9.5, `polled again ${gap.toFixed(1)} s after "no proxies"`);
     const waited = (open.at - unreachable.at) / 1000;

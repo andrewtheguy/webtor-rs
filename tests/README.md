@@ -11,7 +11,7 @@ here, and the directory snapshot is built by a tool in this directory.
 bun install        # install dependencies from bun.lock
 bun run typecheck  # check all TypeScript without emitting JavaScript
 bun run build      # required first: the harness imports crates/webtor-wasm/pkg/
-bun run test       # api, webrtc-polyfill and websocket-bridge — no network, ~1 minute
+bun run test       # api, webrtc-polyfill and websocket-bridge — no network, ~2 minutes
 bun run seed       # a directory snapshot, ~40 MiB, valid three hours
 bun run test:live  # tests/live.test.ts   — real onion services, ~1 minute
 bun run test:live:polyfill  # webrtc-polyfill-live.test.ts — the webrtc bridge under Bun, ~1 minute
@@ -46,7 +46,10 @@ ID and gives the session up after three that deliver nothing. Another has the
 broker answer with no proxy and then with one that is gone before webtor
 reaches it, and checks that webtor waits ten seconds between polls and tells
 the broker its NAT is "unknown" once a proxy matched for "unrestricted" was
-unreachable. Those waits are most of the suite's time. No bridge sits behind
+unreachable. Those waits are most of the suite's time. A proxy on loopback
+can still fail to open in time, and webtor then asks the broker for another,
+so the cases count the channels webtor used rather than the broker's polls,
+and a failure prints what webtor logged. No bridge sits behind
 the proxies, so every bootstrap fails, and each case also waits for webtor to
 close every data channel it opened.
 
@@ -70,7 +73,11 @@ and drops it, then refuses the next two with a 503, as a bridge instance that
 is briefly down does. It checks that webtor dials again after one second and
 then two, rather than giving up the session, that every connection it gets
 through opens with the same Turbo client ID, and that refusals do not count
-toward the three connections that deliver nothing.
+toward the three connections that deliver nothing. Another case has the
+bridge never answer the replacement's upgrade, and checks that the session
+ends a minute after its connection was lost, when the bridge would have let it
+go, rather than waiting on the dial for ever; that minute is most of the
+file's time.
 
 **`live.test.ts`** bootstraps one client and reuses it for every case:
 directory cache export, an HTTP GET, a server-chosen 4xx, caller-supplied
