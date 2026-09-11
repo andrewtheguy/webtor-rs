@@ -64,17 +64,25 @@ async function startStun(): Promise<{ url: string; close(): void }> {
   };
 }
 
-/** What the stand-in broker and proxy saw of one bootstrap. */
-interface Rendezvous {
-  /** Why `WebtorClient.create` rejected. */
-  error: string;
-  /** Every broker poll, the last being the one whose proxy answered. */
-  polls: Poll[];
-  /** The label of the data channel webtor opened. */
+/** One data channel webtor opened, as the proxy on the other end saw it. */
+interface ProxyChannel {
   label: string;
   /** The first message on it, as hex, or what it was if not binary. */
   first: string;
+  /** When that arrived, in `performance.now()` milliseconds. */
+  at: number;
 }
+
+/** What the stand-in broker and proxies saw of one bootstrap. */
+interface Rendezvous {
+  /** Why `WebtorClient.create` rejected. */
+  error: string;
+  polls: Poll[];
+  channels: ProxyChannel[];
+}
+
+/** How the `index`th proxy answers webtor's first message; `null` is silence. */
+type ProxyReply = (index: number) => string | Uint8Array<ArrayBuffer> | null;
 
 async function within<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -88,42 +96,55 @@ async function within<T>(promise: Promise<T>, ms: number, what: string): Promise
   }
 }
 
+/** The Turbo client ID a connection opened with, from its first message. */
+function clientId(channel: ProxyChannel): string {
+  assert.match(channel.first, new RegExp(`^${TURBO_TOKEN}[0-9a-f]{16}$`));
+  return channel.first.slice(TURBO_TOKEN.length);
+}
+
 /**
  * Bootstrap a client over the webrtc bridge with this file as its broker and
- * its volunteer proxy. The broker answers its first polls as `brokerReplies`
- * says and matches a proxy after that. The proxy answers the first message
- * webtor sends it with `reply`, and the bootstrap fails on whatever webtor
- * makes of that.
+ * its volunteer proxies. The broker answers its first polls as
+ * `brokerReplies` says and matches a proxy after that, and each proxy answers
+ * the first message webtor sends it as `reply` says. No bridge is behind any
+ * of them, so the bootstrap fails, on whatever webtor makes of the replies.
  *
- * Resolves once webtor has closed its side as well, since a failed attempt
- * that left its peer connection open would leak one per retry.
+ * Resolves once webtor has closed every data channel it opened, since a
+ * connection it gave up and left open would leak one per redial.
  */
 async function bootstrapThrough(
   webtor: Webtor,
   stunUrl: string,
-  reply: string | Uint8Array<ArrayBuffer>,
+  reply: ProxyReply,
   brokerReplies: BrokerReply[] = [],
 ): Promise<Rendezvous> {
-  const seen: Partial<Rendezvous> = {};
-  let channelClosed: () => void = () => {};
-  const closed = new Promise<void>((resolve) => {
-    channelClosed = resolve;
-  });
+  const channels: ProxyChannel[] = [];
+  const closes: Promise<void>[] = [];
 
   const broker = standInForBroker((channel) => {
-    seen.label = channel.label;
+    const index = closes.length;
+    closes.push(
+      new Promise<void>((resolve) => {
+        channel.onclose = () => resolve();
+      }),
+    );
     channel.onmessage = ({ data }) => {
-      if (seen.first !== undefined) return;
-      seen.first =
-        data instanceof ArrayBuffer
-          ? Buffer.from(data).toString('hex')
-          : `a ${typeof data}: ${String(data)}`;
-      if (typeof reply === 'string') channel.send(reply);
-      else channel.send(reply);
+      if (channels[index]) return;
+      channels[index] = {
+        label: channel.label,
+        first:
+          data instanceof ArrayBuffer
+            ? Buffer.from(data).toString('hex')
+            : `a ${typeof data}: ${String(data)}`,
+        at: performance.now(),
+      };
+      const answer = reply(index);
+      if (typeof answer === 'string') channel.send(answer);
+      else if (answer) channel.send(answer);
     };
-    channel.onclose = () => channelClosed();
   }, brokerReplies);
 
+  let error = '';
   try {
     const client = await webtor.WebtorClient.create({
       bridge: 'webrtc',
@@ -133,25 +154,18 @@ async function bootstrapThrough(
       log: false,
     });
     await client.close();
-    seen.error = '';
-  } catch (error) {
-    seen.error = String(error);
+  } catch (failure) {
+    error = String(failure);
   }
 
   try {
-    if (broker.polls.length) await within(closed, 5_000, 'webtor did not close its data channel');
+    await within(Promise.all(closes), 5_000, 'webtor did not close every data channel');
   } finally {
     broker.restore();
   }
-  assert.ok(seen.error, 'bootstrap succeeded with no bridge behind the proxy');
-  assert.equal(
-    broker.polls.length,
-    brokerReplies.length + 1,
-    `expected a poll per broker reply and one more: ${seen.error}`,
-  );
-  assert.ok(seen.first !== undefined, `nothing arrived at the proxy: ${seen.error}`);
-  seen.polls = broker.polls;
-  return seen as Rendezvous;
+  assert.ok(error, 'bootstrap succeeded with no bridge behind the proxy');
+  assert.ok(channels.length, `nothing arrived at a proxy: ${error}`);
+  return { error, polls: broker.polls, channels };
 }
 
 describe('webrtc bridge with node-datachannel under Bun', () => {
@@ -170,8 +184,9 @@ describe('webrtc bridge with node-datachannel under Bun', () => {
   it('negotiates through the broker and carries binary both ways', async () => {
     // One Turbo data frame of four bytes: too short to be a KCP segment, so
     // KCP refusing it is what shows it came through Turbo as binary.
-    const seen = await bootstrapThrough(webtor, stun.url, new Uint8Array([0x84, 1, 2, 3, 4]));
+    const seen = await bootstrapThrough(webtor, stun.url, () => new Uint8Array([0x84, 1, 2, 3, 4]));
 
+    assert.equal(seen.polls.length, 1);
     const [poll] = seen.polls;
     assert.equal(poll.version, '1.0');
     assert.equal(poll.fingerprint, PUBLIC_FINGERPRINT);
@@ -180,36 +195,56 @@ describe('webrtc bridge with node-datachannel under Bun', () => {
     assert.equal(offer.type, 'offer');
     assert.match(offer.sdp, / 127\.0\.0\.1 \d+ typ srflx/, 'no candidate from the STUN server');
 
-    assert.equal(seen.label, 'webrtc');
-    assert.match(seen.first, new RegExp(`^${TURBO_TOKEN}[0-9a-f]{16}$`));
+    assert.equal(seen.channels[0].label, 'webrtc');
+    clientId(seen.channels[0]);
     assert.match(seen.error, /KCP input error: InvalidSegmentSize\(4\)/);
   });
 
-  it('refuses a text message from the proxy', async () => {
-    const seen = await bootstrapThrough(webtor, stun.url, 'not binary');
-    assert.match(seen.error, /Snowflake WebRTC received a non-binary message/);
+  it('carries the session to another proxy, and gives it up after three deliver nothing', async () => {
+    // A proxy that sends text is one webtor stops using. The session goes on
+    // through the next, which must open with the same client ID for the
+    // bridge to know it; three that deliver nothing end it.
+    const seen = await bootstrapThrough(webtor, stun.url, () => 'not binary');
+
+    assert.equal(seen.polls.length, 3);
+    assert.equal(seen.channels.length, 3);
+    const ids = new Set(seen.channels.map(clientId));
+    assert.equal(ids.size, 1, `the session changed its client ID: ${[...ids].join(', ')}`);
+    assert.match(seen.error, /3 connections in a row delivered nothing/);
+  });
+
+  it('moves off a proxy that opens and then says nothing', async () => {
+    // Twenty seconds: the bridge's smux speaks every ten, so a connection
+    // this quiet is not carrying the session.
+    const seen = await bootstrapThrough(webtor, stun.url, (index) =>
+      index === 0 ? null : 'not binary',
+    );
+
+    assert.equal(seen.polls.length, 3);
+    const quiet = (seen.polls[1].at - seen.channels[0].at) / 1000;
+    assert.ok(quiet >= 19.5, `gave up on the silent proxy after ${quiet.toFixed(1)} s`);
+    assert.equal(new Set(seen.channels.map(clientId)).size, 1);
   });
 
   it('asks for open proxies once a strict one is unreachable', async () => {
     // Twenty seconds, most of it waiting as the official client does: ten
     // after a broker that had no proxy, then webtor's ten-second wait for a
     // data channel that never opens.
-    const seen = await bootstrapThrough(webtor, stun.url, 'not binary', [
+    const seen = await bootstrapThrough(webtor, stun.url, () => 'not binary', [
       'no proxies',
       'unreachable',
     ]);
     const [empty, unreachable, open] = seen.polls;
 
     // A broker with no proxy says nothing about the NAT; an unreachable proxy
-    // matched for an unrestricted one does.
+    // matched for an unrestricted one does, for the rest of the client's life.
     assert.deepEqual(
       seen.polls.map((poll) => poll.nat),
-      ['unrestricted', 'unrestricted', 'unknown'],
+      ['unrestricted', 'unrestricted', 'unknown', 'unknown', 'unknown'],
     );
     const gap = (unreachable.at - empty.at) / 1000;
     assert.ok(gap >= 9.5, `polled again ${gap.toFixed(1)} s after "no proxies"`);
     const waited = (open.at - unreachable.at) / 1000;
     assert.ok(waited >= 9.5, `gave up on the unreachable proxy after ${waited.toFixed(1)} s`);
-    assert.match(seen.error, /Snowflake WebRTC received a non-binary message/);
   });
 });

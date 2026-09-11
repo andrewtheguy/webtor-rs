@@ -12,6 +12,7 @@
 //! speaks RFC 6455 over one.
 
 mod authority;
+mod bridge;
 mod circuit;
 mod client;
 mod config;
@@ -33,6 +34,7 @@ mod snowflake_webrtc;
 mod snowflake_ws;
 mod time;
 mod turbo;
+mod turbotunnel;
 mod wasm_runtime;
 mod wasm_runtime_unsupported;
 mod webrtc_stream;

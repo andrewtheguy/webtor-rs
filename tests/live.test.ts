@@ -10,7 +10,13 @@
 
 import assert from 'node:assert/strict';
 import { afterAll as after, beforeAll as before, describe, it } from 'bun:test';
-import { BRIDGE_FINGERPRINT, BRIDGE_URL, clientOptions, seedUrl } from './support/bootstrap.ts';
+import {
+  BRIDGE_FINGERPRINT,
+  BRIDGE_URL,
+  clientOptions,
+  seedUrl,
+  workerClientOptions,
+} from './support/bootstrap.ts';
 import { openHarness, type BrowserHarness } from './support/browser.ts';
 import {
   ATTEMPT_TIMEOUT_MS,
@@ -323,7 +329,7 @@ describe('webtor-wasm over Tor', () => {
   // gateway too. Two GETs to one service, because the second is meant to
   // begin on the circuit the first built rather than rendezvous again.
   it('runs in a dedicated worker and reuses the circuit to a service', async () => {
-    const created = await harness.call('workerCreate', clientOptions(), seededFrom);
+    const created = await harness.call('workerCreate', workerClientOptions(), seededFrom);
     console.log(`  worker client ready in ${created.seconds}s`);
 
     try {

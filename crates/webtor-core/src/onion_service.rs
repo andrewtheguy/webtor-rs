@@ -100,7 +100,9 @@ const TRANSITION_DELAY: (u64, u64) = (5 * 60, 15 * 60);
 /// refreshed — would put this in a loop.
 const MIN_REPUBLISH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
-const ESTABLISH_INTRO_TIMEOUT: Duration = Duration::from_secs(90);
+/// One circuit build, which gives up on its own after twenty seconds, and the
+/// introduction point's answer.
+const ESTABLISH_INTRO_TIMEOUT: Duration = Duration::from_secs(30);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(90);
 /// Streams a single client circuit may have open at once.
@@ -210,7 +212,7 @@ pub struct OnionService {
 
 /// The parts of a running service that its background tasks share.
 struct ServiceState {
-    circuit_manager: Arc<CircuitManager>,
+    circuit_manager: Rc<CircuitManager>,
     /// Held for republishing: every time period needs the identity blinded
     /// again, so this key lives as long as the service does rather than being
     /// dropped once the first descriptor is signed.
@@ -598,7 +600,15 @@ async fn maintain_intro_points(state: Rc<ServiceState>, mut nudges: mpsc::Receiv
 
         let outcome = {
             let _publishing = state.publishing.lock().await;
-            match reconcile_intro_points(&state).await {
+            // Every point rides the bridge channel, so when it closes they all
+            // end with it. Reopening it happens here, before any point's own
+            // timeout starts: through the broker it can take longer than one
+            // point is given.
+            let reconciled = match state.circuit_manager.channel().await {
+                Ok(_) => reconcile_intro_points(&state).await,
+                Err(error) => Err(error),
+            };
+            match reconciled {
                 // Whether this reconcile changed anything or a previous round
                 // left the last change unpublished, the answer is the same
                 // descriptor: whatever is answering now, on every ring.
@@ -664,7 +674,7 @@ impl OnionService {
     /// Resolves once at least one HSDir has accepted the descriptor, which is
     /// the point at which a client can reach the address.
     pub(crate) async fn launch(
-        circuit_manager: Arc<CircuitManager>,
+        circuit_manager: Rc<CircuitManager>,
         directory_manager: Rc<DirectoryManager>,
         relay_manager: Arc<RwLock<RelayManager>>,
         options: OnionServiceOptions,

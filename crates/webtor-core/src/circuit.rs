@@ -4,11 +4,14 @@
 //! relay before its final hop: an HSDir, a rendezvous point or an
 //! introduction point. Nothing here ever reaches an exit.
 
+use crate::bridge::Bridge;
+use crate::config::LogType;
 use crate::error::{Result, TorError};
 use crate::relay::{Relay, RelayManager};
+use crate::retry::with_timeout;
 use std::sync::Arc;
 use std::time::Duration;
-use async_lock::RwLock;
+use async_lock::{Mutex, RwLock};
 use tor_linkspec::{CircTarget, HasRelayIds};
 use tor_proto::ccparams::{
     Algorithm, CongestionControlParamsBuilder, CongestionWindowParamsBuilder,
@@ -79,6 +82,16 @@ pub(crate) fn make_circ_params() -> Result<CircParameters> {
     ))
 }
 
+/// How long one circuit, all three hops of it, may take to build.
+///
+/// tor-proto waits for an extension's answer as long as the relay takes, and
+/// a relay that never answers holds the circuit open with nothing to show for
+/// it: Arti's own circuit manager is what bounds a build, and this client
+/// builds circuits without it. A circuit that has not come up in this long is
+/// given up, so that whatever wanted it can move on to other relays. Building
+/// one takes a second or two, through a Snowflake proxy included.
+const CIRCUIT_BUILD_TIMEOUT: Duration = Duration::from_secs(20);
+
 pub(crate) struct SimpleTimeoutEstimator;
 
 impl TimeoutEstimator for SimpleTimeoutEstimator {
@@ -87,21 +100,37 @@ impl TimeoutEstimator for SimpleTimeoutEstimator {
     }
 }
 
-#[derive(Clone)]
 pub(crate) struct CircuitManager {
     relay_manager: Arc<RwLock<RelayManager>>,
-    channel: Arc<RwLock<Option<Arc<Channel>>>>,
+    bridge: Bridge,
+    /// The bridge channel, once one has been opened and until the client is
+    /// closed.
+    channel: RwLock<Option<Arc<Channel>>>,
+    /// Held while a closed channel is replaced, so that everything that finds
+    /// it closed at once shares the one new channel.
+    reopening: Mutex<()>,
 }
 
 impl CircuitManager {
-    pub(crate) fn new(
-        relay_manager: Arc<RwLock<RelayManager>>,
-        channel: Arc<RwLock<Option<Arc<Channel>>>>,
-    ) -> Self {
+    pub(crate) fn new(relay_manager: Arc<RwLock<RelayManager>>, bridge: Bridge) -> Self {
         Self {
             relay_manager,
-            channel,
+            bridge,
+            channel: RwLock::new(None),
+            reopening: Mutex::new(()),
         }
+    }
+
+    /// Open a new bridge channel for a bootstrap, in place of any there was.
+    pub(crate) async fn open_channel(&self) -> Result<Arc<Channel>> {
+        let channel = self.bridge.open().await?;
+        *self.channel.write().await = Some(channel.clone());
+        Ok(channel)
+    }
+
+    /// Forget the channel. Nothing reopens one until the next bootstrap.
+    pub(crate) async fn close_channel(&self) {
+        *self.channel.write().await = None;
     }
 
     /// Build a fresh three-hop tunnel Snowflake → middle → `target`, choosing
@@ -111,8 +140,22 @@ impl CircuitManager {
         &self,
         target: &T,
     ) -> Result<(ClientTunnel, Relay)> {
+        // A channel reopened on the way is not the circuit's time to spend.
         let channel = self.channel().await?;
-        let bridge_fingerprint = self.bridge_fingerprint().await?;
+        with_timeout(
+            CIRCUIT_BUILD_TIMEOUT,
+            "Circuit build",
+            self.build_on(&channel, target),
+        )
+        .await
+    }
+
+    async fn build_on<T: CircTarget>(
+        &self,
+        channel: &Arc<Channel>,
+        target: &T,
+    ) -> Result<(ClientTunnel, Relay)> {
+        let bridge_fingerprint = bridge_fingerprint(channel);
 
         let middle = {
             let relay_manager = self.relay_manager.read().await;
@@ -173,37 +216,69 @@ impl CircuitManager {
         Ok((tunnel, middle))
     }
 
+    /// The bridge channel, reopened first if it has closed.
+    ///
+    /// Every circuit rides this one channel, so once it closes nothing works
+    /// until there is another. A client's own calls reopen it before they
+    /// start, and a published service reopens it here, when it next needs a
+    /// circuit, since nothing else would.
     pub(crate) async fn channel(&self) -> Result<Arc<Channel>> {
-        self.channel
-            .read()
-            .await
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| TorError::Internal("Channel not established".to_string()))
+        if let Some(channel) = self.live_channel().await? {
+            return Ok(channel);
+        }
+        let _reopening = self.reopening.lock().await;
+        if let Some(channel) = self.live_channel().await? {
+            return Ok(channel);
+        }
+        self.bridge.log(
+            "The Snowflake bridge channel closed; opening another",
+            LogType::Warn,
+        );
+        let channel = self.bridge.open().await?;
+        let mut current = self.channel.write().await;
+        // A client closed while this was opening wants no channel.
+        if current.is_none() {
+            channel.terminate();
+            return Err(not_established());
+        }
+        *current = Some(channel.clone());
+        Ok(channel)
     }
 
-    async fn bridge_fingerprint(&self) -> Result<String> {
-        Ok(self
-            .channel()
-            .await?
-            .target()
-            .rsa_identity()
-            .map(|identity| hex::encode(identity.as_bytes()))
-            .unwrap_or_else(|| "0000000000000000000000000000000000000000".to_string()))
+    /// The channel while it is open, `None` once it has closed, and an error
+    /// when there is none to reopen.
+    async fn live_channel(&self) -> Result<Option<Arc<Channel>>> {
+        match self.channel.read().await.as_ref() {
+            Some(channel) if channel.is_closing() => Ok(None),
+            Some(channel) => Ok(Some(channel.clone())),
+            None => Err(not_established()),
+        }
     }
+}
+
+fn not_established() -> TorError {
+    TorError::Internal("Channel not established".to_string())
+}
+
+fn bridge_fingerprint(channel: &Channel) -> String {
+    channel
+        .target()
+        .rsa_identity()
+        .map(|identity| hex::encode(identity.as_bytes()))
+        .unwrap_or_else(|| "0000000000000000000000000000000000000000".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TorClientOptions;
 
     #[tokio::test]
     async fn circuits_require_a_channel() {
         let manager = CircuitManager::new(
             Arc::new(RwLock::new(RelayManager::new(Vec::new()))),
-            Arc::new(RwLock::new(None)),
+            Bridge::new(TorClientOptions::snowflake_websocket().bridge, None),
         );
         assert!(manager.channel().await.is_err());
-        assert!(manager.bridge_fingerprint().await.is_err());
     }
 }
