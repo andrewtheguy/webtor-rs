@@ -160,12 +160,13 @@ pinned authorities before installing a byte of it.
 
 ## Tests
 
-`tests/` drives the built package in headless Chrome.
+`tests/` drives the built package in headless Chrome, and under Bun with
+node-datachannel for the webrtc bridge.
 
 ```bash
 bun install       # install dependencies from bun.lock
 bun run build     # wasm-pack the package into crates/webtor-wasm/pkg/
-bun run test      # API suite: URL helpers and option validation, no network
+bun run test      # API suite and the webrtc bridge under Bun, no network
 bun run seed      # fetch a directory snapshot to tests/.directory-seed.json
 bun run test:live # end to end against public onion services
 bun run test:dynamic # end to end against a dynamic onion site of our own, see below

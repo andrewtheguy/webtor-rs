@@ -6,7 +6,7 @@
   "packageManager": "bun@1.4.0",
   "scripts": {
     "build": "wasm-pack build crates/webtor-wasm --release --target web --scope andrewtheguy",
-    "test": "bun test --timeout 60000 ./tests/api.test.ts ./scripts/local-onion/server.test.ts",
+    "test": "bun test --timeout 60000 ./tests/api.test.ts ./tests/webrtc-polyfill.test.ts ./scripts/local-onion/server.test.ts",
     "test:live": "bun test --timeout 600000 ./tests/live.test.ts",
     "test:dynamic": "bun test --timeout 600000 ./tests/dynamic.test.ts",
     "test:interop": "bun ./tests/tools/interop-cli.ts",
@@ -17,6 +17,7 @@
   "devDependencies": {
     "@biomejs/biome": "2.5.13",
     "@types/bun": "^1.3.9",
+    "node-datachannel": "^0.33.3",
     "playwright-core": "^1.50.0",
     "typescript": "~5.9.3",
     "wasm-pack": "0.15.0"
