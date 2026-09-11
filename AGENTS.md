@@ -6,4 +6,6 @@ run cargo clippy and cargo test after rust changes
 
 no cargo fmt
 
+use biome for lint for javascript projects, and use async await instead of promises unless promises is meant for a specific reason
+
 always bump only webtor-wasm by patch version for breaking changes, but only one bump per branch

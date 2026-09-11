@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { startListener, type Listener, type ReceivedMessage } from './listener';
 import {
   normalizeAddress,
@@ -13,6 +13,9 @@ import type { Bridge, LogEntry } from './tor-client';
 type Side = 'listen' | 'send';
 
 type ListenState = 'idle' | 'publishing' | 'live' | 'failed';
+
+/** A delivery as the feed shows it, numbered in the order it was sent. */
+type SentDelivery = Delivery & { id: number };
 
 function clock(at: number): string {
   return new Date(at).toLocaleTimeString([], { hour12: false });
@@ -209,25 +212,28 @@ function SendSide() {
   const [via, setVia] = useState<SendVia>('webtor');
   const [sending, setSending] = useState(false);
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [deliveries, setDeliveries] = useState<Delivery[]>([]);
+  const [deliveries, setDeliveries] = useState<SentDelivery[]>([]);
+  const sent = useRef(0);
   const [failure, setFailure] = useState<string | null>(null);
 
   // Prefer the browser's Tor when there is one: in Tor Browser it is already
   // bootstrapped, and it spares the tab a Snowflake client of its own. The
   // probe only picks the default; it can be wrong, so the choice stays open.
-  const [probeRun, setProbeRun] = useState(0);
-  useEffect(() => {
-    let cancelled = false;
+  const probeRun = useRef(0);
+  const runProbe = useCallback(async () => {
+    const run = ++probeRun.current;
     setProbe('probing');
-    void browserReachesOnion().then((result) => {
-      if (cancelled) return;
-      setProbe(result);
-      if (result.reachable) setVia('browser');
-    });
+    const result = await browserReachesOnion();
+    if (run !== probeRun.current) return;
+    setProbe(result);
+    if (result.reachable) setVia('browser');
+  }, []);
+  useEffect(() => {
+    void runProbe();
     return () => {
-      cancelled = true;
+      probeRun.current++;
     };
-  }, [probeRun]);
+  }, [runProbe]);
 
   const address = normalizeAddress(addressInput);
   const ready = address != null && message.trim() !== '' && !sending;
@@ -244,7 +250,8 @@ function SendSide() {
         bridge,
         onLog: (entry) => setLogs((current) => [...current, entry]),
       });
-      setDeliveries((current) => [delivery, ...current].slice(0, 40));
+      const id = ++sent.current;
+      setDeliveries((current) => [{ ...delivery, id }, ...current].slice(0, 40));
       setMessage('');
     } catch (error) {
       setFailure(describe(error));
@@ -292,7 +299,7 @@ function SendSide() {
               <button
                 type="button"
                 className="link"
-                onClick={() => setProbeRun((run) => run + 1)}
+                onClick={() => void runProbe()}
               >
                 Check again
               </button>
@@ -357,8 +364,8 @@ function SendSide() {
             <p className="hint">Nothing sent yet.</p>
           ) : (
             <ul className="feed">
-              {deliveries.map((delivery, index) => (
-                <li key={`${deliveries.length - index}`}>
+              {deliveries.map((delivery) => (
+                <li key={delivery.id}>
                   <span className="at">{delivery.seconds}s</span>
                   <span>
                     via {delivery.via === 'browser' ? 'Tor Browser' : 'Snowflake'}{' '}
