@@ -313,7 +313,7 @@ fn set(object: &js_sys::Object, key: &str, value: &JsValue) {
 
 #[wasm_bindgen]
 pub struct WebtorClient {
-    client: Arc<TorClient>,
+    client: Rc<TorClient>,
     log: Logger,
     /// Set by `close`. Work issued afterwards fails at once instead of
     /// bootstrapping a Tor client all over again for a stream nobody wants.
@@ -377,7 +377,7 @@ impl WebtorClient {
                 .await
                 .map_err(|error| js_error("Failed to establish Tor connection", error))?;
             Ok(JsValue::from(Self {
-                client: Arc::new(client),
+                client: Rc::new(client),
                 log,
                 closed: Rc::new(Cell::new(false)),
                 pending: Rc::new(RefCell::new(HashMap::new())),

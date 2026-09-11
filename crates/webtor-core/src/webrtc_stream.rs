@@ -64,11 +64,22 @@ impl PartialEq for PeerConnectionClass {
 
 impl Eq for PeerConnectionClass {}
 
-// The client's options are `Send + Sync` because its core is written against a
-// threaded runtime as well as this one. Browser WASM is single-threaded and a
-// `js_sys::Function` never leaves its thread.
-unsafe impl Send for PeerConnectionClass {}
-unsafe impl Sync for PeerConnectionClass {}
+// A JS constructor belongs to the thread that made it, which threaded WASM
+// makes observable; nothing may claim it is `Send` or `Sync`.
+const _: fn() = || {
+    trait AmbiguousIfSend<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+    trait AmbiguousIfSync<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+    <PeerConnectionClass as AmbiguousIfSend<_>>::check();
+    <PeerConnectionClass as AmbiguousIfSync<_>>::check();
+};
 
 pub struct WebRtcStream {
     peer_connection: RtcPeerConnection,
